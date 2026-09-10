@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "TiebaPura HarmonyOS entry module",
+  "main": "",
+  "author": "a307608689-afk",
+  "license": "GPL-3.0",
+  "dependencies": {},
+  "devDependencies": {},
+  "dynamicDependencies": {}
+}

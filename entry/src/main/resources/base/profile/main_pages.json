@@ -1,0 +1,22 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/Search",
+    "pages/ThreadList",
+    "pages/ThreadDetail",
+    "pages/SubPostDetail",
+    "pages/PersonalContent",
+    "pages/Login",
+    "pages/ImagePreview",
+    "pages/ComposeThread",
+    "pages/Settings",
+    "pages/FontSizePage",
+    "pages/PersonalizedPage",
+    "pages/ShieldSettings",
+    "pages/BlacklistManager",
+    "pages/UserProfile",
+    "pages/FollowList",
+    "pages/UsageHabitsPage",
+    "pages/AutoSignSettings"
+  ]
+}

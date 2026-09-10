@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "贴吧客户端模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "贴吧客户端入口"
+    },
+    {
+      "name": "save_image_reason",
+      "value": "用于将帖子图片保存到系统图库"
+    }
+  ]
+}

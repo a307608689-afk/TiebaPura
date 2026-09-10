@@ -1,0 +1,1793 @@
+/*
+ * TiebaPura - HarmonyOS 原生 ArkTS 实现的第三方百度贴吧客户端
+ * Copyright (C) 2026 a307608689-afk
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { common } from '@kit.AbilityKit';
+import { systemShare } from '@kit.ShareKit';
+import { uniformTypeDescriptor as utd } from '@kit.ArkData';
+import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
+import { AuthManager } from '../service/AuthManager';
+import { TiebaService } from '../service/TiebaService';
+import { CacheManager } from '../cache/CacheManager';
+import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
+import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
+import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
+import { ThreadListSkeleton } from '../components/Skeleton';
+
+interface FollowSets {
+  ids: Set<string>;
+  names: Set<string>;
+}
+
+/** 半随机排序辅助条目：帖子 + 解析后时间戳 + 原顺序号（保证稳定排序） */
+interface TsItem {
+  ts: number;
+  seq: number;
+  item: ThreadItem;
+}
+
+/** 解析帖子时间字符串 → 毫秒时间戳（兼容秒级/毫秒级数字与格式化字符串） */
+function parseThreadTs(createTime: string): number {
+  if (!createTime) {
+    return 0;
+  }
+  const t: number = Number(createTime);
+  if (!isNaN(t) && t > 0) {
+    return t < 1e12 ? t * 1000 : t;
+  }
+  const d: number = new Date(createTime.replace(/-/g, '/')).getTime();
+  return isNaN(d) ? 0 : d;
+}
+
+/** Fisher-Yates 洗牌（就地打乱后返回原数组） */
+function shuffle<T>(arr: T[]): T[] {
+  for (let i: number = arr.length - 1; i > 0; i--) {
+    const j: number = Math.floor(Math.random() * (i + 1));
+    const tmp: T = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr;
+}
+
+/**
+ * 半随机时间排序：「仅推荐关注的吧」补采结果的展示顺序。
+ * 先按时间分桶（24 小时内 / 7 天内 / 更早），桶间近期优先；桶内按 2 小时时间带细分并带内打乱，
+ * 宏观保持“近期活跃优先”的观感，同批次顺序每次刷新又不同，产生真随机感。
+ */
+function sortSemiRandomByTime(list: ThreadItem[]): ThreadItem[] {
+  const now: number = Date.now();
+  const dayMs: number = 86400000;
+  const bandMs: number = 2 * 3600000;
+  const tsList: TsItem[] = list.map((item: ThreadItem, idx: number): TsItem => {
+    const e: TsItem = { ts: parseThreadTs(item.createTime), seq: idx, item };
+    return e;
+  });
+  tsList.sort((a: TsItem, b: TsItem): number => (b.ts - a.ts) || (a.seq - b.seq));
+  const b24: ThreadItem[] = [];
+  const b7: ThreadItem[] = [];
+  const bOld: ThreadItem[] = [];
+  for (const e of tsList) {
+    if (e.ts >= now - dayMs) {
+      b24.push(e.item);
+    } else if (e.ts >= now - 7 * dayMs) {
+      b7.push(e.item);
+    } else {
+      bOld.push(e.item);
+    }
+  }
+  const jitter = (arr: ThreadItem[]): ThreadItem[] => {
+    const result: ThreadItem[] = [];
+    let band: ThreadItem[] = [];
+    let bandKey: number = -1;
+    for (const item of arr) {
+      const ts: number = parseThreadTs(item.createTime);
+      const key: number = ts === 0 ? -1 : Math.floor(ts / bandMs);
+      if (band.length > 0 && key !== bandKey) {
+        shuffle(band);
+        for (const b of band) {
+          result.push(b);
+        }
+        band = [];
+      }
+      band.push(item);
+      bandKey = key;
+    }
+    if (band.length > 0) {
+      shuffle(band);
+      for (const b of band) {
+        result.push(b);
+      }
+    }
+    return result;
+  };
+  return jitter(b24).concat(jitter(b7), bOld);
+}
+
+enum LoadState {
+  Loading,
+  Success,
+  Empty,
+  Error,
+}
+
+enum HomeFeed {
+  Recommended = 0,
+  Following = 1,
+}
+
+/** 首页预加载阈值：距底部剩余距离小于该值时提前静默加载下一页（约 2 屏，覆盖快速甩滑的请求耗时） */
+const HOME_PREFETCH_DISTANCE: number = 1200;
+/** 关注动态页：本地切片分页每页条数（聚合结果一次性拉回，翻页零请求） */
+const FOLLOW_FEED_PAGE_SIZE: number = 20;
+
+/**
+ * 推荐/关注动态页内容区顶部让位（首卡距屏幕顶）：悬浮胶囊底边 ≈ 48(栏内 top) + 40(胶囊高) ≈ 88，
+ * 98 即留约 10 的呼吸间隙；由 Refresh 的 margin-top 承担，随内容滚动（沉浸）。
+ * 注意：不要再往 Scroll 内的 Column 里塞「占位子元素」——子元素自身的 margin/space 会在这份让位
+ * 之上再叠一份，留空看起来明显偏多。
+ */
+const HOME_TOP_PAD: number = 98;
+
+/**
+ * 顶部官方标题栏试点开关（2026-09-10）：
+ * true  = 「推荐 / 关注动态 / 搜索」整行搬进 Navigation 的 title 槽位，玻璃交给官方沉浸材质 systemMaterial
+ *         （官方口径：systemMaterial 的生效区域仅 Navigation/NavDestination 标题栏、横向 Tabs(barPosition=End) 底部 TabBar）；
+ * false = 回退改造前的页面主体悬浮层（manualGlass + backgroundBlurStyle 真磨砂兜底）。
+ */
+const HOME_OFFICIAL_TITLE_BAR: boolean = true;
+/**
+ * 官方标题栏高度：与改造前悬浮层几何逐项一致 —— 44(状态栏让位) + 44(按钮行高) + 20(底部呼吸) = 108。
+ * NavigationCustomTitle 设置了 height 时 titleMode 不参与计算。
+ */
+const HOME_TITLE_BAR_HEIGHT: number = 108;
+
+/**
+ * 首页自含页组件（Index.ets 拆分的最后一个内联页）：
+ * - 数据/方法/UI 全自管：推荐流 + 关注动态双数据源、点赞/分享/进贴/作者主页、首页历史等
+ * - 与宿主解耦（仅靠 AppStorage token / 回调）：
+ *   · homeBootRequest：宿主 aboutToAppear 初始化完成后通知本页冷启动加载
+ *   · tabLoginRefresh：登录/登出/换号时重同步账号数据并失效账号级缓存
+ *   · homePageShownTick：宿主 onPageShow 通知，做作者昵称回填刷新
+ *   · homeRetapRequest：宿主底栏重复点击首页 Tab 时通知整页刷新
+ *   · darkTick / fontScale：深色与字号全局联动
+ *   · onOpenFavorite：首页搜索入口联动收藏页本地搜索（宿主负责切 Tab）
+ */
+@Component
+export struct HomeTab {
+  /** 首页搜索入口：宿主切换到收藏 Tab（搜索在收藏页本地过滤） */
+  onOpenFavorite: () => void = () => {
+  };
+  @StorageLink('fontScale') fontScale: number = 1.0;
+  @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
+  @State isDark: boolean = false;
+  // 使用习惯：首页推荐仅显示关注吧的帖子（开关变化时自动刷新推荐流）
+  @StorageLink('homeOnlyFollow') @Watch('onHomeOnlyFollowChanged') homeOnlyFollow: boolean = false;
+  // 宿主启动完成后通知（约 aboutToAppear 各 Manager init + 登录态就绪后自增一次）
+  @StorageLink('homeBootRequest') @Watch('onBootTick') homeBootRequest: number = 0;
+  // 登录/登出/换号通用事件（各常驻子页订阅）
+  @StorageLink('tabLoginRefresh') @Watch('onLoginTick') tabLoginRefresh: number = 0;
+  // 宿主 onPageShow 自增：返回本页时回填作者昵称（不触发网络）
+  @StorageLink('homePageShownTick') @Watch('onPageTick') homePageShownTick: number = 0;
+  // 宿主底栏重复点击首页 Tab：整页刷新（按当前 feed 重拉第一页）
+  @StorageLink('homeRetapRequest') @Watch('onRetapTick') homeRetapRequest: number = 0;
+  @State loggedIn: boolean = false;
+  @State threads: ThreadItem[] = [];
+  @State loadState: LoadState = LoadState.Loading;
+  @State homePage: number = 1;
+  @State homeHasMore: boolean = true;
+  @State homeStalledPages: number = 0;
+  @State homeRefreshing: boolean = false;
+  @State homeLoadingMore: boolean = false;
+  @State homeFeed: HomeFeed = HomeFeed.Recommended;
+  // ===== 关注动态独立数据源（v1.17：与推荐流解耦，切换不销毁、不重拉，左右滑动转场时各自渲染）=====
+  @State folThreads: ThreadItem[] = [];
+  @State folState: LoadState = LoadState.Loading;
+  @State folPage: number = 1;
+  @State folHasMore: boolean = true;
+  @State folStalledPages: number = 0;
+  @State folRefreshing: boolean = false;
+  @State folLoadingMore: boolean = false;
+  @State errorMsg: string = '';
+  // 聚合拉回的关注用户帖子全量（本地切片分页源）
+  private folAll: ThreadItem[] = [];
+  // 冷启动首次进入自动加载，后续切换不重新拉取（仅下拉刷新/整页刷新手动刷新）
+  private folFeedLoaded: boolean = false;
+  // 推荐流已加载标志：首次加载成功后置位；切回时若已加载则不重拉、恢复浏览位置
+  // （与关注动态 folFeedLoaded 对称；换号/「仅关注吧」开关变化时置 false 触发重载）
+  private recommendLoaded: boolean = false;
+  private folScrollY: number = 0;
+  private folLoadToken: number = 0;
+  private folLastPrefetchY: number = -10000;
+  private folContentH: number = 0;
+  private folViewportH: number = 0;
+  private folScroller: Scroller = new Scroller();
+  // 首页列表控制器：重复点击首页 tab 刷新时回到顶部
+  private homeScroller: Scroller = new Scroller();
+  // 各 feed 浏览位置记忆：推荐流 / 关注动态 分别记录滚动偏移，切回时恢复
+  private homeScrollY: number = 0;
+  private recommendScrollY: number = 0;
+  // 首页 feed 左右滑动转场动画状态：首次挂载豁免（避免与整页 Tab 滑入叠加成双层动画）；切换动画期间锁（防重复触发）
+  private firstHomeMount: boolean = true;
+  private homeFeedSwitching: boolean = false;
+  // 首页预加载测量值：内容高/视口高（普通字段，避免 onAreaChange 高频回调触发 UI 重建）
+  private homeContentH: number = 0;
+  private homeViewportH: number = 0;
+  // 首页预加载节流与竞态：上次触发偏移；请求代际 token（刷新/切feed时递增，旧请求结果直接丢弃）
+  private homeLastPrefetchY: number = -10000;
+  private homeLoadToken: number = 0;
+  // 「仅推荐关注的吧」：关注吧 ID / 吧名集合（会话内缓存，登录/开关变化时失效）。
+  // 两套并存：现代 API 推荐流 forumName 取自 fname/forum_name，关注列表取自 forum.name，
+  // 吧名格式不同源，优先按 forumId 匹配（稳定），forumName 仅作为 forumId 缺失时的兜底。
+  private followForumIds: Set<string> = new Set<string>();
+  private followForumNames: Set<string> = new Set<string>();
+  private followForumNamesLoaded: boolean = false;
+  // 「仅推荐关注的吧」补采游标：已随机采样的吧名，避免连续多轮重复采样同一批吧
+  private backfillSampledForums: Set<string> = new Set<string>();
+  // 首页昵称补校准轮数（仅当仍有占位名作者时最多补 3 轮）
+  private homeReEnrichAttempts: number = 0;
+  // 首页初始化完成标志：冷启动恢复开关触发的首次 Watch 不强制刷新（由冷启动缓存直出接管）
+  private homeInitDone: boolean = false;
+  // 冷启动引导只执行一次（homeBootRequest 可能先于本组件 aboutToAppear 置位）
+  private bootStarted: boolean = false;
+
+  // 延迟初始化：aboutToAppear生命周期阶段UIContext就绪后赋值，避免类字段初始化期获取null
+  private context?: common.UIAbilityContext;
+
+  async aboutToAppear(): Promise<void> {
+    this.isDark = isDarkMode();
+    this.loggedIn = AuthManager.getInstance().isLogin();
+    // 若宿主已完成启动引导（token 已置位），直接开跑；否则等 onBootTick
+    if ((AppStorage.get<number>('homeBootRequest') ?? 0) > 0) {
+      this.startBoot();
+    }
+  }
+
+  /** darkTick 递增（宿主或子 Tab 页切换深色）→ 重读全局深色状态 */
+  private onDarkTick(): void {
+    this.isDark = isDarkMode();
+  }
+
+  /** 宿主 aboutToAppear 各 Manager init + 登录态就绪后通知：冷启动加载（缓存直出，不做后台刷新） */
+  private onBootTick(): void {
+    this.startBoot();
+  }
+
+  private startBoot(): void {
+    if (this.bootStarted) {
+      return;
+    }
+    this.bootStarted = true;
+    this.loggedIn = AuthManager.getInstance().isLogin();
+    this.isDark = isDarkMode();
+    // 冷启动不自动刷新：有缓存直接展示（silentOnCache=false），无缓存时兜底走一次网络
+    const homeLoad = this.loadHomeThreads(false, false);
+    homeLoad.then(() => {
+      // 首页加载（缓存直出或网络兜底）完成后标记初始化完成：
+      // 此后 homeOnlyFollow 变化（仅用户手动切开关）才触发 onHomeOnlyFollowChanged 强制刷新
+      this.homeInitDone = true;
+    });
+  }
+
+  /** 登录/登出/换号（tabLoginRefresh 递增）：失效账号级缓存并重同步登录态。
+   *  注意与旧内联实现一致：只置失效标志/清账号隔离数据，不主动重拉——由后续进入/切 feed 触发 */
+  private onLoginTick(): void {
+    this.loggedIn = AuthManager.getInstance().isLogin();
+    // 登录账号变化：关注吧集合失效（仅推荐关注的吧 需按新账号重新拉取）
+    this.followForumNamesLoaded = false;
+    this.backfillSampledForums.clear();
+    // 关注动态按账号隔离：换号/登出后失效，下次进入重新拉取，避免展示上一账号的关注帖
+    this.folFeedLoaded = false;
+    this.folThreads = [];
+    this.folAll = [];
+    this.folScrollY = 0;
+    // 推荐流「仅关注吧」过滤依赖账号关注集合：同样失效，切回推荐页时按新账号重新加载
+    this.recommendLoaded = false;
+  }
+
+  /** 宿主 onPageShow：从详情页返回时用实时昵称回填当前列表（不重新请求网络） */
+  private onPageTick(): void {
+    this.refreshAuthorsFromCache();
+  }
+
+  /** 宿主底栏重复点击首页 Tab：整页刷新（按当前 feed 重拉第一页，与下拉刷新同一路径） */
+  private onRetapTick(): void {
+    this.reloadHomeFromTab();
+  }
+
+  /**
+   * 安全获取 UIAbilityContext：优先使用已缓存this.context；兜底现场获取
+   */
+  private getUIAbilityContext(): common.UIAbilityContext {
+    if (this.context) {
+      return this.context;
+    }
+    const liveCtx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (liveCtx) {
+      this.context = liveCtx;
+    }
+    return liveCtx;
+  }
+
+  /**
+   * 首页帖子分享：鸿蒙官方Share Kit系统分享面板（参考CSDN Share Kit宿主应用发起分享）
+   * 主路径：@kit.ShareKit → systemShare.SharedData(general.link) + ShareController.show()
+   * 兜底：若ShareKit不可用/分享面板拉起失败，自动降级为写入系统剪贴板，提示用户手动粘贴
+   * 排障：最外层try/catch捕获所有异常→Toast显式反馈，避免用户感觉"点了没反应"
+   */
+  private shareThread(data: ThreadSharePayload): void {
+    try {
+      if (!data || data.tid.length === 0) {
+        this.getUIContext().getPromptAction().showToast({ message: '帖子信息缺失，无法分享' });
+        return;
+      }
+      const threadUrl: string = `https://tieba.baidu.com/p/${data.tid}`;
+      const titleLine: string =
+        data.forumName.length > 0 ? `[${data.forumName}] ${data.title}` : data.title;
+      const rawAbstract: string = data.abstract ?? '';
+      const descriptionText: string =
+        rawAbstract.length > 0
+          ? (rawAbstract.length > 140 ? `${rawAbstract.substring(0, 140)}…` : rawAbstract)
+          : '';
+      const fullText: string =
+        descriptionText.length > 0
+          ? `${titleLine}\n${descriptionText}\n${threadUrl}`
+          : `${titleLine}\n${threadUrl}`;
+      const abilityCtx: common.UIAbilityContext = this.getUIAbilityContext();
+      if (!abilityCtx) {
+        // Context拿不到：直接兜底剪贴板
+        this.getUIContext().getPromptAction().showToast({ message: '系统分享不可用，正在复制链接' });
+        this.copyShareToClipboard(fullText, titleLine, threadUrl);
+        return;
+      }
+
+      // ========== 主路径：Share Kit 系统分享面板 ==========
+      try {
+        // ★ 官方Codelabs L426-438 纯链接分享：utd.UniformDataType.HYPERLINK + content字段（图片才用uri+fileUri）
+        const sharedData: systemShare.SharedData = new systemShare.SharedData({
+          utd: utd.UniformDataType.HYPERLINK,
+          content: threadUrl,
+          title: titleLine,
+          description: descriptionText
+        });
+        const controller: systemShare.ShareController = new systemShare.ShareController(sharedData);
+        // ★ 官方Codelabs关键修正：controller.show()返回Promise，必须单独.catch()才能捕获异步错误
+        controller.show(abilityCtx, {
+          previewMode: systemShare.SharePreviewMode.DETAIL,
+          selectionMode: systemShare.SelectionMode.SINGLE
+        }).then(() => {
+          // Promise.resolve = 系统分享面板已成功拉起（用户可能取消/成功，都算面板弹了）
+          this.getUIContext().getPromptAction().showToast({ message: '系统分享面板已弹出' });
+        }).catch((showErr: BusinessError) => {
+          // Promise异步reject：这里是面板拉起失败（权限/UTD不支持/其他），把code+msg全量Toast便于定位
+          const code = showErr?.code ?? 'unknown';
+          const msg = showErr?.message ?? String(showErr);
+          this.getUIContext().getPromptAction().showToast({
+            message: `分享面板失败[${code}]：${msg}`
+          });
+          this.copyShareToClipboard(fullText, titleLine, threadUrl);
+        });
+        return;
+      } catch (shareErr) {
+        this.getUIContext().getPromptAction().showToast({ message: '系统分享不可用，正在复制链接' });
+        this.copyShareToClipboard(fullText, titleLine, threadUrl);
+      }
+    } catch (outerErr) {
+      // 全局兜底：任何异常都弹Toast，避免用户感觉点了没反应
+      const errMsg: string = outerErr instanceof Error ? outerErr.message : String(outerErr);
+      this.getUIContext().getPromptAction().showToast({ message: `分享异常：${errMsg}` });
+    }
+  }
+
+  /**
+   * 兜底：写入系统剪贴板，保证分享失败时用户仍可粘贴发送（pasteboard @kit.BasicServicesKit）
+   * 任何内部异常都会被外层shareThread捕获弹Toast，避免二次静默失败
+   */
+  private copyShareToClipboard(fullText: string, title: string, url: string): void {
+    try {
+      const sysPasteboard = pasteboard.getSystemPasteboard();
+      const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, fullText);
+      sysPasteboard.setData(pasteData, (err: BusinessError | undefined) => {
+        if (err) {
+          this.getUIContext().getPromptAction().showToast({
+            message: `复制失败：${err.message || String(err)}`
+          });
+        } else {
+          this.getUIContext().getPromptAction().showToast({
+            message: `已复制「${title}」链接，粘贴即可分享`
+          });
+        }
+      });
+    } catch (clipboardErr) {
+      const errMsg: string = clipboardErr instanceof Error ? clipboardErr.message : String(clipboardErr);
+      this.getUIContext().getPromptAction().showToast({
+        message: `剪贴板不可用：${errMsg}；帖子链接：${url}`
+      });
+    }
+  }
+
+  /** 用详情页回填的作者昵称缓存刷新列表显示（不重新请求网络） */
+  private refreshAuthorsFromCache(): void {
+    const service = TiebaService.getInstance();
+    let changed = false;
+    this.updateCurrentThreads(this.currentFeedThreads().map((t: ThreadItem): ThreadItem => {
+      if (t.authorId !== undefined && t.authorId.length > 0) {
+        const cachedName: string | undefined = service.getCachedAuthorName(t.authorId);
+        if (cachedName !== undefined && cachedName.length > 0 && cachedName !== t.author) {
+          changed = true;
+          return {
+            tid: t.tid, postId: t.postId, forumId: t.forumId, title: t.title, forumName: t.forumName,
+            forumAvatar: t.forumAvatar, author: cachedName, authorId: t.authorId, authorAvatar: t.authorAvatar,
+            authorNameShowMissing: t.authorNameShowMissing,
+            replyNum: t.replyNum, likeCount: t.likeCount, isLiked: t.isLiked, abstract: t.abstract,
+            firstImage: t.firstImage, images: t.images, createTime: t.createTime, isTop: t.isTop,
+            isGood: t.isGood, isFeatured: t.isFeatured
+          } as ThreadItem;
+        }
+      }
+      return t;
+    }));
+    if (changed) {
+      console.info('[AUTHORDIAG] 首页列表已用详情页昵称回填刷新');
+    }
+  }
+
+  /** 「仅推荐关注的吧」是否生效：已登录且开关开启 */
+  private shouldOnlyFollow(): boolean {
+    return this.loggedIn && this.homeOnlyFollow;
+  }
+
+  /** 单个吧的一次补采请求：随机 sort_type（0 最近回复 / 1 最新发帖）与页码（1/2），取前 limit 条；失败静默跳过 */
+  private async fetchForumFeedOnce(forumName: string, limit: number): Promise<ThreadItem[]> {
+    try {
+      const sortType: number = Math.random() < 0.5 ? 0 : 1;
+      const page: number = Math.random() < 0.5 ? 1 : 2;
+      const r: PagedResult<ThreadItem> = await TiebaService.getInstance().fetchForumThreads(forumName, page, sortType, false);
+      return r.list.slice(0, limit);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * 「仅推荐关注的吧」关注吧补采：
+   * 从未采样过的关注吧中随机取 N=8 个，每吧随机 sort_type/页码并发拉取，合并去重后半随机时间排序，
+   * 返回最多 targetCount 条；excludeTids 为已展示帖子，补采时跳过避免重复。
+   * 采样游标本轮用尽后自动重置（此时已展示 tid 仍会被排除，信息流不会无限重复）。
+   */
+  private async fetchFollowForumFeed(targetCount: number, excludeTids?: Set<string>): Promise<ThreadItem[]> {
+    const sets: FollowSets | null = await this.getFollowSets();
+    if (sets === null || sets.names.size === 0) {
+      return [];
+    }
+    const allNames: string[] = [];
+    for (const n of sets.names) {
+      allNames.push(n);
+    }
+    let candidates: string[] = [];
+    for (const n of allNames) {
+      if (!this.backfillSampledForums.has(n)) {
+        candidates.push(n);
+      }
+    }
+    if (candidates.length === 0) {
+      this.backfillSampledForums.clear();
+      candidates = allNames.slice();
+    }
+    shuffle(candidates);
+    const sampled: string[] = candidates.slice(0, 8);
+    for (const n of sampled) {
+      this.backfillSampledForums.add(n);
+    }
+    const tasks: Promise<ThreadItem[]>[] = [];
+    for (const name of sampled) {
+      // 单吧请求 4s 超时包装：个别吧接口挂起不拖累整批补采（8 个吧仍并发）
+      tasks.push(this.withFeedTimeout(this.fetchForumFeedOnce(name, 6), 4000));
+    }
+    const chunks: ThreadItem[][] = await Promise.all(tasks);
+    const seen: Set<string> = new Set<string>();
+    if (excludeTids !== undefined) {
+      for (const t of excludeTids) {
+        seen.add(t);
+      }
+    }
+    const merged: ThreadItem[] = [];
+    for (const chunk of chunks) {
+      for (const item of chunk) {
+        if (item.tid.length > 0 && !seen.has(item.tid)) {
+          seen.add(item.tid);
+          merged.push(item);
+        }
+      }
+    }
+    if (merged.length === 0) {
+      return [];
+    }
+    return sortSemiRandomByTime(merged).slice(0, targetCount);
+  }
+
+  /** 补采限时包装：最坏 ms 毫秒内返回（超时按空处理，避免个别吧挂起拖慢首屏/翻页） */
+  private async withFeedTimeout(p: Promise<ThreadItem[]>, ms: number): Promise<ThreadItem[]> {
+    let settled: boolean = false;
+    return await new Promise<ThreadItem[]>((resolve) => {
+      const timer: number = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve([]);
+        }
+      }, ms);
+      p.then((v: ThreadItem[]) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(v);
+        }
+      }).catch(() => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve([]);
+        }
+      });
+    });
+  }
+
+  /**
+   * 拉取关注吧 ID / 吧名集合（会话内缓存；失败返回 null 表示"未知"，调用方退化为正常推荐避免空白）。
+   * 最多拉 3 页（每页 50），覆盖绝大多数账号的关注量。
+   * 注：现代 API 推荐流 forumName 取自 fname/forum_name，关注列表取自 forum.name，字段不同源，
+   * 吧名字符串匹配常常全空——必须用 forumId（数字 ID 跨接口稳定）作为主匹配键，吧名仅作 forumId 缺失时的兜底。
+   */
+  private async getFollowSets(): Promise<FollowSets | null> {
+    if (this.followForumNamesLoaded) {
+      return { ids: this.followForumIds, names: this.followForumNames };
+    }
+    const ids: Set<string> = new Set<string>();
+    const names: Set<string> = new Set<string>();
+    try {
+      // 3 页并发拉取（替代串行 for），首轮等待从 3 个串行请求降到 1 个并发批次；
+      // 单页失败返回空结果，不拖累其余页（任一页可用即正常过滤）
+      const results: PagedResult<FollowItem>[] = await Promise.all([1, 2, 3].map((p: number): Promise<PagedResult<FollowItem>> =>
+        TiebaService.getInstance().fetchFollowList(p)
+          .catch((): PagedResult<FollowItem> => ({ list: [], hasMore: false, page: p }))));
+      for (const r of results) {
+        for (const f of r.list) {
+          if (f.forumId && f.forumId.length > 0) {
+            ids.add(f.forumId);
+          }
+          if (f.forumName && f.forumName.length > 0) {
+            names.add(f.forumName);
+          }
+        }
+      }
+      this.followForumIds = ids;
+      this.followForumNames = names;
+      this.followForumNamesLoaded = true;
+      return { ids, names };
+    } catch (e) {
+      // 拉取失败：本次不过滤（保持正常推荐），下次触发时重试
+      return null;
+    }
+  }
+
+  /**
+   * 首页推荐页获取统一入口：
+   * - 正常模式：单页请求（15 条），保持原有行为
+   * - 仅关注吧模式：单次放大条数 + 按关注吧名过滤，不足目标数量时继续翻页补齐，
+   *   保证推荐数量与正常模式相当；返回 page 为最后实际请求到的页码（供加载更多续接）。
+   */
+  private async fetchHomePage(page: number): Promise<PagedResult<ThreadItem>> {
+    if (!this.shouldOnlyFollow()) {
+      return TiebaService.getInstance().fetchHomeThreads(page, false);
+    }
+    const sets: FollowSets | null = await this.getFollowSets();
+    if (sets === null || (sets.ids.size === 0 && sets.names.size === 0)) {
+      // 关注列表不可用：退化为正常推荐，避免首页空白
+      return TiebaService.getInstance().fetchHomeThreads(page, false);
+    }
+    const targetCount: number = 15;   // 目标条数：与正常推荐一页相当
+    const pageCount: number = 60;     // 单次放大请求条数，减少翻页次数
+    const maxPages: number = 5;       // 兜底上限：最多连续请求页数，避免极端情况下长时间加载
+    const collected: ThreadItem[] = [];
+    const seen: Set<string> = new Set<string>();
+    let p: number = page;
+    let hasMore: boolean = true;
+    let lastReqPage: number = page;
+    // 首批 2 页并发（大幅缩短首轮等待；60 条×2 通常已足够过滤出 15 条），不足时后续单页串行补齐
+    let batch: number = 2;
+    while (p < page + maxPages) {
+      const pageNums: number[] = [];
+      for (let i: number = 0; i < batch && p < page + maxPages; i++) {
+        pageNums.push(p);
+        p++;
+      }
+      const results: PagedResult<ThreadItem>[] = await Promise.all(pageNums.map((pn: number): Promise<PagedResult<ThreadItem>> =>
+        TiebaService.getInstance().fetchHomeThreads(pn, false, pageCount)));
+      for (let i: number = 0; i < results.length; i++) {
+        const result: PagedResult<ThreadItem> = results[i];
+        lastReqPage = pageNums[i];
+        hasMore = result.hasMore;
+        if (result.list.length === 0) {
+          return { list: collected, hasMore, page: lastReqPage };
+        }
+        for (const item of result.list) {
+          if (!seen.has(item.tid)) {
+            seen.add(item.tid);
+            // 优先按 forumId 匹配（跨接口稳定）；仅在 forumId 缺失时回退到吧名匹配
+            const hit: boolean = (item.forumId !== undefined && item.forumId.length > 0 && sets.ids.has(item.forumId))
+              || ((item.forumId === undefined || item.forumId.length === 0) && sets.names.has(item.forumName));
+            if (hit) {
+              collected.push(item);
+            }
+          }
+        }
+        if (!hasMore || collected.length >= targetCount) {
+          return { list: collected, hasMore, page: lastReqPage };
+        }
+      }
+      batch = 1;
+    }
+    return { list: collected, hasMore, page: lastReqPage };
+  }
+
+  /** 开关变化：清关注集合缓存；若停留在推荐页则立即重新加载 */
+  private onHomeOnlyFollowChanged(): void {
+    // 冷启动阶段由 UsageHabitsManager.init 恢复开关状态触发（首页加载尚未执行）：
+    // 跳过强制刷新，首页由 startBoot 的 loadHomeThreads(false,false) 走缓存直出
+    if (!this.homeInitDone) {
+      return;
+    }
+    // 推荐流数据源已变化：切回推荐页时需重新加载（正停留在推荐页时下面立即重载）
+    this.recommendLoaded = false;
+    this.followForumNamesLoaded = false;
+    this.backfillSampledForums.clear();
+    if (this.homeFeed === HomeFeed.Recommended) {
+      this.homePage = 1;
+      this.homeHasMore = true;
+      this.homeStalledPages = 0;
+      if (this.threads.length === 0) {
+        this.loadState = LoadState.Loading;
+      }
+      this.loadHomeThreads(true);
+    }
+  }
+
+  /**
+   * 首页推荐流加载：
+   * - 有缓存（含过期，stale-while-revalidate）→ 立即显示秒开；silentOnCache=true 时后台静默刷新
+   * - 无缓存 → 网络请求后立即渲染，昵称校准后台执行，不阻塞首屏
+   * forceRefresh=true（下拉刷新）跳过缓存直连网络。
+   * silentOnCache=false（冷启动）仅展示缓存，不自动刷新；数据新鲜度由用户主动下拉/切 tab 保证。
+   * 「仅推荐关注的吧」开启时同样缓存直出：缓存即上次过滤加载的结果，冷启动直接展示，主动刷新才重新过滤加载。
+   */
+  async loadHomeThreads(forceRefresh: boolean = false, silentOnCache: boolean = true): Promise<void> {
+    if (this.homeRefreshing) {
+      return;
+    }
+    this.homeRefreshing = true;
+    // 请求代际递增：使 in-flight 的预加载/加载更多结果作废，避免 concat 到刷新后的新列表
+    this.homeLoadToken++;
+    this.homePage = 1;
+    this.homeHasMore = true;
+    this.homeStalledPages = 0;
+    // 「仅推荐关注的吧」补采：刷新时重置采样游标，重新随机采样关注吧
+    this.backfillSampledForums.clear();
+    // 仅在当前列表为空时切骨架屏（首次加载/切换 feed）；已有内容刷新时保留列表原地更新，避免闪屏
+    if (this.threads.length === 0) {
+      this.loadState = LoadState.Loading;
+    }
+    try {
+      if (!forceRefresh) {
+        // 方案B：过期缓存也先显示，冷启动同样秒开；冷启动不再后台刷新，等用户主动操作
+        // 仅关注模式同样缓存直出（缓存内容即上次过滤加载的结果），避免冷启动重复网络加载
+        const cached = await CacheManager.getInstance().getWithTtlAllowStale<ThreadItem[]>(CACHE_KEY.THREAD_LIST);
+        if (cached && cached.data.length > 0) {
+          this.threads = cached.data;
+          this.loadState = LoadState.Success;
+          this.recommendLoaded = true;
+          this.homeRefreshing = false;
+          if (silentOnCache) {
+            this.refreshHomeSilently();
+          }
+          return;
+        }
+      }
+      // 方案A：请求 + 立即渲染，昵称校准后台执行不阻塞首屏；8s 刷新超时兜底，弱网/接口挂起不无限转圈
+      const result = await this.withFeedRefreshTimeout(this.fetchHomePage(1));
+      let list: ThreadItem[] = result.list;
+      if (this.shouldOnlyFollow() && list.length < 15) {
+        // 推荐流过滤不足目标数量：触发关注吧补采，补齐到一屏再渲染，避免“不满一屏反复自动翻页”
+        const exclude: Set<string> = new Set<string>();
+        for (const item of list) {
+          exclude.add(item.tid);
+        }
+        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(15 - list.length, exclude), 5000);
+        if (backfill.length > 0) {
+          list = list.concat(backfill);
+          // 合并后统一半随机时间排序（仅关注吧模式）
+          list = sortSemiRandomByTime(list);
+        }
+      }
+      this.threads = list;
+      this.recommendLoaded = true;
+      this.homePage = result.page;
+      this.homeHasMore = list.length > 0;
+      if (this.shouldOnlyFollow() && list.length < 15) {
+        // 关注吧补采仍不足一屏：直接到底，避免不满一屏时 onAreaChange 反复触发自动加载
+        this.homeHasMore = false;
+      }
+      this.homeStalledPages = 0;
+      this.loadState = list.length > 0 ? LoadState.Success : LoadState.Empty;
+      if (list.length > 0) {
+        this.enrichHomeInBackground(list);
+        await CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, list, CACHE_TTL.THREAD_LIST);
+      }
+    } catch (e) {
+      if (this.threads.length === 0) {
+        this.loadState = LoadState.Error;
+        this.errorMsg = (e as Error).message ?? '推荐内容加载失败';
+      } else {
+        // 刷新超时/失败：保留旧内容，仅提示（下拉刷新/整页刷新场景）
+        this.getUIContext().getPromptAction().showToast({ message: '刷新失败，已展示上次内容' });
+      }
+    } finally {
+      this.homeRefreshing = false;
+    }
+  }
+
+  /** 缓存命中后的后台静默刷新：更新列表并回写缓存，失败保留缓存内容 */
+  private refreshHomeSilently(): void {
+    this.fetchHomePage(1).then((result) => {
+      if (result.list.length === 0) {
+        return;
+      }
+      this.homePage = result.page;
+      this.threads = result.list;
+      this.homeHasMore = result.list.length > 0;
+      this.homeStalledPages = 0;
+      this.enrichHomeInBackground(result.list);
+      CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, result.list, CACHE_TTL.THREAD_LIST);
+    }).catch((e: Error) => {
+      // 静默刷新失败保留缓存内容展示，仅记录日志
+      console.info(`[HomeTab] home silent refresh fail: ${e.message}`);
+    });
+  }
+
+  /** 占位名判断：吧友XXXX / 贴吧用户_xxx / 贴吧用户（推荐页 JSON 缺 name_show 时的兜底名） */
+  private isPlaceholderAuthorName(name: string | undefined): boolean {
+    if (name === undefined || name.length === 0) {
+      return false;
+    }
+    return name === '贴吧用户' || name.startsWith('贴吧用户_') || name.startsWith('吧友');
+  }
+
+  /**
+   * 首页昵称后台校准：拉取 profile 后按 authorId diff 局部替换，不阻塞首屏。
+   * v1.22 首轮校准后若仍有占位名作者（profile 超时/风控/瞬时失败，且 enrich 只在重新
+   * 拉列表时触发），延迟补校准，覆盖用户停留在页面期间自动补齐，最终与详情页/个人信息页一致。
+   */
+  private enrichHomeInBackground(list: ThreadItem[]): void {
+    TiebaService.getInstance().enrichHomeAuthors(list).then((enriched: ThreadItem[]) => {
+      this.applyEnrichedAuthors(enriched);
+      this.scheduleHomeAuthorReEnrich();
+    }).catch((_: Error) => {
+      // 校准失败保留接口昵称，不影响列表展示
+    });
+  }
+
+  /** 补校准轮询：仅当当前列表仍有占位名作者时，间隔 4s 再补一轮，最多补 3 轮 */
+  private scheduleHomeAuthorReEnrich(): void {
+    if (this.homeReEnrichAttempts >= 3) {
+      return;
+    }
+    const hasPlaceholder: boolean = this.currentFeedThreads().some((t: ThreadItem): boolean =>
+      (t.authorId !== undefined && t.authorId.length > 0) && this.isPlaceholderAuthorName(t.author));
+    if (!hasPlaceholder) {
+      return;
+    }
+    const snapshot: ThreadItem[] = this.currentFeedThreads();
+    this.homeReEnrichAttempts += 1;
+    setTimeout(() => {
+      TiebaService.getInstance().enrichHomeAuthors(snapshot).then((enriched: ThreadItem[]) => {
+        this.applyEnrichedAuthors(enriched);
+        this.scheduleHomeAuthorReEnrich();
+      }).catch((_: Error) => {
+        // 补校准失败，等待下一轮 / 用户手动刷新
+      });
+    }, 4000);
+  }
+
+  /** 将校准结果按 authorId diff 更新到当前列表（兼容校准期间已加载更多） */
+  private applyEnrichedAuthors(enriched: ThreadItem[]): void {
+    const nameMap: Map<string, string> = new Map<string, string>();
+    for (const e of enriched) {
+      const id: string = `${e.authorId ?? ''}`;
+      if (id.length > 0 && e.author.length > 0) {
+        nameMap.set(id, e.author);
+      }
+    }
+    if (nameMap.size === 0) {
+      return;
+    }
+    let changed: boolean = false;
+    const updated: ThreadItem[] = this.currentFeedThreads().map((t: ThreadItem): ThreadItem => {
+      const id: string = `${t.authorId ?? ''}`;
+      const nick: string | undefined = nameMap.get(id);
+      if (nick !== undefined && nick.length > 0 && nick !== t.author) {
+        changed = true;
+        return {
+          tid: t.tid, postId: t.postId, forumId: t.forumId, title: t.title, forumName: t.forumName,
+          forumAvatar: t.forumAvatar, author: nick, authorId: t.authorId, authorAvatar: t.authorAvatar,
+          authorNameShowMissing: t.authorNameShowMissing,
+          replyNum: t.replyNum, likeCount: t.likeCount, isLiked: t.isLiked, abstract: t.abstract,
+          firstImage: t.firstImage, images: t.images, createTime: t.createTime, isTop: t.isTop,
+          isGood: t.isGood, isFeatured: t.isFeatured
+        } as ThreadItem;
+      }
+      return t;
+    });
+    if (changed) {
+      this.updateCurrentThreads(updated);
+    }
+  }
+
+  async loadMoreHomeThreads(silent: boolean = false): Promise<void> {
+    if (this.homeLoadingMore || !this.homeHasMore || this.threads.length === 0) {
+      return;
+    }
+    this.homeLoadingMore = true;
+    // 记录当前代际：返回时若已刷新/切feed则丢弃结果
+    const myToken: number = this.homeLoadToken;
+    try {
+      const exclude: Set<string> = new Set<string>();
+      for (const item of this.threads) {
+        exclude.add(item.tid);
+      }
+      let appended: ThreadItem[] = [];
+      if (this.shouldOnlyFollow()) {
+        // 仅关注吧模式：推荐流已翻尽，直接补采一轮关注吧近期帖子（随机采样、跳过已展示）
+        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(15, exclude), 5000);
+        if (myToken !== this.homeLoadToken) {
+          return;
+        }
+        appended = backfill;
+      } else {
+        const nextPage = this.homePage + 1;
+        const result = await this.fetchHomePage(nextPage);
+        if (myToken !== this.homeLoadToken) {
+          return;
+        }
+        for (const item of result.list) {
+          if (!exclude.has(item.tid)) {
+            exclude.add(item.tid);
+            appended.push(item);
+          }
+        }
+        // 更新为最后实际请求到的页码（仅关注吧模式不依赖翻页，此处仅正常模式推进）
+        this.homePage = result.page;
+      }
+      if (appended.length > 0) {
+        this.threads = this.threads.concat(appended);
+        this.homeStalledPages = 0;
+        // 新增项的昵称后台校准，不阻塞翻页
+        this.enrichHomeInBackground(appended);
+        await CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, this.threads, CACHE_TTL.THREAD_LIST);
+      } else {
+        // 补采/翻页均无新内容：只允许少量连续空轮，随后保护性停止，
+        // 避免无限请求（正常模式可能返回重复页；仅关注吧模式可能关注吧帖子已枯竭）。
+        this.homeStalledPages += 1;
+      }
+      this.homeHasMore = this.homeStalledPages < 3;
+    } catch (e) {
+      // 预加载失败静默忽略，靠 onReachEnd 兜底重试；仅用户主动触底时提示
+      if (!silent) {
+        this.getUIContext().getPromptAction().showToast({ message: '加载更多失败，请稍后重试' });
+      }
+    } finally {
+      this.homeLoadingMore = false;
+    }
+  }
+
+  /** 当前激活 feed 的列表数据源（点赞/昵称回填等就地更新用） */
+  private currentFeedThreads(): ThreadItem[] {
+    return this.homeFeed === HomeFeed.Following ? this.folThreads : this.threads;
+  }
+
+  /** 将更新后的列表写回当前激活 feed 的数据源 */
+  private updateCurrentThreads(updated: ThreadItem[]): void {
+    if (this.homeFeed === HomeFeed.Following) {
+      this.folThreads = updated;
+    } else {
+      this.threads = updated;
+    }
+  }
+
+  /** v1.17 首页推荐/关注动态左右滑动转场（同收藏页分类 Tab 范式）：dir=-1 左侧页（推荐），dir=1 右侧页（关注动态）。
+   *  进出都从/向本侧平移，切换时旧视图滑出 + 新视图滑入，效果等同底部 Tab 的"推开"。
+   *  不加透明度，避免两页交错时透出背景显得生硬；两页互推更贴近原生分段切换。 */
+  private feedTabTransition(dir: number): TransitionEffect {
+    const x: string = dir < 0 ? '-100%' : '100%';
+    return TransitionEffect.asymmetric(
+      // 出现：从本侧滑入
+      TransitionEffect.translate({ x: x })
+        .animation({ duration: 300, curve: Curve.EaseOut }),
+      // 消失：向本侧滑出
+      TransitionEffect.translate({ x: x })
+        .animation({ duration: 280, curve: Curve.EaseInOut })
+    );
+  }
+
+  private selectHomeFeed(feed: HomeFeed): void {
+    // 切走前记录当前 feed 浏览位置（数据各自常驻，无需另存内容）
+    if (this.homeFeed === HomeFeed.Following) {
+      this.folScrollY = this.homeScrollY;
+    } else if (this.homeFeed === HomeFeed.Recommended) {
+      this.recommendScrollY = this.homeScrollY;
+    }
+    const targetState: LoadState = feed === HomeFeed.Following ? this.folState : this.loadState;
+    if (this.homeFeed === feed && targetState !== LoadState.Error) {
+      return;
+    }
+    if (feed === HomeFeed.Following && !this.loggedIn) {
+      this.openLogin();
+      return;
+    }
+    // 左右滑动转场：置位切换动画状态（旧视图滑出 / 新视图滑入），动画期间锁防重复触发
+    this.homeFeedSwitching = true;
+    this.firstHomeMount = false;
+    this.homeFeed = feed;
+    this.errorMsg = '';
+    if (feed === HomeFeed.Recommended) {
+      if (this.recommendLoaded) {
+        // 已加载过：不重新拉取，直接恢复常驻内容与上次浏览位置（与关注动态一致）
+        this.restoreHomeScroll();
+      } else {
+        // 首次进入或数据源已失效（换号/「仅关注吧」开关变化）：加载第一页（缓存秒开）
+        this.loadHomeThreads();
+      }
+    } else if (this.folFeedLoaded) {
+      // 已加载过：不重新拉取，直接恢复常驻内容与浏览位置（关注动态内容随会话保留）
+      this.restoreHomeScroll();
+    } else {
+      // 冷启动首次进入：自动加载
+      this.loadFollowingThreads();
+    }
+    // 外层滑动转场结束后复位切换锁（时长取转场 300ms 上限 + 余量）
+    setTimeout(() => { this.homeFeedSwitching = false; }, 400);
+  }
+
+  /** 切回已加载 feed 时恢复上次浏览位置（内容渲染完成后再定位） */
+  private restoreHomeScroll(): void {
+    const targetY: number = this.homeFeed === HomeFeed.Following ? this.folScrollY : this.recommendScrollY;
+    if (targetY <= 0) {
+      return;
+    }
+    const scroller: Scroller = this.homeFeed === HomeFeed.Following ? this.folScroller : this.homeScroller;
+    const feed: HomeFeed = this.homeFeed;
+    const feedState: LoadState = feed === HomeFeed.Following ? this.folState : this.loadState;
+    setTimeout(() => {
+      if (this.homeFeed === feed && feedState === LoadState.Success) {
+        scroller.scrollTo({ xOffset: 0, yOffset: targetY, animation: { duration: 0 } });
+      }
+    }, 80);
+  }
+
+  private showFollowingFeed(): void {
+    this.selectHomeFeed(HomeFeed.Following);
+  }
+
+  /** 首页搜索入口：打开全吧搜索（搜吧 / 搜贴 / 搜人） */
+  private openSearchFromHome(): void {
+    try {
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/Search' })
+        .catch((err: Error) => {
+          this.getUIContext().getPromptAction().showToast({
+            message: `打开搜索失败：${err instanceof Error ? err.message : String(err)}`
+          });
+        });
+    } catch (e) {
+      this.getUIContext().getPromptAction().showToast({
+        message: `打开搜索失败：${e instanceof Error ? e.message : String(e)}`
+      });
+    }
+  }
+
+  /** 重复点击首页 tab 的整页刷新：按当前 feed 重拉第一页，与下拉刷新走同一路径（推荐强制走网络，不做缓存直出） */
+  private reloadHomeFromTab(): void {
+    // 先回到列表最顶部，再触发刷新（与主流 App 行为一致）
+    if (this.homeFeed === HomeFeed.Following) {
+      if (this.folState === LoadState.Success) {
+        this.folScroller.scrollEdge(Edge.Top);
+      }
+      this.loadFollowingThreads();
+    } else {
+      if (this.loadState === LoadState.Success) {
+        this.homeScroller.scrollEdge(Edge.Top);
+      }
+      this.loadHomeThreads(true);
+    }
+  }
+
+  private async loadFollowingThreads(): Promise<void> {
+    if (this.folRefreshing || this.folLoadingMore) {
+      return;
+    }
+    this.folRefreshing = true;
+    // 请求代际递增：使 in-flight 的预加载/加载更多结果作废，避免 concat 到刷新后的新列表
+    this.folLoadToken++;
+    const myToken: number = this.folLoadToken;
+    // 缓存按账号隔离：换号/登出后 key 变化，不会展示上一账号的关注帖
+    const cacheKey: string = `${CACHE_KEY.FOLLOW_FEED}_${this.accountId()}`;
+    // 仅在当前列表为空时切骨架屏；已有内容刷新时保留列表原地更新，避免闪屏
+    if (this.folThreads.length === 0) {
+      this.folState = LoadState.Loading;
+    }
+    // 先尝试缓存直出（stale-while-revalidate）：聚合拉取完成前先渲染上次结果秒开；
+    // 缓存命中不阻断网络聚合，完成后原地替换（ForEach 按 tid 复用节点，无闪烁）
+    try {
+      const cached = await CacheManager.getInstance().getWithTtlAllowStale<ThreadItem[]>(cacheKey);
+      if (cached && cached.data.length > 0) {
+        this.applyFolSnapshot(cached.data);
+      }
+    } catch (e) {
+    }
+    // 流式应用快照：网络聚合的增量中间态回调（并发窗口先到先得）。
+    // 关键保护：除首屏空白外的中间态，必须相对当前已展示列表是"纯尾部追加"
+    // （前 min(已展示, 新) 项 tid 顺序完全一致）才应用；
+    // 否则跳过——避免迟返回用户的更新帖插入顶部、把已展示的顶部内容顶掉，
+    // 造成"加载过程中先出现其它顺序帖子、再变正确顺序"的顶部跳变。
+    // 最终全量在下方 await 返回后单独强制应用，保证内容最终正确完整。
+    // - 首屏空白（folThreads=0）→ 首个非空中间态直接应用（流式秒开）
+    // - 已有首屏（缓存直出或首批已应用）→ 走纯追加判定；纯追加则增长、否则跳过
+    let initialApplied: boolean = false;
+    const applySnapshot = (list: ThreadItem[]): void => {
+      if (myToken !== this.folLoadToken) {
+        return;
+      }
+      if (list.length === 0) {
+        return;
+      }
+      if (!initialApplied) {
+        initialApplied = true;
+        // 首屏空白：直接应用，让最快返回的用户帖子秒出首屏
+        if (this.folThreads.length === 0) {
+          this.applyFolSnapshot(list);
+          return;
+        }
+        // 已有首屏（缓存直出）：走纯追加判定，不直接覆盖
+      }
+      // 已应用过首屏：要求纯尾部追加才应用
+      if (list.length <= this.folThreads.length) {
+        return;
+      }
+      const n: number = this.folThreads.length;
+      let pureAppend: boolean = true;
+      for (let i = 0; i < n; i++) {
+        if (list[i].tid !== this.folThreads[i].tid) {
+          pureAppend = false;
+          break;
+        }
+      }
+      if (!pureAppend) {
+        return;
+      }
+      this.applyFolSnapshot(list);
+    };
+    try {
+      // 网络聚合拉取（关注用户列表 + 各人最新发帖），每次进入/刷新都保证最新；
+      // 8s 刷新超时兜底：弱网/接口挂起时最坏 8 秒结束，避免刷新转圈无上限
+      const list = await this.withFeedRefreshTimeout(
+        TiebaService.getInstance().fetchFollowingUserFeed(applySnapshot));
+      if (myToken !== this.folLoadToken) {
+        return;
+      }
+      // 最终全量：网络聚合完成即最终态（可能少于缓存直出，属正常），强制应用
+      this.applyFolSnapshot(list);
+      // 聚合成功回写缓存（异步不阻塞），保证下次进入/刷新秒开
+      if (list.length > 0) {
+        CacheManager.getInstance().putWithTtl(cacheKey, list, CACHE_TTL.FOLLOW_FEED).catch(() => {
+        });
+      }
+    } catch (e) {
+      if (myToken !== this.folLoadToken) {
+        return;
+      }
+      // 超时/失败：作废在途聚合结果（底层 fetchFollowingUserFeed 仍在跑，其 onBatch 到达时 token 已变，直接丢弃）
+      this.folLoadToken++;
+      // 首批失败才进错误态；已有缓存/内容（超时兜底）时保留现状
+      if (this.folAll.length === 0) {
+        this.folState = LoadState.Error;
+        this.errorMsg = '关注动态加载失败，请稍后重试';
+      } else {
+        this.getUIContext().getPromptAction().showToast({ message: '刷新超时，已展示上次内容' });
+      }
+    } finally {
+      this.folRefreshing = false;
+    }
+  }
+
+  /** 首页 feed 刷新超时兜底：弱网/接口挂起时最多转 8 秒，超时按失败处理（调用方保留旧内容） */
+  private withFeedRefreshTimeout<T>(promise: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve: (v: T) => void, reject: (e: Error) => void) => {
+      const timer: number = setTimeout(() => {
+        reject(new Error('刷新超时，请检查网络'));
+      }, 8000);
+      promise.then((value: T) => {
+        clearTimeout(timer);
+        resolve(value);
+      }).catch((e: Error) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+  }
+
+  /** 应用关注动态全量快照：切片分页 + 状态更新（缓存直出与网络聚合共用） */
+  private applyFolSnapshot(list: ThreadItem[]): void {
+    // 保留已展示条数下限：增量回调可能发生在已向下翻页之后（folThreads 超过一页），
+    // 新快照只增不减，避免中间态把已加载的下一页"收回"导致列表跳动
+    const keep = Math.max(this.folThreads.length, FOLLOW_FEED_PAGE_SIZE);
+    this.folAll = list;
+    this.folThreads = list.slice(0, keep);
+    this.folPage = 1;
+    this.folHasMore = list.length > this.folThreads.length;
+    this.folStalledPages = 0;
+    this.folState = this.folThreads.length > 0 ? LoadState.Success : LoadState.Empty;
+    // 加载成功即视为"已加载过"，后续切换不再自动重新拉取
+    this.folFeedLoaded = true;
+  }
+
+  private async loadMoreFollowingThreads(silent: boolean = false): Promise<void> {
+    if (this.folLoadingMore || !this.folHasMore || this.folThreads.length === 0) {
+      return;
+    }
+    this.folLoadingMore = true;
+    // 记录当前代际：返回时若已刷新/切feed则丢弃结果
+    const myToken: number = this.folLoadToken;
+    try {
+      const nextStart: number = this.folThreads.length;
+      if (nextStart >= this.folAll.length) {
+        this.folHasMore = false;
+        return;
+      }
+      // 本地切片分页：聚合结果已在 service 端按时间倒序并去重，直接切片即可，零网络请求
+      const appended: ThreadItem[] = this.folAll.slice(nextStart, nextStart + FOLLOW_FEED_PAGE_SIZE);
+      if (myToken !== this.folLoadToken) {
+        return;
+      }
+      this.folThreads = this.folThreads.concat(appended);
+      this.folPage++;
+      this.folHasMore = this.folAll.length > this.folThreads.length;
+      this.folStalledPages = 0;
+    } catch (e) {
+      // 本地切片无网络，异常仅作兜底；预加载失败静默忽略
+      if (!silent) {
+        this.getUIContext().getPromptAction().showToast({ message: '加载关注动态失败，请稍后重试' });
+      }
+    } finally {
+      this.folLoadingMore = false;
+    }
+  }
+
+  /**
+   * 首页预加载：滚动剩余距离 < 阈值时提前静默加载下一页，实现触底无缝续流。
+   * - 剩余距离 = 内容高 − 视口高 − 当前偏移（由 onAreaChange 测量）
+   * - homeLoadingMore 锁 + 偏移节流防重；onReachEnd 保留作兜底（锁会挡住重复请求）
+   */
+  private onHomeScroll(_x: number, y: number): void {
+    // 无条件记录当前 feed 浏览位置（切走/切回时恢复）
+    this.homeScrollY = y;
+    if (this.homeFeed === HomeFeed.Following) {
+      this.folScrollY = y;
+    } else {
+      this.recommendScrollY = y;
+    }
+    if (this.homeFeed === HomeFeed.Following) {
+      // 关注动态预加载：使用关注流独立测量值与状态
+      if (this.folState !== LoadState.Success || this.folLoadingMore || !this.folHasMore) {
+        return;
+      }
+      const remaining: number = this.folContentH - this.folViewportH - y;
+      if (remaining > HOME_PREFETCH_DISTANCE) {
+        return;
+      }
+      // 节流：偏移变化超过 120vp 才允许再次触发，避免同一轮滚动连续请求
+      if (Math.abs(y - this.folLastPrefetchY) < 120) {
+        return;
+      }
+      this.folLastPrefetchY = y;
+      this.loadMoreFollowingThreads(true);
+    } else {
+      if (this.loadState !== LoadState.Success || this.homeLoadingMore || !this.homeHasMore) {
+        return;
+      }
+      const remaining: number = this.homeContentH - this.homeViewportH - y;
+      if (remaining > HOME_PREFETCH_DISTANCE) {
+        return;
+      }
+      // 节流：偏移变化超过 120vp 才允许再次触发，避免同一轮滚动连续请求
+      if (Math.abs(y - this.homeLastPrefetchY) < 120) {
+        return;
+      }
+      this.homeLastPrefetchY = y;
+      this.loadMoreHomeThreads(true);
+    }
+  }
+
+  /** 内容尺寸变化：记录内容高；不满一屏时直接预取下一页（Scroll 无滚动，onReachEnd/onScroll 均不触发） */
+  private onHomeContentAreaChange(oldValue: Area, newValue: Area): void {
+    const h: number = newValue.height as number;
+    if (this.homeFeed === HomeFeed.Following) {
+      this.folContentH = h;
+      if (this.folState === LoadState.Success && !this.folLoadingMore && this.folHasMore
+        && this.folViewportH > 0 && this.folContentH <= this.folViewportH) {
+        this.loadMoreFollowingThreads(true);
+      }
+    } else {
+      this.homeContentH = h;
+      if (this.loadState === LoadState.Success && !this.homeLoadingMore && this.homeHasMore
+        && this.homeViewportH > 0 && this.homeContentH <= this.homeViewportH) {
+        this.loadMoreHomeThreads(true);
+      }
+    }
+  }
+
+  /** 视口尺寸变化：记录视口高（按当前 feed 分别记录） */
+  private onHomeViewportAreaChange(oldValue: Area, newValue: Area): void {
+    if (this.homeFeed === HomeFeed.Following) {
+      this.folViewportH = newValue.height as number;
+    } else {
+      this.homeViewportH = newValue.height as number;
+    }
+  }
+
+  /** 左右滑动手势切换首页 feed：左滑 → 关注动态，右滑 → 推荐；动画期间锁防连滑错乱
+   *  PanGesture.onActionEnd 的 offsetX 为水平总位移：负值=左滑，正值=右滑 */
+  private onHomeFeedPanEnd(event: GestureEvent): void {
+    if (this.homeFeedSwitching) {
+      return;
+    }
+    const dx: number = event.offsetX;
+    if (dx < -80 && this.homeFeed === HomeFeed.Recommended) {
+      // 左滑：切到关注动态
+      this.showFollowingFeed();
+    } else if (dx > 80 && this.homeFeed === HomeFeed.Following) {
+      // 右滑：切回推荐
+      this.selectHomeFeed(HomeFeed.Recommended);
+    }
+  }
+
+  private accountId(): string {
+    return AuthManager.getInstance().getUser()?.userId ?? '';
+  }
+
+  private openLogin(): void {
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/Login' });
+  }
+
+  /** 首页卡片点击作者头像/名称：跳转作者用户主页 */
+  private openUserProfile(authorId: string, author: string): void {
+    const id: string = `${authorId ?? ''}`.trim();
+    if (id.length === 0) {
+      this.getUIContext().getPromptAction().showToast({ message: '该用户信息暂不可用' });
+      return;
+    }
+    this.getUIContext().getRouter().pushUrl({
+      url: 'pages/UserProfile',
+      params: { userId: id, userName: author }
+    }).catch(() => {
+      this.getUIContext().getPromptAction().showToast({ message: '用户主页打开失败，请稍后重试' });
+    });
+  }
+
+  private async recordHistory(item: ThreadItem): Promise<void> {
+    const historyItem: PersonalContentItem = {
+      id: item.tid,
+      tid: item.tid,
+      title: item.title,
+      forumName: item.forumName,
+      forumId: item.forumId ?? '',
+      forumAvatar: item.forumAvatar ?? '',
+      author: item.author,
+      abstract: item.abstract,
+      replyNum: item.replyNum,
+      createTime: item.createTime
+    };
+    const accountId: string = AuthManager.getInstance().getUser()?.userId ?? '';
+    if (accountId.length > 0) {
+      historyItem.accountId = accountId;
+      await CacheManager.getInstance().appendJsonItem(`${CACHE_KEY.PERSONAL_HISTORY}_${accountId}`, historyItem);
+    }
+  }
+
+  private openThread(item: ThreadItem): void {
+    const tid = item.tid.trim();
+    if (tid.length === 0) {
+      this.getUIContext().getPromptAction().showToast({ message: '帖子信息暂不可用' });
+      return;
+    }
+    this.recordHistory(item);
+    // 点击即预取：利用跳转动画窗口后台取详情，详情页打开即命中缓存秒开
+    TiebaService.getInstance().prefetchThreadDetail(tid, item.forumId ?? '');
+    this.getUIContext().getRouter().pushUrl({
+      url: 'pages/ThreadDetail',
+      params: { tid: tid, forum: item.forumName, fid: item.forumId ?? '' }
+    }).catch(() => {
+      this.getUIContext().getPromptAction().showToast({ message: '帖子打开失败，请稍后重试' });
+    });
+  }
+
+  private async handleLike(tid: string, postId: string, liked: boolean): Promise<void> {
+    try {
+      const result = await TiebaService.getInstance().togglePostAgree(tid, postId, liked);
+      if (result) {
+        this.updateCurrentThreads(this.currentFeedThreads().map((t: ThreadItem) => {
+          if (t.tid === tid) {
+            const updated: ThreadItem = {
+              tid: t.tid, postId: t.postId, forumId: t.forumId,
+              title: t.title, forumName: t.forumName, forumAvatar: t.forumAvatar,
+              author: t.author, authorAvatar: t.authorAvatar,
+              replyNum: t.replyNum,
+              likeCount: (t.likeCount ?? 0) + (liked ? 1 : -1),
+              isLiked: liked,
+              abstract: t.abstract, firstImage: t.firstImage,
+              images: t.images, createTime: t.createTime,
+              isTop: t.isTop, isGood: t.isGood,
+            };
+            return updated;
+          }
+          return t;
+        }));
+      }
+    } catch (e) {
+      const msg = (e as Error).message ?? '操作失败';
+      this.getUIContext().getPromptAction().showToast({ message: msg });
+    }
+  }
+
+  @Builder
+  RecommendedFeed() {
+    Column() {
+      if (this.loadState === LoadState.Loading) {
+        ThreadListSkeleton()
+          .width('100%')
+          .layoutWeight(1)
+      } else if (this.loadState === LoadState.Error) {
+        ErrorView({
+          message: this.errorMsg,
+          onRetry: () => {
+            this.loadHomeThreads();
+          }
+        }).layoutWeight(1)
+      } else if (this.loadState === LoadState.Empty) {
+        EmptyView({
+          message: '暂时没有推荐内容',
+          icon: '○'
+        }).layoutWeight(1)
+      } else {
+        // 刷新区整体下移到"推荐/关注动态"按钮下方：系统默认指示器从按钮下方出现，跟手、松手刷新
+        Refresh({ refreshing: this.homeRefreshing, offset: 48, friction: 62 }) {
+          Scroll(this.homeScroller) {
+            Column() {
+              ForEach(this.threads, (item: ThreadItem) => {
+                ThreadCard({
+                  item: {
+                    tid: item.tid,
+                    postId: item.postId ?? '',
+                    forumId: item.forumId,
+                    title: item.title,
+                    forumName: item.forumName,
+                    forumAvatar: item.forumAvatar ?? '',
+                    author: item.author,
+                    authorId: item.authorId,
+                    authorAvatar: item.authorAvatar ?? '',
+                    replyNum: item.replyNum,
+                    likeCount: item.likeCount ?? 0,
+                    isLiked: item.isLiked ?? false,
+                    abstract: item.abstract,
+                    firstImage: item.firstImage ?? '',
+                    images: item.images ?? [],
+                    createTime: item.createTime,
+                    isTop: item.isTop,
+                    isGood: item.isGood,
+                  } as ThreadItemData,
+                  onTap: (_tid: string) => this.openThread(item),
+                  onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                  onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                  onComment: (_tid: string) => this.openThread(item),
+                  onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                })
+                .margin({ bottom: Spacing.md })
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+
+              // 预加载/触底加载进行中的占位尾卡：触底时也有"正在加载"反馈，避免空等停顿感
+              if (this.homeLoadingMore && this.homeHasMore) {
+                Row({ space: 8 }) {
+                  LoadingProgress()
+                    .width(20)
+                    .height(20)
+                  Text('正在加载更多…')
+                    .fontSize(13)
+                    .fontColor('#8A8A8A')
+                }
+                .width('100%')
+                .height(56)
+                .justifyContent(FlexAlign.Center)
+                .margin({ bottom: Spacing.md })
+              }
+
+              // 底部空间
+              Column()
+                .width('100%')
+                .height(150)
+            }
+            .width('100%')
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
+            .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeContentAreaChange(oldValue, newValue))
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeViewportAreaChange(oldValue, newValue))
+          .onScroll((xOffset: number, yOffset: number) => this.onHomeScroll(xOffset, yOffset))
+          .onReachEnd(() => {
+            if (this.loadState === LoadState.Success && !this.homeLoadingMore) {
+              this.loadMoreHomeThreads();
+            }
+          })
+        }
+        .width('100%')
+        .margin({ top: HOME_TOP_PAD })
+        .layoutWeight(1)
+        .backgroundColor(Color.Transparent)
+        .clip(false)
+        .onRefreshing(() => {
+          this.homeRefreshing = false;
+          // 下拉刷新强制走网络，不做缓存直出
+          this.loadHomeThreads(true);
+        })
+      }
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .backgroundColor(Color.Transparent)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    .overlay(this.BottomFadeOverlay())
+    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+  }
+
+  /** 关注动态视图：fol* 独立数据源，常驻不销毁，切换时保留内容与滚动位置 */
+  @Builder
+  FollowingFeed() {
+    Column() {
+      if (this.folState === LoadState.Loading) {
+        ThreadListSkeleton()
+          .width('100%')
+          .layoutWeight(1)
+      } else if (this.folState === LoadState.Error) {
+        ErrorView({
+          message: this.errorMsg,
+          onRetry: () => {
+            this.loadFollowingThreads();
+          }
+        }).layoutWeight(1)
+      } else if (this.folState === LoadState.Empty) {
+        EmptyView({
+          message: '暂时没有关注动态',
+          icon: '○'
+        }).layoutWeight(1)
+      } else {
+        Refresh({ refreshing: this.folRefreshing, offset: 48, friction: 62 }) {
+          Scroll(this.folScroller) {
+            Column() {
+              ForEach(this.folThreads, (item: ThreadItem) => {
+                ThreadCard({
+                  item: {
+                    tid: item.tid,
+                    postId: item.postId ?? '',
+                    forumId: item.forumId,
+                    title: item.title,
+                    forumName: item.forumName,
+                    forumAvatar: item.forumAvatar ?? '',
+                    author: item.author,
+                    authorId: item.authorId,
+                    authorAvatar: item.authorAvatar ?? '',
+                    replyNum: item.replyNum,
+                    likeCount: item.likeCount ?? 0,
+                    isLiked: item.isLiked ?? false,
+                    abstract: item.abstract,
+                    firstImage: item.firstImage ?? '',
+                    images: item.images ?? [],
+                    createTime: item.createTime,
+                    isTop: item.isTop,
+                    isGood: item.isGood,
+                  } as ThreadItemData,
+                  onTap: (_tid: string) => this.openThread(item),
+                  onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                  onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                  onComment: (_tid: string) => this.openThread(item),
+                  onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                })
+                .margin({ bottom: Spacing.md })
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+
+              // 预加载/触底加载进行中的占位尾卡
+              if (this.folLoadingMore && this.folHasMore) {
+                Row({ space: 8 }) {
+                  LoadingProgress()
+                    .width(20)
+                    .height(20)
+                  Text('正在加载动态…')
+                    .fontSize(13)
+                    .fontColor('#8A8A8A')
+                }
+                .width('100%')
+                .height(56)
+                .justifyContent(FlexAlign.Center)
+                .margin({ bottom: Spacing.md })
+              }
+
+              // 底部空间
+              Column()
+                .width('100%')
+                .height(150)
+            }
+            .width('100%')
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
+            .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeContentAreaChange(oldValue, newValue))
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeViewportAreaChange(oldValue, newValue))
+          .onScroll((xOffset: number, yOffset: number) => this.onHomeScroll(xOffset, yOffset))
+          .onReachEnd(() => {
+            if (this.folState === LoadState.Success && !this.folLoadingMore) {
+              this.loadMoreFollowingThreads();
+            }
+          })
+        }
+        .width('100%')
+        .margin({ top: HOME_TOP_PAD })
+        .layoutWeight(1)
+        .backgroundColor(Color.Transparent)
+        .clip(false)
+        .onRefreshing(() => {
+          this.folRefreshing = false;
+          this.loadFollowingThreads();
+        })
+      }
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .backgroundColor(Color.Transparent)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    .overlay(this.BottomFadeOverlay())
+    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+  }
+
+  @Builder
+  BottomFadeOverlay() {
+    Stack()
+      .height('100%')
+      .width('100%')
+      .linearGradient({
+        direction: GradientDirection.Bottom,
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+      })
+      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
+      .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  HomeHeaderOverlay() {
+    // 吸顶标题：按钮始终悬浮在顶部，帖子从下方穿过
+    Row({ space: 16 }) {
+      Text('推荐')
+        .fontSize(fs(16, this.fontScale))
+        .fontWeight(this.homeFeed === HomeFeed.Recommended
+          ? FontWeight.Bold
+          : FontWeight.Medium)
+        // 参考底栏切换：去蓝底，状态交给系统强调色文字；中性磨砂玻璃底保留真模糊质感
+        .fontColor(this.homeFeed === HomeFeed.Recommended
+          ? $r('sys.color.font_emphasize')
+          : $r('sys.color.font_primary'))
+        .backgroundColor(Theme.segGlass(this.isDark, this.homeFeed === HomeFeed.Recommended))
+        .border({ width: 0.5, color: Theme.manualGlassBorder() })
+        .backgroundBlurStyle(this.homeFeed === HomeFeed.Recommended ? BlurStyle.Regular : BlurStyle.Thin,
+          { scale: this.homeFeed === HomeFeed.Recommended ? 0.8 : 0.85 })
+        .shadow(Theme.segGlassShadow(this.isDark, this.homeFeed === HomeFeed.Recommended))
+        .borderRadius(Radius.full)
+        .padding({ left: 22, right: 22, top: 9, bottom: 9 })
+        .onClick(() => this.selectHomeFeed(HomeFeed.Recommended))
+
+      Text('关注动态')
+        .fontSize(fs(16, this.fontScale))
+        .fontWeight(this.homeFeed === HomeFeed.Following
+          ? FontWeight.Bold
+          : FontWeight.Medium)
+        // 与推荐钮一致：中性磨砂玻璃 + 系统强调色文字切换
+        .fontColor(this.homeFeed === HomeFeed.Following
+          ? $r('sys.color.font_emphasize')
+          : $r('sys.color.font_primary'))
+        .backgroundColor(Theme.segGlass(this.isDark, this.homeFeed === HomeFeed.Following))
+        .border({ width: 0.5, color: Theme.manualGlassBorder() })
+        .backgroundBlurStyle(this.homeFeed === HomeFeed.Following ? BlurStyle.Regular : BlurStyle.Thin,
+          { scale: this.homeFeed === HomeFeed.Following ? 0.8 : 0.85 })
+        .shadow(Theme.segGlassShadow(this.isDark, this.homeFeed === HomeFeed.Following))
+        .borderRadius(Radius.full)
+        .padding({ left: 22, right: 22, top: 9, bottom: 9 })
+        .onClick(() => this.showFollowingFeed())
+
+      Blank()
+
+      // 首页搜索入口（全站搜吧接口不可用，BUG-03 定案：联动收藏页本地搜索）
+      Button() {
+        SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.color.icon_primary')]).fontSize(fs(20, this.fontScale))
+      }
+      .width(44).height(44)
+      // 与胶囊同风格：中性磨砂玻璃圆钮（无色底），透明不可见仅作热区
+      .backgroundColor(Theme.segGlass(this.isDark, false))
+      .border({ width: 0.5, color: Theme.manualGlassBorder() })
+      .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
+      .shadow(Theme.segGlassShadow(this.isDark, false))
+      .borderRadius(Radius.full)
+      .accessibilityText('全吧搜索')
+      .onClick(() => { this.openSearchFromHome(); })
+    }
+    .width('100%')
+    .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 20 }) // 加大按钮与下方首张卡片的视觉空隙（v1.15.9）
+    .backgroundColor(Color.Transparent)
+    .zIndex(15)
+  }
+
+  /**
+   * 官方槽位标题栏：整行搬进 Navigation 的 title 槽位。
+   * 几何与 HomeHeaderOverlay 逐项一致（top 44 / bottom 20 / 左右 Spacing.lg / space 16 /
+   * 胶囊 padding 左右 22 + 上下 9 / fontSize 16 / 圆钮 44），只把玻璃从 backgroundBlurStyle 换成官方沉浸材质。
+   * - 未选中 / 选中 → ImmMaterial.seg(false/true)（THIN / REGULAR 中性档，不染色，状态仍由文字色 + 字重表达）
+   * - 搜索圆钮 → ImmMaterial.seg(false)（THIN 中性档，与两胶囊同一套材质语言）
+   * 文字图标色全部沿用系统可反色资源（font_emphasize / font_primary / icon_primary），满足官方自动反色前提。
+   * 不挂 backgroundColor / border / backgroundBlurStyle / shadow：官方明确不建议与 systemMaterial 同用（会互相覆盖）。
+   */
+  @Builder
+  HomeTitleBar() {
+    Row({ space: 16 }) {
+      Text('推荐')
+        .fontSize(fs(16, this.fontScale))
+        .fontWeight(this.homeFeed === HomeFeed.Recommended
+          ? FontWeight.Bold
+          : FontWeight.Medium)
+        .fontColor(this.homeFeed === HomeFeed.Recommended
+          ? $r('sys.color.font_emphasize')
+          : $r('sys.color.font_primary'))
+        .systemMaterial(ImmMaterial.seg(this.homeFeed === HomeFeed.Recommended))
+        .borderRadius(Radius.full)
+        .padding({ left: 22, right: 22, top: 9, bottom: 9 })
+        .onClick(() => this.selectHomeFeed(HomeFeed.Recommended))
+
+      Text('关注动态')
+        .fontSize(fs(16, this.fontScale))
+        .fontWeight(this.homeFeed === HomeFeed.Following
+          ? FontWeight.Bold
+          : FontWeight.Medium)
+        .fontColor(this.homeFeed === HomeFeed.Following
+          ? $r('sys.color.font_emphasize')
+          : $r('sys.color.font_primary'))
+        .systemMaterial(ImmMaterial.seg(this.homeFeed === HomeFeed.Following))
+        .borderRadius(Radius.full)
+        .padding({ left: 22, right: 22, top: 9, bottom: 9 })
+        .onClick(() => this.showFollowingFeed())
+
+      Blank()
+
+      // 首页搜索入口（全站搜吧接口不可用，BUG-03 定案：联动收藏页本地搜索）
+      Button() {
+        SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.color.icon_primary')]).fontSize(fs(20, this.fontScale))
+      }
+      .width(44)
+      .height(44)
+      // Button 自带 comp_background_emphasize 品牌蓝默认填充（Text 胶囊无默认背景，故只有圆钮会泛蓝底）：
+      // 必须显式清成 Transparent，否则 THIN 玻璃下透出一片蓝底
+      .backgroundColor(Color.Transparent)
+      // 与两颗胶囊统一材质语言：THIN 中性档（不染色）；此前是 control() 的 ULTRA_THIN，太薄看不见玻璃
+      .systemMaterial(ImmMaterial.seg(false))
+      .borderRadius(Radius.full)
+      .accessibilityText('全吧搜索')
+      .onClick(() => { this.openSearchFromHome(); })
+    }
+    .width('100%')
+    .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 20 })
+    .backgroundColor(Color.Transparent)
+  }
+
+  /**
+   * 内容层：推荐 / 关注动态两个 feed 视图 + 左右滑动手势。
+   * 官方标题栏路径（Navigation title 槽位）与兜底路径（页面主体悬浮层）共用同一份内容。
+   */
+  @Builder
+  HomeFeedContent() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      // 推荐页 / 关注动态：两个独立视图按 homeFeed 条件渲染，TransitionEffect 驱动左右滑动转场
+      // （同收藏页"吧分类/自定义分类"切换范式：旧视图滑出 + 新视图滑入，互推效果）
+      if (this.homeFeed === HomeFeed.Recommended) {
+        Column() {
+          this.RecommendedFeed()
+        }
+        .width('100%')
+        .height('100%')
+        .transition(this.firstHomeMount ? TransitionEffect.IDENTITY : this.feedTabTransition(-1))
+      } else {
+        Column() {
+          this.FollowingFeed()
+        }
+        .width('100%')
+        .height('100%')
+        .transition(this.firstHomeMount ? TransitionEffect.IDENTITY : this.feedTabTransition(1))
+      }
+
+      // 悬浮按钮层（独立于滚动内容，帖子可穿过按钮区域）
+      // 官方标题栏路径下按钮已在 Navigation title 槽位里，这里不再叠一层
+      if (!HOME_OFFICIAL_TITLE_BAR) {
+        this.HomeHeaderOverlay()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Color.Transparent)
+    // 左右滑动手势：切换推荐/关注动态。
+    // 用 parallelGesture 与内部 Scroll 并行识别（Scroll 会优先消费横向滑动手势导致父级 gesture 不触发）；
+    // 用 PanGesture 而非 SwipeGesture：识别更宽容，onActionEnd 直接给出总位移判断方向
+    .parallelGesture(
+      PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 30 })
+        .onActionEnd((event: GestureEvent) => {
+          this.onHomeFeedPanEnd(event);
+        })
+    )
+  }
+
+  build() {
+    if (HOME_OFFICIAL_TITLE_BAR) {
+      // 官方槽位路径：Navigation + 自定义 title（height 固定 108，与改造前悬浮层几何一致）
+      // barStyle STACK：内容区延伸到标题栏之下（官方建议，标题栏材质获得最佳沉浸体验的前提）
+      // backgroundColor 显式透明：避免标题栏自带底色压住滚动经过的内容
+      Navigation() {
+        this.HomeFeedContent()
+      }
+      .title({ builder: this.HomeTitleBar(), height: HOME_TITLE_BAR_HEIGHT },
+        { barStyle: BarStyle.STACK, backgroundColor: Color.Transparent })
+      .mode(NavigationMode.Stack)
+      .hideTitleBar(false)
+      .hideBackButton(true)
+      .width('100%')
+      .height('100%')
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    } else {
+      // 兜底路径：改造前原样（页面主体悬浮层 + manualGlass/backgroundBlurStyle 真磨砂）
+      this.HomeFeedContent()
+    }
+  }
+}

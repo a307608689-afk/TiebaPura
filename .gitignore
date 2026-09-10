@@ -1,0 +1,40 @@
+# ===== DevEco Studio / HarmonyOS 工程 =====
+/.idea/
+*.iml
+/.hvigor/
+/.hvigor-blue-build/
+/.appanalyzer/
+/.cxx/
+/.clangd
+/.clang-format
+/.clang-tidy
+/local.properties
+/oh-package-lock.json5.bak
+
+# ===== 依赖与构建产物（可由 ohpm install + 构建重新生成）=====
+**/oh_modules/
+**/node_modules/
+**/build/
+**/.test/
+*.hap
+*.hsp
+*.har.disabled
+*.abc
+*.protoBin
+*.msgpack
+
+# ===== 本机开发 / 抓包取证临时产物（不随工程分发）=====
+/-p/
+/backup/
+/_probe_tangs/
+/outputs/
+/tools/
+/ui_*.xml
+/_h.txt
+
+# ===== 系统 / 编辑器杂项 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
