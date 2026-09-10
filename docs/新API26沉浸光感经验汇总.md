@@ -561,7 +561,9 @@ struct ConfirmDialogCard {
 | `@BuilderParam` 注入 | struct 声明 `@BuilderParam content: () => void`，宿主传 `content: this.CategoryManageSheetContent` | ⚠️ **不推荐**：`builder:` 是**属性传参**（不是尾随闭包），`@BuilderParam` 内部执行时 `this` 指向**子组件**，宿主状态全取不到；`bind(this)` 未见官方支持 |
 
 > **判据**：卡内元素只被这一个弹窗用 → 复制进 struct；被多个弹窗用 → 抽**全局 `@Builder function`**（参数化 `isDark` / `fontScale`）。
-> 本页 `CardDivider` 同时被 `BackupDialog` / `ExportDialog` 使用，所以宿主那份必须保留。
+> 本页历史情况：宿主 `CardDivider` 曾被 `BackupDialog` / `ExportDialog` 共用，故两边都留了一份；
+> 2026-09-10 两弹窗先后迁成 `@CustomDialog`（§6.11 / §6.12）后，卡内分隔线各自复制为 `CardDividerLine`，
+> 宿主那份已无调用点，**已删除**（收尾时记得回查这类"只被已删浮层使用"的残留 `@Builder`）。
 
 #### 坑 2：可空对象不能 `@Link`，但「对象换新后弹窗内要实时刷新」
 
@@ -885,6 +887,73 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | `pages/HomeTab.ets` | `build()` = `if (HOME_OFFICIAL_TITLE_BAR) { Navigation()... } else { this.HomeFeedContent() }` |
 | `common/Theme.ets` | `ImmMaterial.seg(active)` + `ensureSegActive()` / `ensureSegIdle()` + `_matSegActive` / `_matSegIdle` 缓存 |
 
+### 6.11 第十三处迁移：收藏页「分类备份」弹窗（2026-09-10）
+
+**对象**：`Favorite.ets` 的 `BackupDialog`（TopBar「备份」按钮 → 分类备份菜单：标题区 + 两条分隔线 + 「导出备份」/「导入备份」两行 + 取消按钮）。
+
+| 项 | 内容 |
+|---|---|
+| 改造前 | 页面 body 顶层 `Stack` 自绘浮层（`@Builder BackupDialog()`），玻璃 = `sheetGlass` + `backgroundBlurStyle(Regular, 0.85)` + 0.5 描边 + `shadow radius 48` |
+| 改造后 | 顶层 `@CustomDialog struct BackupDialogCard` + `backupDialogController`，玻璃 = `options.systemMaterial = ImmMaterial.dialog()` |
+| 结果 | ✅ 构建通过（`BUILD SUCCESSFUL`）；待真机确认材质渲染 |
+| 位置 / 几何 | 与同页其他弹窗逐项一致（宽度 `dialogCardWidth()` / 圆角 32vp / 底部锚点 `dy -110` / 遮罩 `#06000000` / 同一 `ImmMaterial.dialog()`）；标题区、分隔线、两行入口、取消按钮的尺寸 / 内距 / 字号 / 图标**一行未改** |
+| 调用点 | `showBackupSheet()` 里仍是 `this.showBackupDialog = true`，靠 `@Watch('onShowBackupDialogChanged')` 驱动 `open()`（`@Watch` 顶替原 `syncBackState`，桥接回调里代调） |
+| 按钮 | 取消按钮按 §6.2 挂 `ImmMaterial.cardAction()` + `#B3FFFFFF` / `#B31B1E24`（原 `Theme.bgCard()` **不透明**会盖掉材质）；新增 `closeBackupDialog()` 收敛关闭入口（取消 / 点遮罩 / 返回键 / `onBackRequest` 四处共用） |
+
+**这次新增的一条判据：卡内「原本透明的行」不要为了"顺手材质化"而挂材质。**
+
+§9.1 的迁移注记写「弹窗卡内的按钮按 §6.2 挂 `systemMaterial`」——本次**只对按钮**执行：
+「导出备份 / 导入备份」两行原本就是**无底色的透明行**（平铺在玻璃卡上，靠分隔线分区），
+若挂 `ImmMaterial.cardAction()`（THIN）会在卡面多出一块**玻璃瓦片**，与改造前观感不符。
+对比 §6.8 的 `bindSheet` 条目 `Row`：那里原本就是 `Theme.bgCard()` 实底行，换成「材质 + 半透明底」才是等价替换。
+
+> **判据**：材质化只针对**原本有底色**的元素（按钮 / 卡片 / 实底行）；
+> 原本透明、只靠卡片玻璃承托的行**保持透明** —— 否则等于在弹窗卡上「再加一层玻璃」。
+
+**两级弹窗时序未动**：`导出备份` 仍是「关本弹窗 → 打开导出授权弹窗」、`导入备份` 仍是「关本弹窗 → 拉起系统文件选择器」，
+不套 §6.7 的 300ms 延时 —— 因为后两者是**覆盖式**出现（导出授权卡 / 系统选择器），改造前同样是「关闭动画期间目标已出现」，
+行为与观感口径保持一致。
+
+**代码索引**：
+
+| 位置 | 内容 |
+|---|---|
+| `pages/Favorite.ets` | 顶层 `@CustomDialog struct BackupDialogCard`（原 `@Builder BackupDialog()` 内容迁入 + 内联 `CardDividerLine`，@Builder 不能跨 struct，坑 16） |
+| `pages/Favorite.ets` | `@State @Watch('onShowBackupDialogChanged') showBackupDialog` + `backupDialogController` + `onShowBackupDialogChanged()` + `closeBackupDialog()` |
+| `pages/Favorite.ets` | `build()` 里原 `if (this.showBackupDialog) { this.BackupDialog() }` 与整个 `@Builder BackupDialog()` 已删除 |
+
+**同批一起改的还有同页 `ExportDialog`**（导出授权卡，含 `SaveButton` 安全控件）—— 见 §6.12；两弹窗 UI 已按用户要求统一。
+
+---
+
+### 6.12 第十四处迁移：收藏页「导出备份授权」弹窗（2026-09-10）
+
+**对象**：`Favorite.ets` 的 `ExportDialog`（备份菜单点「导出备份」→ 授权弹窗：说明文案 + 系统 `SaveButton` 安全控件 + 取消）。
+用户点名要求「弹窗 UI 跟备份弹窗一致」，故与 §6.11 同批落地。
+
+| 项 | 内容 |
+|---|---|
+| 改造前 | 页面 body 顶层 `Stack` 自绘浮层；卡片宽度 `calc(100% - 64vp)`、圆角 `Radius.lg`(16)、`margin.bottom 110`、自绘 `sheetGlass` 玻璃 + `zIndex 20` |
+| 改造后 | 顶层 `@CustomDialog struct ExportDialogCard` + `exportDialogController`（系统弹窗宿主，吃 `ImmMaterial.dialog()`） |
+| UI 对齐（用户要求） | 卡片宽度 `dialogCardWidth()`（48vp 边距，原 64vp）／圆角 32vp／底部锚点 `dy -110`／遮罩 `#06000000`／`ImmMaterial.dialog()`；标题区换成 §6.11 同款（标题 17 Medium 居中 + 说明 13 次级居中、lineHeight 18、内距 lg·lg·lg·md）＋同一条分隔线；按钮语言统一为「16vp 内缩、44 高、`Radius.full`」：取消按钮改为与备份弹窗逐项同款（`ImmMaterial.cardAction()` + `#B3FFFFFF`/`#B31B1E24` + 15 Medium；原为 40 高 / 14 次级字 / `bgElevated`）；`SaveButton` 从 200 固定宽改为**卡片内全宽**，与取消按钮同形 |
+| 状态 / 桥接 | `showExportDialog` 的 `@Watch('syncBackState')` → `@Watch('onShowExportDialogChanged')`（回调内代调 `syncBackState`）；新增 `@State exportDialogMessage` **文案快照**，宿主在「备份弹窗 → 导出」回调里**先写文案再置显隐**（同 §6.1 快照套路）；新增 `closeExportDialog()` 收敛关闭入口（取消 / 遮罩 / 返回键 / `onBackRequest` / `confirmExport` 的 `finally` 五处共用） |
+| 结果 | ✅ 构建通过（`BUILD SUCCESSFUL`）；待真机确认材质与安全控件授权 |
+
+**这次踩实的坑：`SaveButton`（安全控件）进系统弹窗该怎么写。**
+
+官方文档明确：`SaveButton`「**不支持通用属性，仅继承安全控件通用属性**」。据此改了三处：
+
+1. **宽度用数值 vp，不用百分比 / `calc()`** —— 安全控件通用属性里 `width/height` 是 `Length`，官方对百分比既未声明支持也未禁止；
+   而安全控件**文本被截断 / 显示不全时点击不授权**（静默失败，最难查）。故宽度取宿主算好的
+   `actionWidth = dialogCardWidth() - 32`（与「取消」按钮的 `calc(100% - 32vp)` 等值），由外层 `Row().justifyContent(FlexAlign.Center)` 居中。
+2. **不在安全控件上挂 `margin`** —— 安全控件通用属性清单里**没有 `margin`**（尽管示例代码出现过 `.margin()`），外边距一律交给外层 `Row` 的 `padding`。
+3. **保持 `buttonType: ButtonType.Capsule` + 足尺寸** —— 授权失败错误码 2 包含「按钮整体尺寸过大」「文本超出背托范围」「按钮被其他组件或窗口遮挡 / 超出窗口或屏幕」；
+   本处 `dialogCardWidth() - 32` × 44（400vp 宽屏 ≈ 320×44vp）属正常按钮尺寸，弹窗内也不存在遮挡。
+
+> **判据**：安全控件（`SaveButton` / `PasteButton`）放进系统弹窗 = **可以放**，但只能用「安全控件通用属性」那一小撮：
+> `width/height/size/padding/borderRadius/fontSize/fontColor/fontWeight/backgroundColor/iconSize/align/...`；
+> 外层布局（margin / 居中 / 等分）全部交给普通父容器。样式一旦"不合法"，表现是**授权失败而不是报错** —— 这也是本次宁可用数值宽也不用百分比的理由。
+
 ---
 
 ## 7. 已知偏差与遗留问题
@@ -932,6 +1001,8 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 25 | 想沿用「选中态品牌蓝底」的设计，却给槽内胶囊用了 `ImmMaterial.tabActive()` | `tabActive` 自带 `materialColor` 品牌蓝赋色 → 「去蓝底、状态靠文字色」的定稿设计被改回去 | 顶部槽位用**中性档** `ImmMaterial.seg(true/false)`（REGULAR / THIN，无 `materialColor` + `interactive`）；染色档要独立槽位（同坑 14） |
 | 26 | **任何 `Tabs` 壳**（空 tabBar 壳 / 悬浮岛壳）只设 `barBackgroundColor(Transparent)`，以为背板已彻底移除 | 仍渲染**默认模糊背板** —— `barBackgroundBlurStyle` 默认值是 `BlurStyle.COMPONENT_REGULAR`，与颜色层无关。空 tabBar 壳上是「胶囊后一条磨砂板」；悬浮岛壳上是「岛后全宽磨砂带，上边缘像一条细光感线」 | 每个 `Tabs` 壳都必须**显式** `.barBackgroundBlurStyle(BlurStyle.NONE)`；官方玻璃由 `barFloatingStyle.systemMaterial` 承担，与该属性无关，关掉不影响材质（2026-09-10 真机两次发现并修复）。⚠️ `Index` / `Search` / `UserProfile` 的悬浮壳暂未加，若目视出现同款磨砂带照此处理。**追加**：空 tabBar 壳**不要挂 `barOverlap(true)`** —— 它的官方语义附带「底栏默认模糊设为 `COMPONENT_THICK`」，空壳里它零布局作用却触发一层模糊背板/阴影；只有「内容要延伸到底栏之下」的壳（岛壳）才需要 `barOverlap`，且岛壳有 `barFloatingStyle` 重构 bar 不受此影响 |
 | 27 | 材质参数写 `lightEffect: { color: undefined }`，以为"颜色未设=不启用" | **等于显式启用白色流光**：官方语义是「传**对象**=启用、`{color}` 缺省默认 `Color.White`；传 `null`=显式禁用；不传(`undefined`)=跟随组件默认」。悬浮玻璃岛上沿会出现一条白色光感线（左侧圆角处向外探出，极易误认成布局多出来的描边） | 想去掉光感线：该材质槽位改 `lightEffect: null`。`ImmMaterial.floatingBar()` 已改（2026-09-10 真机反馈）；其余槽位（`bar/control/seg/tab/accent/...`）目前仍显式启用，若哪处也嫌光感线明显，同法处理 |
+| 28 | 迁移弹窗时把卡内**原本透明的行**（无底色、只靠卡片玻璃承托）也"顺手"挂上 `systemMaterial` | 玻璃卡面多出一块 THIN 材质瓦片，行区与卡面出现突兀分界，与改造前观感不符 | 材质化只针对**原本有底色**的元素：按钮 / 卡片 / 实底行 → 换「材质 + **半透明**底」（坑 11）；原本透明的行**保持透明**（§6.11） |
+| 29 | 安全控件（`SaveButton` / `PasteButton`）按普通组件写法迁移：`.width('100%')` / `calc()` 百分比宽、直接在控件上挂 `margin` | `SaveButton` **不支持通用属性**（只继承安全控件通用属性）：百分比/calc 行为未定义、`margin` 根本不在属性清单里；更麻烦的是样式"不合法"时表现是**授权失败（错误码 2）而不是报错**，通常还伴随「文本被截断即点击不授权」的静默失败 | 安全控件只用其白名单属性（`width/height/size/padding/borderRadius/fontSize/fontColor/...`），且 `width` 传**数值 vp**（怕百分比失效就用宿主算好的 vp 常量）；margin / 居中 / 等分交给外层普通容器（`Row().padding().justifyContent()`）；务必保留 `ButtonType.Capsule` + 正常尺寸、避免被遮挡或超出屏幕（§6.12） |
 
 ---
 
@@ -945,8 +1016,8 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 2 | `ForumsTab.ets` | 足迹删除确认 `RecentDeleteDialog` | 自绘浮层 + `sheetGlass` | 同上 | ⬜ 待办 |
 | 3 | `ForumsTab.ets` | 关注吧长按菜单 `ForumMenuDialog` | 自绘浮层 + `sheetGlass` | `CustomDialog` + `ImmMaterial.dialog()`（**不用 `bindMenu`**：原形态是「标题 + 已置顶标签 + 菜单行 + 分隔线 + 取消按钮」的贴底卡片，改菜单会动设计） | ✅ **已完成**（§6.3） |
 | 4 | `ForumsTab.ets` | 排序下拉 `ForumSortDialog` | 自绘浮层 + `sheetGlass` | **`bindMenu`** + `MenuOptions.systemMaterial`（原「屏幕右上角固定」的浮层改由系统菜单承载；用 1×1 隐形锚点 + `targetSpace: 0` 保住原坐标） | ✅ **已完成**（§6.9） |
-| 5 | `Favorite.ets` | 备份 `BackupDialog` | 自绘浮层 + `sheetGlass` | `CustomDialog` | ⬜ 待办 |
-| 6 | `Favorite.ets` | 导出 `ExportDialog` | 自绘浮层 + `sheetGlass` | `CustomDialog` | ⬜ 待办 |
+| 5 | `Favorite.ets` | 备份 `BackupDialog` | 自绘浮层 + `sheetGlass` | `CustomDialog` + `ImmMaterial.dialog()`（**两行入口原本是透明行，故不挂材质**：挂了会在卡面多出一块玻璃瓦片，见 §6.11） | ✅ **已完成**（§6.11） |
+| 6 | `Favorite.ets` | 导出 `ExportDialog` | 自绘浮层 + `sheetGlass` | `CustomDialog` + `ImmMaterial.dialog()`，**UI 与 §6.11 备份弹窗统一**；卡内 `SaveButton` 安全控件只能用「安全控件通用属性」→ 宽度传数值 vp、margin 交给外层 Row（见 §6.12） | ✅ **已完成**（§6.12） |
 | 7 | `Favorite.ets` | 置顶确认 `PinConfirmDialog` | 自绘浮层 + `sheetGlass` | `CustomDialog` + `ImmMaterial.dialog()`（**不用 `AlertDialog`**：系统 AlertDialog 的标题/正文/按钮排布是固定样式，保不住「居中标题 + 说明 + 两枚等分胶囊按钮」的原设计） | ✅ **已完成**（§6.4） |
 | 8 | `Favorite.ets` | 排序下拉 `SortMenuPanel` | 自绘浮层 + `sheetGlass` | **`bindMenu`** + `MenuOptions.systemMaterial`（三种 TopBar 形态共用一个根锚点） | ✅ **已完成**（§6.9） |
 | 9 | `Favorite.ets` | 分类管理 `CategoryManageSheet` | 自绘浮层 + `sheetGlass` | `CustomDialog` + `ImmMaterial.dialog()`（**不用 `bindSheet`**：`bindSheet` 会把「底部 110 的居中卡片」变成「底部抽屉」，违反「布局与改动前一致」这一硬要求；封面 / 菜单行 / 分隔线三个 `@Builder` 已随内容复制进 `CategoryManageDialog`） | ✅ **已完成**（§6.6） |
@@ -1152,3 +1223,5 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 2026-09-10 | **真机反馈修复⑥**：① `floatingBar` 从 ULTRA_THIN **调回 THIN**（修复④的降档是在"线是岛边缘"误判下选的，真凶查明后用户要求调回；`lightEffect: null` 保留）。② 排序胶囊下那层淡阴影：壳上 bar 装饰（颜色/模糊/`barOverlap`）已全关净，残留阴影实为**胶囊材质自带投影**（`seg` 的 `applyShadow: true`，两枚胶囊的阴影落在下方白卡上合并成一层）。`Theme.ets` 新增**无阴影档** `ImmMaterial.segFlat(active)`（`segActive/segIdle` 各复制一份仅 `applyShadow: false` 之差），仅 `SortPillInSlot` 换用；顶栏胶囊仍用 `seg` 带阴影版。构建 `BUILD SUCCESSFUL`。经验：**材质胶囊浮在浅色卡面上时，材质自带阴影会被卡面放大成"一层淡阴影"——不是背板，是 `applyShadow`** |
 | 2026-09-10 | 第十二处迁移（顶部槽位）：收藏页 `Favorite.ets` TopBar → `Navigation` title 槽位（用户点名：排序 / 搜索 / 备份按钮改沉浸光感）。五形态（根态 / 编辑态 / 搜索态 / 分类内 / 吧内）塞进同一 title builder；三颗共享小组件 `FavSlotCircleBtn` / `FavSlotSortBtn` / `FavSlotTextBtn` 统一 `ImmMaterial.seg(false)`；开关 `FAV_OFFICIAL_TITLE_BAR` / `FAV_TITLE_BAR_HEIGHT = 98`；附带收益「搜索态 `TextInput` 的 `control()` 材质出坑（页面 body out of scope → 槽位合法），双叠的 shadow + backgroundEffect 按坑 24 删除」。构建 `BUILD SUCCESSFUL`；§9.3 第 3 项标记完成并附落地清单（含搜索态聚焦/键盘避让、Tab 转场、宿主联动三项真机必测） |
 | 2026-09-10 | 第十二处迁移·追加：收藏页「吧分类 / 自定义分类」胶囊行 → title 槽位**第二行**（用户点名）。`FavTitleBar()` 改 `Column`（第一行 = `FavTitleBarRow` 五形态按钮行，第二行 = 分类胶囊行，仅根态显示）；title 高度改动态 `favTitleBarHeight()`（98 / 98+42 随形态切换），新增 `FAV_CAT_TAB_ROW_HEIGHT = 42`；胶囊 `ImmMaterial.seg(active)`（与旧 Regular/Thin 双档同构），显式 `height(32)` 对齐实测带。经验：**同一 title 槽位可以叠多行（Column），配合动态 height 即可把「吸顶多行」整体搬进槽位**；代价是行级转场动画（`listBaseTransition` 左让位）不再适用。构建 `BUILD SUCCESSFUL` |
+| 2026-09-10 | 第十三处迁移：收藏页「分类备份」弹窗 `BackupDialog` 自绘浮层 → 系统 `CustomDialog`（§6.11），位置/几何与同页前四个弹窗逐项一致。纯套 §4 模板（新的 `@Watch` 顶替原 `syncBackState`，桥接回调代调；新增 `closeBackupDialog()` 收敛四处关闭入口；内联 `CardDividerLine` 规避坑 16「@Builder 不能跨 struct」）。新增一条判据：**卡内「原本无底色的透明行」不要材质化** —— 挂 THIN 材质会在玻璃卡面多出一块玻璃瓦片；只有原本有底色的元素（按钮 / 卡片 / `bindSheet` 的实底行）换成「材质 + 半透明底」才是等价替换（§6.11）。§9.1 第 5 项标记完成。构建 `BUILD SUCCESSFUL` |
+| 2026-09-10 | 第十四处迁移（与上一处同批）：收藏页「导出备份授权」弹窗 `ExportDialog` → 系统 `CustomDialog`（§6.12），并按用户要求把两弹窗 UI 统一（同宽度 / 圆角 32vp / 底部锚点 / 遮罩 / `ImmMaterial.dialog()` / 同款标题区与分隔线 / 同款全宽 44 按钮，`SaveButton` 也从 200 固定宽改为卡片内全宽）。新增坑 29：**安全控件不支持通用属性**（只继承安全控件通用属性）—— 宽度必须传数值 vp、`margin` 不在白名单里要交给外层 `Row`，且样式不合法时报的是「授权失败（错误码 2）」+「文本截断即不授权」的静默失败。§9.1 第 6 项标记完成；该页五处弹窗已全部统一为系统弹窗。构建 `BUILD SUCCESSFUL`，HAP 已产出（`entry-default-unsigned.hap` 4.97MB） |

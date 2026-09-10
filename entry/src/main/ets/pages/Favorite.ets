@@ -395,6 +395,243 @@ struct CategoryManageDialog {
 }
 
 /**
+ * 备份弹窗（系统 CustomDialog + API 26 沉浸光感）。
+ *
+ * 原为「页面 body 顶层 Stack 自绘浮层」（宿主 @Builder BackupDialog）→ 换成系统 CustomDialog：
+ * 自绘浮层挂 systemMaterial 必然 `Material inactive: out of scope`，只有系统弹窗宿主才吃官方沉浸材质。
+ *
+ * 几何与改造前逐项一致（§4.3 对齐表）：
+ * - 宽度 calc(100% - 48vp) → options.width 数值 vp；圆角 32vp；遮罩 #06000000；
+ *   底部锚点（底距 110）→ alignment Bottom + offset dy -110；
+ *   标题区 / 两条分隔线 / 两行入口 / 取消按钮的尺寸、内距、字号、图标全部原样保留。
+ * - 卡内不再自绘 backgroundColor / border / backgroundBlurStyle / shadow 四项（材质会接管）。
+ *
+ * 内容自包含：CardDividerLine 与宿主 CardDivider 同源（@Builder 不能跨 struct 调用，§6.6 坑 1）。
+ * ⚠️ 两行入口（导出 / 导入）原本就是**透明行**（无底色，平铺在玻璃卡上），故不挂材质 ——
+ * 挂 THIN 材质会在卡面多出一块玻璃瓦片，与改造前观感不符；只把卡片玻璃本身换成官方材质。
+ */
+@CustomDialog
+struct BackupDialogCard {
+  /** 系统弹窗必须声明 CustomDialogController 类型属性（ArkTS 编译期强校验） */
+  controller?: CustomDialogController;
+  @Link isDark: boolean;
+  @Link fontScale: number;
+  /** 导出备份（业务在宿主：关本弹窗 → 打开导出授权弹窗） */
+  onExport: () => void = () => {};
+  /** 导入备份（业务在宿主：关本弹窗 → 拉起系统文件选择器） */
+  onImport: () => void = () => {};
+  /** 取消（点遮罩 / 返回键同源，统一走宿主 closeBackupDialog） */
+  onCancel: () => void = () => {};
+
+  build() {
+    Column() {
+      // 标题区（留出呼吸感）
+      Column({ space: 6 }) {
+        Text('分类备份')
+          .fontSize(fs(17, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary(this.isDark))
+          .textAlign(TextAlign.Center)
+        Text('备份仅包含自定义分类及其中的帖子映射，收藏本体在云端不受影响。')
+          .fontSize(fs(13, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .lineHeight(fs(18, this.fontScale))
+          .textAlign(TextAlign.Center)
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.lg, bottom: Spacing.md })
+
+      this.CardDividerLine()
+
+      // 导出备份：图标 + 主文案 + 副文案 + 右箭头
+      Row({ space: Spacing.md }) {
+        SymbolGlyph($r('sys.symbol.arrow_up'))
+          .fontColor([Theme.textPrimary(this.isDark)])
+          .fontSize(fs(19, this.fontScale))
+        Column({ space: 2 }) {
+          Text('导出备份')
+            .fontSize(fs(15, this.fontScale))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.textPrimary(this.isDark))
+          Text('将自定义分类及分类内帖子保存为 JSON 文件')
+            .fontSize(fs(12, this.fontScale))
+            .fontColor(Theme.textTertiary(this.isDark))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontColor([$r('sys.color.icon_tertiary')])
+          .fontSize(fs(14, this.fontScale))
+      }
+      .width('100%')
+      .padding({ left: Spacing.md, right: Spacing.md, top: 12, bottom: 12 })
+      .accessibilityText('导出备份')
+      .onClick(() => { this.onExport(); })
+
+      this.CardDividerLine()
+
+      // 导入备份
+      Row({ space: Spacing.md }) {
+        SymbolGlyph($r('sys.symbol.arrow_down'))
+          .fontColor([Theme.textPrimary(this.isDark)])
+          .fontSize(fs(19, this.fontScale))
+        Column({ space: 2 }) {
+          Text('导入备份')
+            .fontSize(fs(15, this.fontScale))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.textPrimary(this.isDark))
+          Text('从本地 JSON 文件恢复分类与帖子映射')
+            .fontSize(fs(12, this.fontScale))
+            .fontColor(Theme.textTertiary(this.isDark))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontColor([$r('sys.color.icon_tertiary')])
+          .fontSize(fs(14, this.fontScale))
+      }
+      .width('100%')
+      .padding({ left: Spacing.md, right: Spacing.md, top: 12, bottom: 12 })
+      .accessibilityText('导入备份')
+      .onClick(() => { this.onImport(); })
+
+      // 显式取消按钮（同分类管理弹窗视觉）：按 §6.2 挂材质 + **半透明**底
+      //（原 Theme.bgCard 是不透明卡片色，会完全盖掉材质，故换 #B3FFFFFF / #B31B1E24）
+      Button() {
+        Text('取消')
+          .fontSize(fs(15, this.fontScale))
+          .fontColor(Theme.textPrimary(this.isDark))
+          .fontWeight(FontWeight.Medium)
+      }
+      .width('calc(100% - 32vp)')
+      .height(44)
+      .systemMaterial(ImmMaterial.cardAction())
+      .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
+      .borderRadius(Radius.full)
+      .margin({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.lg })
+      .accessibilityText('取消')
+      .onClick(() => { this.onCancel(); })
+    }
+    .width('100%')
+    .padding({ top: Spacing.md })
+  }
+
+  /** 居中卡片内分隔线（与宿主 @Builder CardDivider 同源，深浅色自适应） */
+  @Builder
+  CardDividerLine() {
+    Column()
+      .width('calc(100% - 32vp)')
+      .height(0.5)
+      .backgroundColor(this.isDark ? '#26FFFFFF' : '#12000000')
+  }
+}
+
+/**
+ * 导出备份授权弹窗（系统 CustomDialog + API 26 沉浸光感）。
+ *
+ * 原为「页面 body 顶层 Stack 自绘浮层」（宿主 @Builder ExportDialog）→ 换成系统 CustomDialog：
+ * 自绘浮层挂 systemMaterial 必然 `Material inactive: out of scope`，只有系统弹窗宿主才吃官方沉浸材质。
+ *
+ * UI 与同页「分类备份」弹窗（BackupDialogCard）**完全一致**（用户点名要求）：
+ * 卡片宽度 `dialogCardWidth()` / 圆角 32vp / 底部锚点（底距 110）/ 遮罩 #06000000 / `ImmMaterial.dialog()`；
+ * 标题区排版同款（标题 17 Medium 居中 + 说明 13 次级居中、lineHeight 18、内距 lg/lg/lg/md）；
+ * 标题区下同一条分隔线；下方是同一套「全宽 44 高 + Radius.full」按钮语言（16vp 内缩 = 卡片宽 - 32vp）。
+ *
+ * ⚠️ 唯一不能统一的：主操作必须是系统 **SaveButton 安全控件**（用户真实点击才临时授权写入本地文件，
+ * 换普通 Button 会破坏免权限授权链路）。因此按安全控件通用属性规范：
+ * - 宽度用**数值 vp**（`actionWidth` = 卡片宽 - 32）而不是百分比 / calc —— 安全控件只继承
+ *   「安全控件通用属性」，对非常规取值容错差，文本被截断时会**静默不授权**；
+ * - 安全控件通用属性里**没有 margin**，故外边距交给外层 Row 的 padding。
+ *
+ * 文案走快照 @Link（宿主打开前算好分类数），弹窗内不做业务取数（同 ConfirmDialogCard §6.1）。
+ */
+@CustomDialog
+struct ExportDialogCard {
+  /** 系统弹窗必须声明 CustomDialogController 类型属性（ArkTS 编译期强校验） */
+  controller?: CustomDialogController;
+  @Link isDark: boolean;
+  @Link fontScale: number;
+  /** 说明文案（宿主打开前算好：`将导出 N 个自定义分类及分类内帖子为 JSON 文件。`） */
+  @Link dialogMessage: string;
+  /** 卡内按钮宽（vp）= 卡片宽 - 32，与「取消」按钮的 calc(100% - 32vp) 等值（安全控件不用百分比） */
+  actionWidth: number = 280;
+  /** SaveButton 授权成功（宿主：构建 JSON → 系统保存面板 → 写文件） */
+  onAuthorized: () => void = () => {};
+  /** 取消（点遮罩 / 返回键同源，统一走宿主 closeExportDialog） */
+  onCancel: () => void = () => {};
+
+  build() {
+    Column() {
+      // 标题区（与备份弹窗逐项一致）
+      Column({ space: 6 }) {
+        Text('导出备份')
+          .fontSize(fs(17, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary(this.isDark))
+          .textAlign(TextAlign.Center)
+        Text(this.dialogMessage)
+          .fontSize(fs(13, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .lineHeight(fs(18, this.fontScale))
+          .textAlign(TextAlign.Center)
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.lg, bottom: Spacing.md })
+
+      this.CardDividerLine()
+
+      // 授权区：系统安全控件（全宽 44，与下方取消按钮同形；外边距由外层 Row 承担）
+      Row() {
+        SaveButton({ icon: SaveIconStyle.FULL_FILLED, text: SaveDescription.SAVE, buttonType: ButtonType.Capsule })
+          .width(this.actionWidth)
+          .height(44)
+          .onClick((event: ClickEvent, result: SaveButtonOnClickResult) => {
+            if (result === SaveButtonOnClickResult.SUCCESS) {
+              this.onAuthorized();
+            }
+          })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md })
+
+      // 显式取消按钮（与备份弹窗同款：材质 + 半透明底）
+      Button() {
+        Text('取消')
+          .fontSize(fs(15, this.fontScale))
+          .fontColor(Theme.textPrimary(this.isDark))
+          .fontWeight(FontWeight.Medium)
+      }
+      .width('calc(100% - 32vp)')
+      .height(44)
+      .systemMaterial(ImmMaterial.cardAction())
+      .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
+      .borderRadius(Radius.full)
+      .margin({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.lg })
+      .accessibilityText('取消导出')
+      .onClick(() => { this.onCancel(); })
+    }
+    .width('100%')
+    .padding({ top: Spacing.md })
+  }
+
+  /** 居中卡片内分隔线（与宿主 @Builder CardDivider 同源，深浅色自适应） */
+  @Builder
+  CardDividerLine() {
+    Column()
+      .width('calc(100% - 32vp)')
+      .height(0.5)
+      .backgroundColor(this.isDark ? '#26FFFFFF' : '#12000000')
+  }
+}
+
+/**
  * 收藏主 Tab 页（P0 骨架第一批）：
  * - 吧分类收纳夹列表（增量聚合，按吧名分组 + 吧名码点序 + 置顶恒顶）
  * - 吧内帖子列表（本地过滤，排序降级：倒序=接口默认序，正序=本地反转，置顶恒顶）
@@ -434,9 +671,19 @@ export struct FavoriteTab {
   @State categoryInputValue: string = '';
   @State @Watch('syncBackState') showMovePanel: boolean = false;
   @State moveChecked: string[] = [];
-  @State @Watch('syncBackState') showExportDialog: boolean = false;
-  // v1.15.9 备份入口：自定义居中卡片浮层（替代系统 ActionSheet，同置顶确认视觉）
-  @State @Watch('syncBackState') showBackupDialog: boolean = false;
+  /**
+   * 导出授权弹窗显隐（v1.15.11 起为系统 CustomDialog + API 26 沉浸光感，见顶层 struct ExportDialogCard）。
+   * 与其他弹窗同款：布尔状态 + @Watch 驱动 open/close（故原先挂在它上面的 syncBackState 由 onShowExportDialogChanged 代劳）。
+   */
+  @State @Watch('onShowExportDialogChanged') showExportDialog: boolean = false;
+  /** 导出弹窗说明文案快照（宿主打开前算好分类数，弹窗内只读展示） */
+  @State exportDialogMessage: string = '';
+  /**
+   * v1.15.9 备份入口显隐（v1.15.11 起为系统 CustomDialog + API 26 沉浸光感，见顶层 struct BackupDialogCard）。
+   * 保留单一布尔状态，真正 open/close 由 @Watch 驱动，既有 `this.showBackupDialog = x` 调用点零改动。
+   * ⚠️ 一个状态变量只能挂一个 @Watch，故原先的 syncBackState 由 onShowBackupDialogChanged 代劳。
+   */
+  @State @Watch('onShowBackupDialogChanged') showBackupDialog: boolean = false;
   /**
    * 分类管理显隐（v1.15.10 起为系统 CustomDialog + API 26 沉浸光感，见顶层 struct CategoryManageDialog）。
    * 保留单一布尔状态，真正 open/close 由 @Watch 驱动，既有 `this.showCategoryManage = x` 调用点零改动。
@@ -624,6 +871,72 @@ export struct FavoriteTab {
   });
 
   /**
+   * 备份弹窗控制器（系统 CustomDialog + API 26 沉浸光感）。
+   * 几何与其他弹窗**逐项一致**（宽度 dialogCardWidth() / 圆角 32vp / 底部锚点 dy -110 /
+   * 遮罩 #06000000 / 同一 ImmMaterial.dialog()），即出现在屏幕同一处。
+   * 内容由顶层 BackupDialogCard 承载（标题区 + 两条分隔线 + 导出/导入两行 + 取消按钮）。
+   */
+  private backupDialogController: CustomDialogController = new CustomDialogController({
+    builder: BackupDialogCard({
+      isDark: $isDark,
+      fontScale: $fontScale,
+      // 导出：先写文案快照（宿主算好分类数）→ 关本弹窗 → 打开导出授权弹窗（语义与改造前一致）
+      onExport: () => {
+        this.exportDialogMessage = `将导出 ${this.categories.length} 个自定义分类及分类内帖子为 JSON 文件。`;
+        this.showBackupDialog = false;
+        this.showExportDialog = true;
+      },
+      // 导入：先关本弹窗再拉起系统文件选择器（语义与改造前一致）
+      onImport: () => {
+        this.showBackupDialog = false;
+        this.beginImport();
+      },
+      onCancel: () => { this.closeBackupDialog(); }
+    }),
+    autoCancel: true,
+    alignment: DialogAlignment.Bottom,
+    offset: { dx: 0, dy: -110 },
+    maskColor: '#06000000',
+    cornerRadius: 32,
+    width: this.dialogCardWidth(),
+    customStyle: false,
+    systemMaterial: ImmMaterial.dialog(),
+    openAnimation: { duration: 220, curve: Curve.EaseOut },
+    closeAnimation: { duration: 200, curve: Curve.EaseInOut },
+    // 点遮罩/返回键统一交给 closeBackupDialog（与自绘浮层时期语义一致）
+    onWillDismiss: () => { this.closeBackupDialog(); }
+  });
+
+  /**
+   * 导出授权弹窗控制器（系统 CustomDialog + API 26 沉浸光感）。
+   * 位置 / 几何 / 材质与「备份 / 分类管理 / 确认」等弹窗**逐项一致**（同一 width / 圆角 32vp /
+   * 底部锚点 dy -110 / 遮罩 #06000000 / 同一 `ImmMaterial.dialog()`），即出现在屏幕同一处。
+   * `actionWidth` = 卡片宽 - 32vp，给卡内 SaveButton 安全控件用数值宽度（安全控件对百分比/calc 容错差）。
+   */
+  private exportDialogController: CustomDialogController = new CustomDialogController({
+    builder: ExportDialogCard({
+      isDark: $isDark,
+      fontScale: $fontScale,
+      dialogMessage: $exportDialogMessage,
+      actionWidth: this.dialogCardWidth() - 32,
+      onAuthorized: () => { this.confirmExport(); },
+      onCancel: () => { this.closeExportDialog(); }
+    }),
+    autoCancel: true,
+    alignment: DialogAlignment.Bottom,
+    offset: { dx: 0, dy: -110 },
+    maskColor: '#06000000',
+    cornerRadius: 32,
+    width: this.dialogCardWidth(),
+    customStyle: false,
+    systemMaterial: ImmMaterial.dialog(),
+    openAnimation: { duration: 220, curve: Curve.EaseOut },
+    closeAnimation: { duration: 200, curve: Curve.EaseInOut },
+    // 点遮罩/返回键统一交给 closeExportDialog
+    onWillDismiss: () => { this.closeExportDialog(); }
+  });
+
+  /**
    * 弹窗卡片宽度（vp）= 屏幕宽 - 48vp，等价于改造前自绘浮层的 `calc(100% - 48vp)`。
    * ArkTS 的 Dimension 只接受数值 / 百分比 / 资源，不接受 calc 字符串，故换算成数值。
    * 取屏幕宽（display）而非窗口宽：弹窗容器宽度本身还受系统上限（默认 400vp）约束，
@@ -692,6 +1005,29 @@ export struct FavoriteTab {
     this.manageCatIcon = cat.icon;
     this.manageCatCount = this.categoryCountOf(cat.id);
   }
+
+  /** showBackupDialog 变化即驱动系统弹窗 open/close（保留既有 `this.showBackupDialog = x` 调用点） */
+  onShowBackupDialogChanged(): void {
+    // @Watch 一变量只挂一个，故此处代劳原先挂在 showBackupDialog 上的 syncBackState
+    this.syncBackState();
+    if (this.showBackupDialog) {
+      this.backupDialogController.open();
+    } else {
+      this.backupDialogController.close();
+    }
+  }
+
+  /** showExportDialog 变化即驱动系统弹窗 open/close（保留既有 `this.showExportDialog = x` 调用点） */
+  onShowExportDialogChanged(): void {
+    // @Watch 一变量只挂一个，故此处代劳原先挂在 showExportDialog 上的 syncBackState
+    this.syncBackState();
+    if (this.showExportDialog) {
+      this.exportDialogController.open();
+    } else {
+      this.exportDialogController.close();
+    }
+  }
+
   // BUG-03 收藏本地搜索（匹配收藏帖子标题 / 吧名 / 分类名，不依赖网络接口）
   @State @Watch('syncBackState') searchMode: boolean = false;
   @State searchKeyword: string = '';
@@ -1154,13 +1490,26 @@ export struct FavoriteTab {
 
   // ===== 备份导出 / 导入（第七批 · P2-a，入口 §4.4，schema §2.5）=====
 
-  /** v1.15.9 备份入口：自定义居中卡片浮层（替代系统 ActionSheet，同置顶确认视觉） */
+  /**
+   * v1.15.9 备份入口（v1.15.11 起为系统 CustomDialog + API 26 沉浸光感，替代系统 ActionSheet，
+   * 与其他弹窗同视觉；内容由顶层 BackupDialogCard 承载）。
+   */
   private showBackupSheet(): void {
     if (this.backupBusy) {
       return;
     }
     Haptic.light();
     this.showBackupDialog = true;
+  }
+
+  /** 关闭备份弹窗（点遮罩 / 返回键 / 取消按钮 的统一入口，与其余弹窗写法一致） */
+  private closeBackupDialog(): void {
+    this.showBackupDialog = false;
+  }
+
+  /** 关闭导出授权弹窗（点遮罩 / 返回键 / 取消按钮 / 导出完成后 的统一入口） */
+  private closeExportDialog(): void {
+    this.showExportDialog = false;
   }
 
   /**
@@ -1212,7 +1561,7 @@ export struct FavoriteTab {
       this.toast(`导出失败：${errMsg}`, ToastType.Error);
     } finally {
       this.backupBusy = false;
-      this.showExportDialog = false;
+      this.closeExportDialog();
     }
   }
 
@@ -2121,9 +2470,9 @@ export struct FavoriteTab {
     } else if (this.showRemoveCatConfirm) {
       this.closeRemoveCatConfirm();
     } else if (this.showBackupDialog) {
-      this.showBackupDialog = false;
+      this.closeBackupDialog();
     } else if (this.showExportDialog) {
-      this.showExportDialog = false;
+      this.closeExportDialog();
     } else if (this.editMode) {
       this.exitEditMode();
     } else if (this.selectedCategoryId.length > 0) {
@@ -2492,13 +2841,7 @@ export struct FavoriteTab {
         this.EditBar()
       }
       // 移入分类面板已改为系统半模态 bindSheet（§6.8），由根 Stack 的 .bindSheet 驱动，无需在此挂载
-      if (this.showBackupDialog) {
-        this.BackupDialog()
-      }
-      if (this.showExportDialog) {
-        this.ExportDialog()
-      }
-      // 置顶/取消置顶确认、批量删除确认、分类管理已全部换成系统 CustomDialog（由 controller 驱动，无需在此挂载）
+      // 备份 / 导出授权 / 置顶确认 / 批量删除确认 / 分类管理 已全部换成系统 CustomDialog（由 controller 驱动，无需在此挂载）
       /**
        * 排序菜单锚点（§6.9：自绘下拉浮层 → 系统 bindMenu）。
        * 原自绘面板是 `position({ top: 100, right: 16 })`（三种 TopBar 形态共用）；这里用 1×1 隐形锚点 +
@@ -2637,191 +2980,6 @@ export struct FavoriteTab {
     .height('100%')
     .padding({ top: 8 })
     // 容器节点不设 backgroundColor / border / shadow / backgroundBlurStyle：四项由 options.systemMaterial 接管（§4.4）
-  }
-
-  /** v1.15.9 备份入口：自定义居中卡片浮层（替代系统 ActionSheet：宽敞排版 + 副文案说明 + 显式取消按钮） */
-  @Builder
-  BackupDialog() {
-    Stack() {
-      // 暗色蒙层，点击外部关闭
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor('#06000000')
-        .onClick(() => { this.showBackupDialog = false; })
-        .transition(TransitionEffect.opacity(0).animation({ duration: 180, curve: Curve.EaseOut }))
-
-      Column() {
-        // 标题区（留出呼吸感）
-        Column({ space: 6 }) {
-          Text('分类备份')
-            .fontSize(fs(17, this.fontScale))
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Theme.textPrimary(this.isDark))
-            .textAlign(TextAlign.Center)
-          Text('备份仅包含自定义分类及其中的帖子映射，收藏本体在云端不受影响。')
-            .fontSize(fs(13, this.fontScale))
-            .fontColor(Theme.textSecondary(this.isDark))
-            .lineHeight(fs(18, this.fontScale))
-            .textAlign(TextAlign.Center)
-        }
-        .width('100%')
-        .alignItems(HorizontalAlign.Center)
-        .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.lg, bottom: Spacing.md })
-
-        this.CardDivider()
-
-        // 导出备份：图标 + 主文案 + 副文案 + 右箭头
-        Row({ space: Spacing.md }) {
-          SymbolGlyph($r('sys.symbol.arrow_up'))
-            .fontColor([Theme.textPrimary(this.isDark)])
-            .fontSize(fs(19, this.fontScale))
-          Column({ space: 2 }) {
-            Text('导出备份')
-              .fontSize(fs(15, this.fontScale))
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Theme.textPrimary(this.isDark))
-            Text('将自定义分类及分类内帖子保存为 JSON 文件')
-              .fontSize(fs(12, this.fontScale))
-              .fontColor(Theme.textTertiary(this.isDark))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-          SymbolGlyph($r('sys.symbol.chevron_right'))
-            .fontColor([$r('sys.color.icon_tertiary')])
-            .fontSize(fs(14, this.fontScale))
-        }
-        .width('100%')
-        .padding({ left: Spacing.md, right: Spacing.md, top: 12, bottom: 12 })
-        .accessibilityText('导出备份')
-        .onClick(() => {
-          this.showBackupDialog = false;
-          this.showExportDialog = true;
-        })
-
-        this.CardDivider()
-
-        // 导入备份
-        Row({ space: Spacing.md }) {
-          SymbolGlyph($r('sys.symbol.arrow_down'))
-            .fontColor([Theme.textPrimary(this.isDark)])
-            .fontSize(fs(19, this.fontScale))
-          Column({ space: 2 }) {
-            Text('导入备份')
-              .fontSize(fs(15, this.fontScale))
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Theme.textPrimary(this.isDark))
-            Text('从本地 JSON 文件恢复分类与帖子映射')
-              .fontSize(fs(12, this.fontScale))
-              .fontColor(Theme.textTertiary(this.isDark))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-          SymbolGlyph($r('sys.symbol.chevron_right'))
-            .fontColor([$r('sys.color.icon_tertiary')])
-            .fontSize(fs(14, this.fontScale))
-        }
-        .width('100%')
-        .padding({ left: Spacing.md, right: Spacing.md, top: 12, bottom: 12 })
-        .accessibilityText('导入备份')
-        .onClick(() => {
-          this.showBackupDialog = false;
-          this.beginImport();
-        })
-
-        // 显式取消按钮（同分类管理弹窗视觉）
-        Button() {
-          Text('取消')
-            .fontSize(fs(15, this.fontScale))
-            .fontColor(Theme.textPrimary(this.isDark))
-            .fontWeight(FontWeight.Medium)
-        }
-        .width('calc(100% - 32vp)')
-        .height(44)
-        .backgroundColor(Theme.bgCard(this.isDark))
-        .borderRadius(Radius.full)
-        .margin({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.lg })
-        .accessibilityText('取消')
-        .onClick(() => { this.showBackupDialog = false; })
-      }
-      .width('calc(100% - 48vp)')
-      .margin({ bottom: 110 })
-      .padding({ top: Spacing.md })
-      // 真模糊磨砂：低不透明发透底 + 0.5 白描边 + backgroundBlurStyle（页面顶层浮层 systemMaterial 不渲染，走 §6.6 真模糊模板）
-      .backgroundColor(Theme.sheetGlass(this.isDark))
-      .borderRadius(32)
-      .border({ width: 0.5, color: Theme.manualGlassBorder() })
-      .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
-      .shadow({ radius: 48, color: '#3D000000', offsetY: 18 })
-      .transition(TransitionEffect.scale({ x: 0.92, y: 0.92 }).combine(TransitionEffect.translate({ y: 24 })).combine(TransitionEffect.opacity(0)).animation({ duration: 220, curve: Curve.EaseOut }))
-    }
-    .width('100%')
-    .height('100%')
-    .alignContent(Alignment.Bottom)
-    .transition(TransitionEffect.asymmetric(
-      TransitionEffect.IDENTITY,
-      TransitionEffect.opacity(0).animation({ duration: 200, curve: Curve.EaseInOut })
-    ))
-  }
-
-  /** 导出授权对话框：saveButton 安全控件（用户真实点击才授权），授权后写文件并弹系统保存框 */
-  @Builder
-  ExportDialog() {
-    Column() {
-      Column({ space: Spacing.md }) {
-        Text('导出备份')
-          .fontSize(fs(16, this.fontScale))
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Theme.textPrimary(this.isDark))
-
-        Text(`将导出 ${this.categories.length} 个自定义分类及分类内帖子为 JSON 文件。`)
-          .fontSize(fs(13, this.fontScale))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Theme.textSecondary(this.isDark))
-          .textAlign(TextAlign.Center)
-
-        SaveButton({ icon: SaveIconStyle.FULL_FILLED, text: SaveDescription.SAVE, buttonType: ButtonType.Capsule })
-          .width(200)
-          .height(44)
-          .onClick((event: ClickEvent, result: SaveButtonOnClickResult) => {
-            if (result === SaveButtonOnClickResult.SUCCESS) {
-              this.confirmExport();
-            }
-          })
-
-        Button() {
-          Text('取消')
-            .fontSize(fs(14, this.fontScale))
-            .fontColor(Theme.textSecondary(this.isDark))
-        }
-        .height(40)
-        .padding({ left: 24, right: 24 })
-        .backgroundColor(Theme.bgElevated(this.isDark))
-        .borderRadius(Radius.full)
-        .accessibilityText('取消导出')
-        .onClick(() => { this.showExportDialog = false; })
-      }
-      .width('calc(100% - 64vp)')
-      .margin({ bottom: 110 })
-      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.xl, bottom: Spacing.xl })
-      // 真模糊磨砂：低不透明发透底 + 0.5 白描边 + backgroundBlurStyle（页面顶层浮层 systemMaterial 不渲染，走 §6.6 真模糊模板）
-      .backgroundColor(Theme.sheetGlass(this.isDark))
-      .borderRadius(Radius.lg)
-      .border({ width: 0.5, color: Theme.manualGlassBorder() })
-      .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
-      .shadow({ radius: 48, color: '#3D000000', offsetY: 18 })
-      .transition(TransitionEffect.scale({ x: 0.92, y: 0.92 }).combine(TransitionEffect.translate({ y: 24 })).animation({ duration: 220, curve: Curve.EaseOut }))
-    }
-    .width('100%')
-    .height('100%')
-    .backgroundColor('#06000000')
-    .justifyContent(FlexAlign.End)
-    .zIndex(20)
-    .transition(TransitionEffect.opacity(0).animation({ duration: 180, curve: Curve.EaseOut }))
   }
 
   @Builder
@@ -4524,15 +4682,6 @@ export struct FavoriteTab {
     .padding({ left: Spacing.md, right: Spacing.md, top: 12, bottom: 12 })
     .accessibilityText(title)
     .onClick(onTap)
-  }
-
-  /** v1.15.6 居中卡片内分隔线（深浅色自适应） */
-  @Builder
-  CardDivider() {
-    Column()
-      .width('calc(100% - 32vp)')
-      .height(0.5)
-      .backgroundColor(this.isDark ? '#26FFFFFF' : '#12000000')
   }
 
   @Builder

@@ -4,6 +4,8 @@
 [![Platform](https://img.shields.io/badge/Platform-HarmonyOS%207%20%2F%20API%2026-000000.svg)](#)
 [![Language](https://img.shields.io/badge/Language-ArkTS%20%2F%20ArkUI-3178C6.svg)](#)
 
+**当前版本：`v1.0.0`** · 首个公开版本 · 2026-09-10
+
 > **⚠️ 非官方声明**
 >
 > 本项目是**第三方非官方开源项目**，**与百度公司及其关联企业无任何关系**，未获得百度在授权、
@@ -155,7 +157,7 @@ entry/src/main/ets/
 - `docs/follow-list-delivery.md` — 关注 / 粉丝列表交付记录
 - `docs/user-profile-delivery.md` — 用户主页交付记录
 
-其余模块补充与交付记录文档亦位于 `docs/`，配套各自功能使用。新增排障 / 方案记录时请沿用该目录。
+以上为 `docs/` 当前全部专项文档，各自配套对应模块使用。新增排障 / 方案记录时请沿用该目录与既有命名风格。
 
 ## 接口参考
 
@@ -231,8 +233,8 @@ Copyright (C) 2026  a307608689-afk
 请见 <https://www.gnu.org/licenses/>。
 ```
 
-> 版权署名目前使用 GitHub 账号 `a307608689-afk`。若需更正式的 GPLv3 署名，
-> 可在其后追加邮箱：`Copyright (C) 2026  a307608689-afk <you@example.com>`。
+> 版权署名使用 GitHub 账号 `a307608689-afk`。GPLv3 未强制要求署名包含邮箱，
+> 本项目因此不公开作者邮箱；如需联系请通过 GitHub Issue。
 
 选择 GPLv3 而非宽松协议的原因：本工程在设计上参考了同样以 GPLv3 发布的 TiebaLite，
 采用相同协议可确保下游分发时的授权链条完整、无歧义。
