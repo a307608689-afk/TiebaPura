@@ -16,8 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { common, Want } from '@kit.AbilityKit';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
+import { PRIVACY_POLICY_URL } from '../common/Constants';
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
 
 /** 官方标题栏开关（§6.10 模板）：true 且设备支持材质时，「返回 + 软件设置」搬进 Navigation title 槽位吃官方材质；
@@ -66,6 +68,19 @@ struct Settings {
 
   private openItem(item: string): void {
     this.getUIContext().getPromptAction().showToast({ message: `${item} 即将开放` });
+  }
+
+  /** 打开完整隐私政策：与首启同意弹窗、应用市场「隐私政策网址」共用同一份在线政策（PRIVACY_POLICY_URL） */
+  private openPrivacyPolicy(): void {
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (!ctx) {
+      this.getUIContext().getPromptAction().showToast({ message: '打开失败，请稍后重试' });
+      return;
+    }
+    const want: Want = { uri: PRIVACY_POLICY_URL, action: 'ohos.want.action.viewData', type: 'text/plain' };
+    ctx.startAbility(want).catch(() => {
+      this.getUIContext().getPromptAction().showToast({ message: '打开失败，请稍后重试' });
+    });
   }
 
   private async handleLogout(): Promise<void> {
@@ -318,6 +333,12 @@ struct Settings {
         '一键签到',
         '一键签到功能设定',
         () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/AutoSignSettings' }).catch(() => {}); }
+      )
+      this.SettingItem(
+        $r('sys.symbol.lock_shield'),
+        '隐私政策',
+        '我们如何收集与使用您的信息',
+        () => this.openPrivacyPolicy()
       )
       this.SettingItem(
         $r('sys.symbol.ellipsis_circle'),

@@ -138,6 +138,8 @@ export interface CacheKeys {
   AUTO_SIGN_USE_OFFICIAL: string;
   /** 单吧签到本地状态（按账号 + 吧名隔离：{ date, days }，用于返回重进后回显已签到） */
   FORUM_SIGN_STATE: string;
+  /** 已同意的隐私政策版本号：与 PRIVACY_POLICY_VERSION 比对，版本不一致需重新征得同意 */
+  PRIVACY_AGREED: string;
 }
 
 // 缓存键
@@ -177,6 +179,7 @@ export const CACHE_KEY: CacheKeys = {
   AUTO_SIGN_SLOW_MODE: 'auto_sign_slow_mode',
   AUTO_SIGN_USE_OFFICIAL: 'auto_sign_use_official',
   FORUM_SIGN_STATE: 'tieba_forum_sign_state',
+  PRIVACY_AGREED: 'tieba_privacy_agreed',
 };
 
 // 缓存过期时间接口
@@ -202,6 +205,13 @@ export const CACHE_TTL: CacheTtls = {
   FOLLOW_FEED: 5 * 60 * 1000,        // 5 分钟：关注动态聚合快照，命中即秒开再后台刷新
   FOLLOW_USERS: 10 * 60 * 1000,      // 10 分钟：关注列表变化不频繁，过期可 stale 复用
 };
+
+// 隐私政策（首启同意弹窗 + 应用市场「隐私政策网址」共用同一份在线政策）
+/** 隐私政策版本号：政策内容实质变更时同步递增，已同意旧版本的用户会重新收到同意弹窗 */
+export const PRIVACY_POLICY_VERSION: string = '1.0.0';
+/** 隐私政策在线地址（GitHub 渲染页；与仓库 docs/PRIVACY.md 同源） */
+export const PRIVACY_POLICY_URL: string =
+  'https://github.com/a307608689-afk/TiebaPura/blob/main/docs/PRIVACY.md';
 
 // 主题色（贴吧蓝）
 export const BRAND_BLUE: string = '#3173FF';

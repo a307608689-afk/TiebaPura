@@ -16,14 +16,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-﻿import { common, ConfigurationConstant } from '@kit.AbilityKit';
+﻿import { common, ConfigurationConstant, Want } from '@kit.AbilityKit';
 import { curves } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { FontSizeManager } from '../service/FontSizeManager';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
-import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
+import { CACHE_KEY, CACHE_TTL, PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION } from '../common/Constants';
 import { FollowItem, UserInfo, UserStats } from '../model/DataModel';
 import { Theme, fs, isDarkMode, setDarkMode, ImmBlur, ImmMaterial, MaterialManager } from '../common/Theme';
 import { FavoriteTab } from './Favorite';
@@ -70,6 +70,12 @@ struct Index {
   @StorageLink('fontScale') fontScale: number = 1.0;
   @StorageLink('favEditing') favEditing: boolean = false;
   @State materialSupported: boolean = true;
+  /**
+   * 首启合规闸门阶段：0=正在读本地授权记录（不透明占位底，防闪主界面）1=待用户同意（隐私政策浮层）2=已通过（渲染主界面）
+   * 未进入阶段 2 时主界面（Tabs / PagesStack / HomeTab）完全不参与构建，
+   * 确保用户同意前不读取任何业务数据、不发起任何网络请求。
+   */
+  @State privacyPhase: number = 0;
 
   // 延迟初始化：aboutToAppear生命周期阶段UIContext就绪后赋值，避免类字段初始化期获取null
   private context?: common.UIAbilityContext;
@@ -91,8 +97,66 @@ struct Index {
   async aboutToAppear(): Promise<void> {
     // 生命周期阶段UIContext已就绪，安全初始化context缓存
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    // 闸门前置项：仅为「确定占位底配色 + 探测材质能力」的纯本地读取，不涉及个人信息、不发起网络请求。
+    // 深色态必须先算：否则系统深色下占位底会先闪一帧浅色再切黑。
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported();
+    const sysDark = this.getUIAbilityContext().config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    this.isDark = sysDark;
+    setDarkMode(sysDark);
+    // 合规闸门：用户同意当前版本隐私政策前，不初始化登录态、不读业务缓存、不发任何请求
+    // （应用市场强制要求：征得同意前不得收集任何信息。未同意时直接 return，initApp 整体不执行）
+    if (!await this.isPrivacyAgreed()) {
+      this.privacyPhase = 1;
+      return;
+    }
+    this.privacyPhase = 2;
+    await this.initApp();
+  }
+
+  /**
+   * 是否已同意当前版本隐私政策。
+   * 落盘的是「已同意的政策版本号」而非布尔值：政策实质变更时递增 PRIVACY_POLICY_VERSION，
+   * 老用户无需清数据即可重新收到同意弹窗。读取异常一律按「未同意」处理（宁可多弹一次，不可漏弹）。
+   */
+  private async isPrivacyAgreed(): Promise<boolean> {
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.getUIAbilityContext());
+      return (await cache.get(CACHE_KEY.PRIVACY_AGREED)) === PRIVACY_POLICY_VERSION;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 用户同意：落盘版本号后放行全部业务初始化（写盘失败也放行，不因存储异常把用户卡在弹窗上） */
+  private async onPrivacyAgree(): Promise<void> {
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.getUIAbilityContext());
+      await cache.put(CACHE_KEY.PRIVACY_AGREED, PRIVACY_POLICY_VERSION);
+    } catch (e) {
+      // 写盘失败不阻断：本次会话正常放行，下次启动会再弹一次
+    }
+    this.privacyPhase = 2;
+    await this.initApp();
+  }
+
+  /** 用户拒绝：直接退出应用（不进入任何功能） */
+  private onPrivacyReject(): void {
+    this.getUIAbilityContext().terminateSelf().catch(() => {});
+  }
+
+  /** 打开完整隐私政策（与仓库 docs/PRIVACY.md 同源的 GitHub 渲染页） */
+  private openPrivacyPolicy(): void {
+    const want: Want = { uri: PRIVACY_POLICY_URL, action: 'ohos.want.action.viewData', type: 'text/plain' };
+    this.getUIAbilityContext().startAbility(want).catch(() => {
+      this.getUIContext().getPromptAction().showToast({ message: '打开失败，请稍后重试' });
+    });
+  }
+
+  /** 业务初始化（登录态 / 字号 / 使用习惯 / 关注吧快照 / 首页冷启动）：仅在同意隐私政策后执行 */
+  private async initApp(): Promise<void> {
     // 本地初始化并行执行
     await Promise.all([
       AuthManager.getInstance().init(this.getUIAbilityContext()),
@@ -100,9 +164,6 @@ struct Index {
       UsageHabitsManager.getInstance().init(this.getUIAbilityContext()),
     ]);
     this.refreshLoginState();
-    const sysDark = this.getUIAbilityContext().config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
-    this.isDark = sysDark;
-    setDarkMode(sysDark);
     // 进吧页已抽为自含组件（挂载即加载）：这里仅同步关注吧快照，供「我的」页关注吧统计使用
     this.loadFollowsForMine();
     if (this.loggedIn) {
@@ -142,6 +203,10 @@ struct Index {
   }
 
   onPageShow(): void {
+    // 合规闸门未通过（首启同意弹窗仍在展示）时，不做任何登录态读取与刷新动作
+    if (this.privacyPhase < 2) {
+      return;
+    }
     this.refreshLoginState();
     if (this.loggedIn) {
       this.loadUserStats();
@@ -324,6 +389,10 @@ struct Index {
    * 根视图（favCanGoBack=false）放行系统默认（退出 App）。
    */
   onBackPress(): boolean {
+    // 合规闸门未通过：返回键不生效，不允许绕过隐私政策弹窗进入应用（必须显式选择同意或不同意）
+    if (this.privacyPhase < 2) {
+      return true;
+    }
     if (this.selectedTab === TabIndex.Favorite && AppStorage.get<boolean>('favCanGoBack') === true) {
       const req: number = (AppStorage.get<number>('favBackRequest') ?? 0) + 1;
       AppStorage.setOrCreate<number>('favBackRequest', req);
@@ -334,15 +403,20 @@ struct Index {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
-      // API26+ 沉浸材质生效范围仅限 Navigation 标题栏 / Tabs TabBar 槽位：
-      // 支持时走真实 Tabs（底栏挂 tabBar，官方沉浸材质才渲染），其余走原手写叠放路径（与定稿一致，BottomBar 贴底悬浮）。
-      if (this.materialSupported && MaterialManager.getApiLevel() >= 26) {
-        this.FloatingTabsShell()
-      } else {
-        this.PagesStack()
-        if (!this.favEditing) {
-          this.BottomBar()
+      if (this.privacyPhase >= 2) {
+        // API26+ 沉浸材质生效范围仅限 Navigation 标题栏 / Tabs TabBar 槽位：
+        // 支持时走真实 Tabs（底栏挂 tabBar，官方沉浸材质才渲染），其余走原手写叠放路径（与定稿一致，BottomBar 贴底悬浮）。
+        if (this.materialSupported && MaterialManager.getApiLevel() >= 26) {
+          this.FloatingTabsShell()
+        } else {
+          this.PagesStack()
+          if (!this.favEditing) {
+            this.BottomBar()
+          }
         }
+      } else {
+        // 合规闸门未通过：主界面（含各 Tab 自含组件）不参与构建，只渲染占位/同意浮层
+        this.PrivacyGate()
       }
     }
     .width('100%')
@@ -354,6 +428,122 @@ struct Index {
       this.currentWidth = width;
       this.isWideScreen = width >= 840;
     })
+  }
+
+  /**
+   * 合规闸门浮层（不透明全屏，覆盖启动首帧）：
+   * phase=0 读本地授权记录期间显示品牌占位（毫秒级，避免「先闪主界面再弹窗」）；
+   * phase=1 显示隐私政策同意卡片。
+   * 拒绝 → terminateSelf 退出应用；同意 → 落盘版本号并放行 initApp。
+   */
+  @Builder
+  PrivacyGate() {
+    Column() {
+      if (this.privacyPhase === 1) {
+        this.PrivacyCard()
+      } else {
+        Text('TiebaPura')
+          .fontSize(fs(26, this.fontScale))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Theme.textPrimary(this.isDark))
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor(Theme.bg(this.isDark))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+  }
+
+  /** 隐私政策同意卡片：必须显式表态（不同意即退出），无倒计时自动同意、无默认勾选、点遮罩不消失 */
+  @Builder
+  PrivacyCard() {
+    Column() {
+      Text('隐私政策')
+        .fontSize(fs(19, this.fontScale))
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Theme.textPrimary(this.isDark))
+        .width('100%')
+        .textAlign(TextAlign.Start)
+
+      Scroll() {
+        Column({ space: 10 }) {
+          Text('欢迎使用 TiebaPura。本应用是第三方非官方百度贴吧客户端，由个人开发者 a307608689-afk 独立开发，与百度公司无任何关联。')
+            .fontSize(fs(14, this.fontScale))
+            .fontColor(Theme.textSecondary(this.isDark))
+            .lineHeight(fs(21, this.fontScale))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+
+          Text('为向您提供服务，我们会：')
+            .fontSize(fs(14, this.fontScale))
+            .fontColor(Theme.textSecondary(this.isDark))
+            .lineHeight(fs(21, this.fontScale))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+
+          Text('· 仅在您的设备本地保存登录态、收藏、浏览历史等数据，不上传至我们控制的服务器；\n'
+            + '· 为实现贴吧内容的浏览与检索，必要的请求参数会发送至百度贴吧官方接口；\n'
+            + '· 不申请通讯录、位置、相册、麦克风等与功能无关的任何权限；\n'
+            + '· 不含任何第三方广告、统计或推送 SDK；\n'
+            + '· 不进行用户画像与个性化推荐。')
+            .fontSize(fs(14, this.fontScale))
+            .fontColor(Theme.textSecondary(this.isDark))
+            .lineHeight(fs(21, this.fontScale))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: fs(236, this.fontScale) })
+      .scrollBar(BarState.Off)
+      .margin({ top: 12 })
+
+      Text('查看完整《隐私政策》')
+        .fontSize(fs(14, this.fontScale))
+        .fontColor(Theme.brand())
+        .decoration({ type: TextDecorationType.Underline, color: Theme.brand() })
+        .margin({ top: 14 })
+        .onClick(() => { this.openPrivacyPolicy(); })
+
+      Text('点击「同意并继续」表示您已阅读并同意上述政策；若不同意，您将无法使用本应用。')
+        .fontSize(fs(12, this.fontScale))
+        .fontColor(Theme.textTertiary(this.isDark))
+        .lineHeight(fs(18, this.fontScale))
+        .width('100%')
+        .textAlign(TextAlign.Start)
+        .margin({ top: 14 })
+
+      Row({ space: 12 }) {
+        Button('不同意')
+          .fontSize(fs(15, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .backgroundColor(Theme.bgElevated(this.isDark))
+          .layoutWeight(1)
+          .height(44)
+          .borderRadius(22)
+          .onClick(() => { this.onPrivacyReject(); })
+
+        Button('同意并继续')
+          .fontSize(fs(15, this.fontScale))
+          .fontColor(Color.White)
+          .backgroundColor(Theme.brand())
+          .layoutWeight(1)
+          .height(44)
+          .borderRadius(22)
+          .onClick(() => { this.onPrivacyAgree(); })
+      }
+      .width('100%')
+      .margin({ top: 18 })
+    }
+    .width(this.currentWidth >= 600 ? 440 : Math.max(this.currentWidth - 56, 260))
+    .padding({ left: 20, right: 20, top: 22, bottom: 20 })
+    .borderRadius(20)
+    .backgroundColor(Theme.bgCard(this.isDark))
+    .border({ width: 0.5, color: Theme.divider(this.isDark) })
+    .shadow({ radius: 24, color: '#40000000', offsetY: 8 })
   }
 
   /** API26+ 悬浮玻璃路径：真实 Tabs 单内容承载页叠层，底栏胶囊放入 .tabBar() 槽位（引擎认可其属于 TabBar 生效范围） */
