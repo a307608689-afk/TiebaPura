@@ -32,6 +32,16 @@
 /ui_*.xml
 /_h.txt
 
+# 本机签名材料（含密钥库口令与绝对路径，绝不入库）。
+# 正常位置是 tools/signing.local.json（已由上面的 /tools/ 覆盖），这里兜住「被放到工程根」的情况。
+# 公开仓库不含真实签名材料，他人 clone 后构建出 unsigned 包，属预期行为。
+signing.local.json
+
+# 签名材料本体：密钥库 / 描述文件 / 证书链 —— 出现在任何位置都不入库
+*.p12
+*.p7b
+*.cer
+
 # ===== 系统 / 编辑器杂项 =====
 .DS_Store
 Thumbs.db
