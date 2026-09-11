@@ -65,8 +65,9 @@
   已核：当前 release 包的 `pack.info` 里 `bundleName=com.tiebapura.app`、`version.name=1.0.0`、`version.code=1000000`、`deviceType=["phone"]`、`compatible=23 / target=26`；包内共 8 个条目，**无 sourceMaps / `.map` / `.ts` / debug 残留**。
   已核归档物：`dist\TiebaPura-v1.0.0-hap-2a368c8-20260911-155503.hap`，已对该副本**单独跑过一次 verify-app** 得到 `profile type is: release` + `Verify success`，SHA256 记在同目录 `.sha256` 文件里。
 
-- [ ] **政策改动必须推送到 GitHub**
+- [x] **政策改动必须推送到 GitHub**
   审核员看的是远端文件。本地改完不推送，等于没改——线上 URL 仍是旧内容。
+  已核（2026-09-11）：隐私合规修正已随 `5fc824c` 推送，清单与后续结论修正又推了 `2a368c8` / `d79a782`；`origin/main` 与本地 `HEAD` 一致。
 
 - [ ] **政策版本号是否递增（仅当应用已发布过）**
   位置：`entry/src/main/ets/common/Constants.ets` 的 `PRIVACY_POLICY_VERSION`。
@@ -122,10 +123,11 @@
 | 隐私政策网址 | `https://github.com/a307608689-afk/TiebaPura/blob/main/docs/PRIVACY.md` | `common/Constants.ets` 的 `PRIVACY_POLICY_URL` |
 | 隐私权利（可选） | `https://github.com/a307608689-afk/TiebaPura/issues` | — |
 
-- [ ] 后台填的隐私政策网址与 `Constants.ets` 的 `PRIVACY_POLICY_URL` 逐字符一致（填 `blob` 渲染页，不要填 `raw` 源码页）。
-- [ ] 应用图标已定稿：`AppScope/resources/base/media/app_icon.png` 存在；如市场另有尺寸要求需单独出图。
-- [ ] 三方依赖为空，与政策「不嵌入任何第三方 SDK」一致。
-  位置：根 `oh-package.json5` 与 `entry/oh-package.json5` 的 `dependencies` 均为 `{}`。
+- [x] 后台填的隐私政策网址与 `Constants.ets` 的 `PRIVACY_POLICY_URL` 逐字符一致（填 `blob` 渲染页，不要填 `raw` 源码页）。
+  已核：`Constants.ets` 的值就是 `https://github.com/a307608689-afk/TiebaPura/blob/main/docs/PRIVACY.md`，与上表一字不差——提交时原样粘贴即可。
+- [x] 应用图标已定稿：`AppScope/resources/base/media/app_icon.png` 存在（804106 字节）；如市场另有尺寸要求需单独出图。
+- [x] 三方依赖为空，与政策「不嵌入任何第三方 SDK」一致。
+  已核：根 `oh-package.json5` 与 `entry/oh-package.json5` 的 `dependencies` 均为 `{}`，`devDependencies` / `dynamicDependencies` 亦为空。
 - [ ] **开发者身份一致性**：用第一节的 verify-app 命令打印证书主体，确认它与你提交所用的市场后台账号一致。
   证书主体形如 `CN="<实名>(<开发者账号ID>)\,Release"`——**实名与账号 ID 直接从证书里读，本文档不留档**；文档只记指纹：叶证书 `6842BD54…`。
   另：`AppScope/app.json5` 的 `vendor` 目前是 `a307608689-afk`（GitHub 昵称）；若要在「关于本应用」展示真实开发者名称可一并调整，不改也不影响审核。
