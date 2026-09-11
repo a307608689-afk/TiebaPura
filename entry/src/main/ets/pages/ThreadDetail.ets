@@ -2313,7 +2313,8 @@ struct ThreadDetail {
     .width('100%')
     // 外层左右padding清零，避免挤压内部Row的水平可用宽度导致元素错位
     .padding({ left: 0, right: 0, top: 10, bottom: 10 })
-    .backgroundColor(Theme.bgElevated(this.isDark))
+    // 楼中楼预览容器底色与楼层卡同源（Theme.bgCard）：浅深档都与楼层卡同色，避免深色下出现"框中框"视觉冗余
+    .backgroundColor(Theme.bgCard(this.isDark))
     .borderRadius(Radius.md)
   }
 

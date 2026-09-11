@@ -570,18 +570,19 @@ export struct ThreadCard {
         Row({ space: 6 }) {
           SymbolGlyph($r('sys.symbol.share'))
             .fontSize(fs(18, this.fontScale))
-            .fontColor([Color.Black])
+            .fontColor([Theme.textPrimary(isDarkMode())])
           Text('分享')
             .fontSize(fs(13, this.fontScale))
-            .fontColor(Color.Black)
+            .fontColor(Theme.textPrimary(isDarkMode()))
         }
         .layoutWeight(1)
         .height(36)
         .justifyContent(FlexAlign.Center)
         .borderRadius(18)
-        .backgroundColor(Theme.manualGlass(isDarkMode()))
+        .backgroundColor(Theme.sheetGlass(isDarkMode()))
+        .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.cardAction())
+        .shadow(Theme.glassShadowStyle())
         .systemMaterial(ImmMaterial.cardAction())
         .onClick(() => {
           const payload: ThreadSharePayload = {
@@ -599,18 +600,19 @@ export struct ThreadCard {
         Row({ space: 6 }) {
           SymbolGlyph($r('sys.symbol.ellipsis_message_fill'))
             .fontSize(fs(18, this.fontScale))
-            .fontColor([Color.Black])
+            .fontColor([Theme.textPrimary(isDarkMode())])
           Text(`${this.getItem().replyNum}`)
             .fontSize(fs(13, this.fontScale))
-            .fontColor(Color.Black)
+            .fontColor(Theme.textPrimary(isDarkMode()))
         }
         .layoutWeight(1)
         .height(36)
         .justifyContent(FlexAlign.Center)
         .borderRadius(18)
-        .backgroundColor(Theme.manualGlass(isDarkMode()))
+        .backgroundColor(Theme.sheetGlass(isDarkMode()))
+        .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.cardAction())
+        .shadow(Theme.glassShadowStyle())
         .systemMaterial(ImmMaterial.cardAction())
         .onClick(() => {
           const tid = this.getItem().tid;
@@ -624,23 +626,24 @@ export struct ThreadCard {
           if (this.getItem().isLiked) {
             SymbolGlyph($r('sys.symbol.heart_fill'))
               .fontSize(fs(19, this.fontScale))
-              .fontColor([Color.Black])
+              .fontColor([Theme.textPrimary(isDarkMode())])
           } else {
             SymbolGlyph($r('sys.symbol.heart'))
               .fontSize(fs(19, this.fontScale))
-              .fontColor([Color.Black])
+              .fontColor([Theme.textPrimary(isDarkMode())])
           }
           Text(`${this.getItem().likeCount ?? 0}`)
             .fontSize(fs(13, this.fontScale))
-            .fontColor(Color.Black)
+            .fontColor(Theme.textPrimary(isDarkMode()))
         }
         .layoutWeight(1)
         .height(36)
         .justifyContent(FlexAlign.Center)
         .borderRadius(18)
-        .backgroundColor(Theme.manualGlass(isDarkMode()))
+        .backgroundColor(Theme.sheetGlass(isDarkMode()))
+        .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.cardAction())
+        .shadow(Theme.glassShadowStyle())
         .systemMaterial(ImmMaterial.cardAction())
         .onClick(() => {
           const tid = this.getItem().tid;

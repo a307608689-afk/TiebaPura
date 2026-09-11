@@ -29,6 +29,35 @@ enum LoadState {
   Loading, Success, Empty, Error,
 }
 
+/**
+ * 顶部官方标题栏开关（与 ThreadDetail / HomeTab / ForumsTab 同机制）：
+ * true  = 「返回钮 / 吧名胶囊」整行搬进 Navigation 的 title 槽位，玻璃交给官方沉浸材质 systemMaterial
+ *         （官方口径：systemMaterial 生效区域仅 Navigation/NavDestination 标题栏、横向 Tabs(barPosition=End)
+ *          底部 TabBar；页面 body 内自绘浮层必判 Material inactive: out of scope）；
+ *         几何与「帖子详细页」DetailTitleBar 逐项一致（返回 44 圆钮 + 吧名 58% 宽胶囊居中）。
+ * false = 回退改造前的页面主体悬浮顶栏（shadow + backgroundEffect(ImmBlur.control()) 真磨砂兜底）。
+ * ⚠️ 本页是二级路由页：搬槽位后系统侧滑返回 / 返回键需真机回归（§9.3 注记）。
+ */
+const SUBPOST_OFFICIAL_TITLE_BAR: boolean = true;
+/**
+ * 官方标题栏高度：与改造前悬浮顶栏几何逐项一致 —— 44(状态栏让位) + 44(钮/胶囊行高) + 10(底部呼吸) = 98。
+ * Scroll 首项占位（98）与之同值，保持原值不变。
+ */
+const SUBPOST_TITLE_BAR_HEIGHT: number = 98;
+
+/**
+ * 内容卡片圆角（vp）：父楼层卡与楼中楼回复卡统一 26（2026-09-11 用户指定）。
+ * 改动前分别是 Radius.lg(16) / Radius.md(12)，其余几何（宽高、间距、内边距）一行未改。
+ * 链接跳转确认弹窗卡片沿用工程「居中确认卡」统一规范 32vp，不在本常量管辖范围。
+ */
+const SUBPOST_CARD_RADIUS: number = 26;
+
+/**
+ * 滚动区底部留白：维持改造前的原值 Spacing.xl(20)（滚动内容 Column 的 padding.bottom）。
+ * 历史：2026-09-11 曾按「与帖子详细页一致」改为 160、再降到 96，用户真机查看后要求回退初始值，
+ * 现完全复原（无专属常量，直接用 Spacing.xl）。
+ */
+
 @Entry
 @Component
 struct SubPostDetail {
@@ -43,6 +72,9 @@ struct SubPostDetail {
   @State errorMsg: string = '';
   @State isDark: boolean = isDarkMode();
   @State loading: boolean = false;
+  // API26+ 真机沉浸光感：materialSupported 为 true 时 build 走官方 Navigation 标题栏槽位
+  // （返回钮 / 吧名胶囊吃 systemMaterial）；其余环境走原自绘悬浮顶栏兜底。
+  @State materialSupported: boolean = false;
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
@@ -119,6 +151,7 @@ struct SubPostDetail {
 
   aboutToAppear(): void {
     MaterialManager.init();
+    this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
     const params = this.getUIContext().getRouter().getParams() as Record<string, Object>;
     if (params) {
       this.tid = `${params.tid ?? ''}`.trim();
@@ -260,6 +293,32 @@ struct SubPostDetail {
   }
 
   build() {
+    if (SUBPOST_OFFICIAL_TITLE_BAR && this.materialSupported) {
+      // 官方槽位路径：Navigation + 自定义 title（height 固定 98，与改造前悬浮顶栏几何一致）
+      // barStyle STACK：内容区延伸到标题栏之下（官方建议，标题栏材质获得最佳沉浸体验的前提）
+      // backgroundColor 显式透明：避免标题栏自带底色压住滚动经过的内容
+      Navigation() {
+        this.SubPostContent()
+      }
+      .title({ builder: this.SubPostTitleBar(), height: SUBPOST_TITLE_BAR_HEIGHT },
+        { barStyle: BarStyle.STACK, backgroundColor: Color.Transparent })
+      .mode(NavigationMode.Stack)
+      .hideTitleBar(false)
+      .hideBackButton(true)
+      .width('100%')
+      .height('100%')
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    } else {
+      // 兜底路径：改造前原样（页面主体悬浮 LegacyTopBar + backgroundEffect 真磨砂）
+      this.SubPostContent()
+    }
+  }
+
+  /** 页面主体（改造前 build() 根 Stack 原样搬入；悬浮顶栏仅在官方槽位不可用时挂载） */
+  @Builder
+  SubPostContent() {
     Stack({ alignContent: Alignment.TopStart }) {
       if (this.loadState === LoadState.Loading) {
         LoadingView({ message: '正在加载楼中楼...' }).layoutWeight(1)
@@ -293,8 +352,10 @@ struct SubPostDetail {
         .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
       }
 
-      // 悬浮顶栏（内容可穿过）
-      this.TopBar()
+      // 悬浮顶栏（内容可穿过）；官方 title 槽位路径下两元素已在槽位里（SubPostTitleBar），这里不再叠一层
+      if (!(SUBPOST_OFFICIAL_TITLE_BAR && this.materialSupported)) {
+        this.LegacyTopBar()
+      }
 
       // 链接跳转确认浮层（沉浸光感卡片，风格与收藏页确认弹窗一致）
       if (this.showLinkDialog) {
@@ -307,8 +368,65 @@ struct SubPostDetail {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
+  /**
+   * 官方槽位标题栏：整行搬进 Navigation 的 title 槽位，几何与「帖子详细页」DetailTitleBar 逐项一致
+   * （外层高 98 / padding top 44 + bottom 10 + 左右 Spacing.lg、Row 高 44、吧名胶囊 58% 宽 + 44 高 +
+   * 左右 padding 16 + 居中），只把玻璃从自绘换成官方沉浸材质：
+   * - 返回钮 / 吧名胶囊 → ImmMaterial.seg(false)（THIN 中性档，与帖子详细页顶栏同一套材质语言）；
+   * - 两处都显式 backgroundColor(Color.Transparent)：Button 自带品牌蓝默认填充，不清底会透出蓝底；
+   * - 不挂 border / backgroundBlurStyle / shadow：官方明确不建议与 systemMaterial 同用（会互相覆盖）；
+   * - 图标/文字色沿用系统可反色资源（icon_primary / font_primary），满足官方自动反色前提。
+   */
   @Builder
-  TopBar() {
+  SubPostTitleBar() {
+    Stack() {
+      Row() {
+        Button() {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontColor([$r('sys.color.icon_primary')])
+            .fontSize(fs(24, this.fontScale))
+        }
+        .width(44)
+        .height(44)
+        .backgroundColor(Color.Transparent)
+        .systemMaterial(ImmMaterial.seg(false))
+        .borderRadius(Radius.full)
+        .onClick(() => { this.goBack(); })
+        Blank()
+      }
+      .width('100%')
+      .height(44)
+      .align(Alignment.Start)
+      Button() {
+        Text(`${this.forumName || '楼中楼'}${this.forumName.length > 0 ? '吧' : ''}`)
+          .fontSize(fs(16, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .constraintSize({ maxWidth: '85%' })
+      }
+      .backgroundColor(Color.Transparent)
+      .systemMaterial(ImmMaterial.seg(false))
+      .borderRadius(Radius.full)
+      .height(44)
+      .width('58%')
+      .padding({ left: 16, right: 16 })
+      .align(Alignment.Center)
+      .accessibilityText('楼中楼所在吧')
+    }
+    .width('100%')
+    .height(SUBPOST_TITLE_BAR_HEIGHT)
+    .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
+    .backgroundColor(Color.Transparent)
+  }
+
+  /**
+   * 兜底路径顶栏（改造前原样）：页面主体悬浮层（内容可穿过）+ 透明底 + backgroundEffect 真模糊磨砂。
+   * 仅在官方 title 槽位不可用时挂载（见 SubPostContent 的条件挂载）。
+   */
+  @Builder
+  LegacyTopBar() {
     Row() {
       Button() {
         SymbolGlyph($r('sys.symbol.chevron_left'))
@@ -372,7 +490,7 @@ struct SubPostDetail {
     .width('100%')
     .padding(Spacing.lg)
     .backgroundColor(Theme.bgCard(this.isDark))
-    .borderRadius(Radius.lg)
+    .borderRadius(SUBPOST_CARD_RADIUS)
   }
 
   @Builder
@@ -469,7 +587,7 @@ struct SubPostDetail {
           .backgroundColor(this.highlightCommentId === comment.commentId
             ? (this.isDark ? '#3C3C3C' : '#E4E4E4')
             : Theme.bgCard(this.isDark))
-          .borderRadius(Radius.md)
+          .borderRadius(SUBPOST_CARD_RADIUS)
           // 评论间距：非最后一条时追加 Spacing.sm 视觉区分
           if ((commentIndex ?? 0) < this.commentsState.length - 1) {
             Column() { }

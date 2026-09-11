@@ -19,6 +19,7 @@
 import { AuthManager } from '../service/AuthManager';
 import { UserStats, FollowItem } from '../model/DataModel';
 import { Theme, Spacing, Radius, fs, isDarkMode, setDarkMode, ImmBlur, ImmMaterial } from '../common/Theme';
+import { UsageHabitsManager } from '../service/UsageHabitsManager';
 
 /** 官方标题栏开关：true = 「我的」标题行（含右上角深色切换圆钮）走 Navigation title 槽位吃官方材质（§6.10 模板，与首页/进吧/收藏同机制）；
  *  false = 一键回退到页面主体悬浮自绘玻璃 TopBar（manualGlass + backgroundBlurStyle 真磨砂），旧 TopBar() 原样保留。 */
@@ -161,6 +162,10 @@ export struct MineTab {
       .accessibilityText('切换深色模式')
       .onClick(() => {
         this.isDark = !this.isDark;
+        // 用户主动切换：写 manual + 关跟随系统（避免 onConfigurationUpdate 在 setColorMode 异步窗口内
+        // 拿到旧 Configuration 反向拉回档位）。与 PersonalizedPage 「深色模式」开关完全等价。
+        UsageHabitsManager.getInstance().setFollowSystemDark(false);
+        UsageHabitsManager.getInstance().setDarkModeManual(this.isDark);
         setDarkMode(this.isDark);
         AppStorage.setOrCreate<number>('darkTick', (AppStorage.get<number>('darkTick') ?? 0) + 1);
       })
@@ -207,6 +212,10 @@ export struct MineTab {
       .accessibilityText('切换深色模式')
       .onClick(() => {
         this.isDark = !this.isDark;
+        // 用户主动切换：写 manual + 关跟随系统（避免 onConfigurationUpdate 在 setColorMode 异步窗口内
+        // 拿到旧 Configuration 反向拉回档位）。与 PersonalizedPage 「深色模式」开关完全等价。
+        UsageHabitsManager.getInstance().setFollowSystemDark(false);
+        UsageHabitsManager.getInstance().setDarkModeManual(this.isDark);
         setDarkMode(this.isDark);
         AppStorage.setOrCreate<number>('darkTick', (AppStorage.get<number>('darkTick') ?? 0) + 1);
       })

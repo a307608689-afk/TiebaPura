@@ -27,6 +27,7 @@ import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PersonalContentItem } from '../model/DataModel';
 import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial } from '../common/Theme';
 import { Haptic } from '../common/Haptic';
+import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { compareByName } from '../common/Pinyin';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 
@@ -1223,6 +1224,10 @@ export struct ForumsTab {
       .accessibilityText('切换深色模式')
       .onClick(() => {
         this.isDark = !this.isDark;
+        // 用户主动切换：写 manual + 关跟随系统（避免 onConfigurationUpdate 在 setColorMode 异步窗口内
+        // 拿到旧 Configuration 反向拉回档位）。与 PersonalizedPage 「深色模式」开关完全等价。
+        UsageHabitsManager.getInstance().setFollowSystemDark(false);
+        UsageHabitsManager.getInstance().setDarkModeManual(this.isDark);
         setDarkMode(this.isDark);
         AppStorage.setOrCreate<number>('darkTick', (AppStorage.get<number>('darkTick') ?? 0) + 1);
       })
@@ -1311,6 +1316,10 @@ export struct ForumsTab {
       .accessibilityText('切换深色模式')
       .onClick(() => {
         this.isDark = !this.isDark;
+        // 用户主动切换：写 manual + 关跟随系统（避免 onConfigurationUpdate 在 setColorMode 异步窗口内
+        // 拿到旧 Configuration 反向拉回档位）。与 PersonalizedPage 「深色模式」开关完全等价。
+        UsageHabitsManager.getInstance().setFollowSystemDark(false);
+        UsageHabitsManager.getInstance().setDarkModeManual(this.isDark);
         setDarkMode(this.isDark);
         AppStorage.setOrCreate<number>('darkTick', (AppStorage.get<number>('darkTick') ?? 0) + 1);
       })

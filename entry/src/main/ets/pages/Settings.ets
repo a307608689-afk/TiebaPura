@@ -41,14 +41,25 @@ struct Settings {
   @State fontSizeTick: number = 0;
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位，否则回退自绘玻璃 TopBar（与 ThreadDetail 同判据） */
   @State materialSupported: boolean = false;
+  /** darkTick 自增（个性化页 / 其它 Tab 切换深色 / 系统 onConfigurationUpdate）→ 翻 this.isDark，避免从子页返回时仍是旧档 */
+  @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
 
   onPageShow(): void {
     this.fontSizeTick++;
+    // 页面每次可见都刷新登录态：覆盖「首次进入」与「从登录页返回」两个时点，
+    // 否则账号卡片会一直停留在 @State 初始的未登录态
+    this.loadUserInfo();
   }
 
   aboutToAppear(): void {
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
+    this.isDark = isDarkMode();
+    this.loadUserInfo();
+  }
+
+  /** darkTick 递增 → 重读 isDarkMode() 翻 this.isDark，与 MineTab / PersonalizedPage 同链路 */
+  private onDarkTick(): void {
     this.isDark = isDarkMode();
     this.loadUserInfo();
   }

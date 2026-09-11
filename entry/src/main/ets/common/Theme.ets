@@ -16,8 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { uiMaterial } from '@kit.ArkUI';
+import { uiMaterial, window } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
+import { common, ConfigurationConstant } from '@kit.AbilityKit';
 
 /**
  * 主题与设计令牌。
@@ -594,6 +595,11 @@ export class Theme {
   static textPrimary(isDark: boolean): string { return isDark ? '#F0F2F5' : '#1A1A1A'; }
   static textSecondary(isDark: boolean): string { return isDark ? '#A8AEB8' : '#4E545C'; }
   static textTertiary(isDark: boolean): string { return isDark ? '#6E7480' : '#9AA0A6'; }
+  /**
+   * 图标主色（替代 $r('sys.color.icon_primary')，绕开 Configuration 锁死后系统反色资源卡在旧档的坑）。
+   * 与 textPrimary 同源深色档（#F0F2F5 / #1A1A1A），视觉上与 HarmonyOS 默认 icon_primary 一致。
+   */
+  static iconPrimary(isDark: boolean): string { return isDark ? '#F0F2F5' : '#1A1A1A'; }
   // 分割线
   static divider(isDark: boolean): string { return isDark ? '#2E2E33' : '#EBEDF0'; }
   // 主题蓝
@@ -734,10 +740,132 @@ export function fs(baseFontSize: number, scale: number = AppStorage.get<number>(
 }
 
 /**
- * 设置全局深色模式
+ * 冷启动入口：仅把目标深色态写入模块级变量，不下发系统。
+ *
+ * 冷启动时 _globalIsDark 本就由 EntryAbility.onCreate 在首帧渲染前 fire-and-forget 异步
+ * 读 cache 后调 applicationContext.setColorMode(...) 把 Configuration 同步到目标档；
+ * Index.aboutToAppear 再走一遍只会重复触发整树重建，重入导致闪退。
+ * 因此冷启动二期（Index.aboutToAppear 阶段）只同步应用内状态，系统层不动。
+ */
+export function initDarkMode(isDark: boolean): void {
+  _globalIsDark = isDark;
+}
+
+/**
+ * 系统 Configuration 变化回调专用入口：仅写模块变量 + 递增 darkTick，**不**调 setColorMode。
+ *
+ * 关键设计：onConfigurationUpdate 里调 setColorMode 是反向拉回 / 重入循环的最大来源（setColorMode
+ * 异步生效期间回调里 Configuration.colorMode 仍是旧值，按旧值再 setColorMode 会把档位拉回）。
+ * 因此「系统切色」场景下只同步应用内状态，Configuration 本身已是新值（onConfigurationUpdate
+ * 收到的就是新值），官方槽位自动翻档 —— 不需要也不应该再调 setColorMode。
+ *
+ * 与 setDarkMode 的区别：
+ * - setDarkMode：用户主动切换入口（ForumsTab/我的/月亮钮），会调 setColorMode 主动下发
+ * - syncDarkFromConfig：系统 Configuration 变化回调专用，只同步应用内状态
+ */
+export function syncDarkFromConfig(sysDark: boolean): void {
+  _globalIsDark = sysDark;
+}
+
+/**
+ * 「从手动档切到跟随系统档」专用入口：
+ * - 主动调 setColorMode(NOT_SET) 把 Application Configuration 重置为跟随系统档
+ *   （Configuration.colorMode 立即等于系统当前档，systemMaterial 立即按系统档渲染）
+ * - 同步 _globalIsDark + 状态栏
+ * - **不**调 setColorMode(DARK/LIGHT) 锁死到目标档——跟随系统档要求 Configuration 永远 NOT_SET
+ *
+ * ⚠️ HarmonyOS 设计限制（HTTPS 6.1 §2.1）：setColorMode(NOT_SET) 是「半重置」——
+ *   Configuration.colorMode 立即等于系统档，但「已锁死」标记无法清除，
+ *   未来 onConfigurationUpdate 仍可能静默。**用户仍需杀进程重进**才能让「实时跟档」行为完全恢复。
+ *   不过本次重置后 Configuration.colorMode 已等于系统档 —— ForumsTitleBar / HomeTitleBar 等
+ *   官方槽位的 systemMaterial 与 $r('sys.color.font_primary') 立即按系统档渲染。
+ */
+export function resetConfigurationToFollowSystem(): void {
+  try {
+    const ctx = AppStorage.get<common.UIAbilityContext>('abilityContext');
+    if (!ctx) {
+      return;
+    }
+    // 1. 把 Configuration 重置为跟随系统档（视觉上立即恢复跟随系统）
+    ctx.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+    // 2. 标记"尚未下发 manual 档"——后续 setDarkMode 会再设一次 DARK/LIGHT（手动档用）
+    _systemSyncedDark = -1;
+    // 3. 同步状态栏内容色（按当前系统档取色）
+    const sysDark: boolean =
+      ctx.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    const mainWindow = AppStorage.get<window.Window>('mainWindow');
+    if (mainWindow) {
+      mainWindow.setWindowSystemBarProperties({
+        statusBarColor: '#00000000',
+        navigationBarColor: '#00000000',
+        statusBarContentColor: sysDark ? '#FFFFFF' : '#1A1A1A',
+        navigationBarContentColor: sysDark ? '#FFFFFF' : '#1A1A1A',
+      }).catch(() => {
+      });
+    }
+    console.info('Theme', 'resetConfigurationToFollowSystem: current sysDark=' + (sysDark ? '1' : '0'));
+  } catch (systemError) {
+    // 静默失败不影响应用内状态
+  }
+}
+
+/** 已下发给系统的深色档（-1 = 尚未下发过）。setColorMode 会触发 Configuration 变化，
+ *  进而触发 EntryAbility.onConfigurationUpdate 回调，后者又会调本函数 —— 没有幂等短路会形成
+ *  setColorMode → onConfigurationUpdate → setColorMode 的重入循环导致闪退。 */
+let _systemSyncedDark: number = -1;
+
+/** 设置全局深色模式（用户主动切换入口）。
+ *
+ * 除写入模块级变量供自绘组件读取外，同步把深色态下发给系统，修「应用内软切深色、官方槽位不反色」与
+ * 「重启后深色不完全」（Configuration 不跟随导致顶栏 systemMaterial / 状态栏文字色按旧档渲染）：
+ * 1. `applicationContext.setColorMode(...)` 让 `Configuration.colorMode` 跟随变化，于是
+ *    Navigation/NavDestination 标题栏与 Tabs 底栏里的 `systemMaterial`、以及
+ *    `$r('sys.color.font_primary')` / `$r('sys.color.icon_primary')` 等系统反色资源自动翻档。
+ * 2. 同步状态栏/导航栏内容色——EntryAbility 冷启动写过浅色档，不覆盖则深色下始终是黑字。
+ *
+ * 幂等靠 _systemSyncedDark：Configuration 已经是目标档时跳过 setColorMode，避免重入闪退。
+ *
+ * 失败不阻断应用内主题切换（自绘配色仍由 `_globalIsDark` 保证）。
  */
 export function setDarkMode(isDark: boolean): void {
+  const target: number = isDark ? 1 : 0;
+  // 双条件幂等：模块变量与系统档都已同步到目标值才短路。
+  // 单独看 _systemSyncedDark 不够 —— setColorMode 是异步的，回调里 Configuration 尚未真正变更时
+  // _systemSyncedDark 已被标记，会出现「标记说同步了但实际没变」的误判窗口。
+  if (_globalIsDark === isDark && _systemSyncedDark === target) {
+    return;
+  }
   _globalIsDark = isDark;
+  try {
+    const ctx = AppStorage.get<common.UIAbilityContext>('abilityContext');
+    if (!ctx) {
+      return;
+    }
+    _systemSyncedDark = target;
+    // 关键：先 setColorMode(NOT_SET) 把 Configuration 重置为「跟随系统」（让 Configuration.colorMode
+    // 立即等于系统当前档，visual 上恢复跟随系统），再 setColorMode(target) 锁死到目标档。
+    // 否则用户场景「之前手动切过色 → Configuration 被锁死在 LIGHT → 系统切深色时 Configuration 仍 LIGHT →
+    // systemMaterial 渲染浅色档，顶栏与卡片不同步」。
+    // setColorMode(NOT_SET) 是「半重置」（web 文章 6.1 §2.1）：Configuration.colorMode 立即等于系统档，
+    // 但「已锁死」标记仍在，未来 onConfigurationUpdate 仍静默 —— 所以下面 setColorMode(target) 仍需主动锁。
+    ctx.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+    ctx.getApplicationContext().setColorMode(isDark
+      ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+      : ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT);
+    const mainWindow = AppStorage.get<window.Window>('mainWindow');
+    if (mainWindow) {
+      mainWindow.setWindowSystemBarProperties({
+        statusBarColor: '#00000000',
+        navigationBarColor: '#00000000',
+        statusBarContentColor: isDark ? '#FFFFFF' : '#1A1A1A',
+        navigationBarContentColor: isDark ? '#FFFFFF' : '#1A1A1A',
+      }).catch(() => {
+      });
+    }
+  } catch (systemError) {
+    // 系统侧同步失败不影响应用内主题切换；回退标记以便下次重试
+    _systemSyncedDark = -1;
+  }
 }
 
 /**

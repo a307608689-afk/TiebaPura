@@ -1052,6 +1052,7 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 5 | `UserProfile.ets` / `FollowList.ets` / `BlacklistManager.ets` | TopBar + 排序钮（三页同构） | 同上，可一次改完 | ⬜ 待办 |
 | 6 | `ThreadDetail.ets` | 沉浸顶栏（返回钮 / 吧名胶囊 / 分享钮）+ 排序胶囊（正序 / 只看全部）+ **底部已是官方 `Tabs` 悬浮条** | 顶栏走 `Navigation` title 槽位；排序胶囊走自建「空 tabBar 壳」槽位 —— 均 `ImmMaterial.seg(...)` | ✅ **已完成**（见下方落地清单；该页为「上下两端官方槽位」样板；排序胶囊的「TabBar 槽位子树」新判据待真机复核） |
 | 7 | `Search.ets` | 顶部返回 + 搜索框（`TextInput`）+ **底部已是官方 `Tabs` 悬浮条** | `Navigation` title 槽位 + `ImmMaterial.seg(false)`（返回钮 / 搜索框 / 搜索钮三元素同档）；⚠️ 搜索框搬进标题栏后**聚焦 / 键盘避让 / 输入态**行为待真机验证 | ⏳ **代码已落地**（见下方落地清单） |
+| 8 | `SubPostDetail.ets`（楼中楼页） | TopBar（返回 44 圆钮 / 吧名居中文字） | `Navigation` title 槽位，**几何对齐 `ThreadDetail` 顶栏**（返回 44 圆钮 + 吧名 58% 宽胶囊居中），两元素同挂 `ImmMaterial.seg(false)` | ✅ **代码已落地**（见下方落地清单） |
 
 > ⚠️ **不要无脑推广**：每页都要过 §6.10 的回归清单，尤其**手势冲突**（页面内 `parallelGesture` / 横滑切页）与**返回键**。
 > 二级页（`ThreadList` / `ThreadDetail`）本身已有导航语义，加 `Navigation` 壳前先确认不与宿主 `Index.ets` 的返回链打架。
@@ -1168,6 +1169,42 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
   ③ 底部官方 `Tabs` 悬浮条与顶部 `Navigation` 槽位共存（本页即第二处「上下两端官方槽位」）；④ 低版本兜底路径观感；
   ⑤ 全部 `systemMaterial` 生效、无 `Material inactive: out of scope`。异常时把 `SEARCH_OFFICIAL_TITLE_BAR` 置 `false` 即整行回退。
 
+**`SubPostDetail.ets`（帖子详细页 → 「查看更多楼中楼」）落地清单（2026-09-11，几何对齐 `ThreadDetail` 顶栏）**：
+
+- 开关 `SUBPOST_OFFICIAL_TITLE_BAR = true`（置 `false` 一键回退），`SUBPOST_TITLE_BAR_HEIGHT = 98`
+  = 44(状态栏让位) + 44(钮/胶囊行高) + 10(底部呼吸)，与原悬浮顶栏 `padding` 逐项对齐。
+- 本页是**二级路由页**（`ThreadDetail` / 消息定位 `pushUrl` 进入），槽位路径判据取
+  `SUBPOST_OFFICIAL_TITLE_BAR && this.materialSupported`（与 `ThreadDetail` / `Search` 同判据），
+  低版本 / 关闭沉浸光感时自动回到自绘悬浮顶栏兜底，不会出现「槽位里没有玻璃」。
+- 结构：原 `build()` 根 `Stack` 抽成 `SubPostContent()`（Loading/Error/Empty/Success 四态、`Scroll` 四态、
+  `showLinkDialog` 浮层全部留在其中，一行未动）；原 `TopBar()` 改名 `LegacyTopBar()` **原样保留**，
+  `SubPostContent()` 内改为 `if (!(SUBPOST_OFFICIAL_TITLE_BAR && this.materialSupported)) { this.LegacyTopBar() }`；
+  新增 `SubPostTitleBar()` 作槽内版本。
+- 槽内版本几何 = 视觉参照物 `ThreadDetail.DetailTitleBar()`：`Stack` + `Row(返回钮 44 + Blank)`（`align(Start)`）
+  + 居中吧名胶囊（`Button`，宽 `58%` / 高 44 / 左右 `padding` 16 / `Radius.full` / `fontSize` 16 / Medium）；
+  外层 `height(SUBPOST_TITLE_BAR_HEIGHT)` + `padding{left/right: Spacing.lg, top: 44, bottom: 10}`。
+  差异仅一处：`ThreadDetail` 右侧是分享钮 44，本页无分享功能，故只留 `Blank()` 撑开（返回钮落点不变）。
+- 两元素（返回钮 / 吧名胶囊）统一：`backgroundColor(Color.Transparent)`（清 `Button` 默认品牌蓝填充）
+  + `systemMaterial(ImmMaterial.seg(false))`（THIN 中性档，与帖子详细页顶栏同一套材质语言）+ `borderRadius(Radius.full)`；
+  图标/文字色用系统可反色资源（`icon_primary` / `font_primary`），满足官方自动反色前提；
+  槽内**不挂** `border` / `backgroundBlurStyle` / `shadow`（§4.4 口径）。
+- 几何零改动：`Scroll` 首项占位仍是 `height(98)`（正好等于 title bar 高度）；`subpost_scroll_content` 的
+  `padding` 与滚动定位偏移（`targetY - 120`）保持原值；`BottomFadeOverlay` / 链接确认浮层一律未动。
+- 兜底路径（开关 false / 低版本）与改造前**逐字节一致**：`LegacyTopBar()` 仍是「透明底 + `shadow(glassShadowStyle)`
+  + `backgroundEffect(ImmBlur.control())` + `systemMaterial(ImmMaterial.control())`」的自绘真磨砂自绘浮层。
+- ⚠️ **真机必测**：① 二级路由页的系统**侧滑返回 / 返回键**（`Navigation` 壳不应吞手势，异常时置 `false` 整行回退）；
+  ② 消息通知定位链路（`notifyCommentPid` 高亮 + `scrollTo` 偏移，顶栏高度未变故偏差为零）；
+  ③ 吧名超长时的 `Ellipsis`（胶囊 `constraintSize maxWidth: '85%'`）；④ 深色模式与字号缩放（`fontScale`）；
+  ⑤ 全部 `systemMaterial` 生效、无 `Material inactive: out of scope`。
+- 卡片圆角（2026-09-11 用户指定）：父楼层卡与楼中楼回复卡统一常量 `SUBPOST_CARD_RADIUS = 26`
+  （改动前分别是 `Radius.lg(16)` / `Radius.md(12)`），宽高 / 间距 / 内边距一行未改；
+  同页「链接跳转确认」弹窗卡片沿用工程「居中确认卡」统一规范 32vp，不在该常量管辖范围。
+- 滚动区底部留白：**维持改造前原值 `Spacing.xl(20)`**（滚动内容 `Column` 的 `padding.bottom`）。
+  历史与结论（2026-09-11，勿重复踩坑）：曾按「与帖子详细页一致」改为 `160`、再降到 `96`，用户真机
+  查看后要求**回退初始值**，现已完全复原、无专属常量。经验：`ThreadDetail` 的 `padding.bottom = 160`
+  里含底部悬浮回复岛让位 96（岛底距 30 + 岛高 66），**没有底部悬浮栏的页面照抄 160 会明显偏空**，
+  即便折中取 96 也仍偏离本页原有观感——跨页对齐「留白」时先确认对方数值里是否掺了浮层让位。
+
 ---
 
 ## 10. 每改一个点位都要跑的自测清单
@@ -1225,3 +1262,8 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 2026-09-10 | 第十二处迁移·追加：收藏页「吧分类 / 自定义分类」胶囊行 → title 槽位**第二行**（用户点名）。`FavTitleBar()` 改 `Column`（第一行 = `FavTitleBarRow` 五形态按钮行，第二行 = 分类胶囊行，仅根态显示）；title 高度改动态 `favTitleBarHeight()`（98 / 98+42 随形态切换），新增 `FAV_CAT_TAB_ROW_HEIGHT = 42`；胶囊 `ImmMaterial.seg(active)`（与旧 Regular/Thin 双档同构），显式 `height(32)` 对齐实测带。经验：**同一 title 槽位可以叠多行（Column），配合动态 height 即可把「吸顶多行」整体搬进槽位**；代价是行级转场动画（`listBaseTransition` 左让位）不再适用。构建 `BUILD SUCCESSFUL` |
 | 2026-09-10 | 第十三处迁移：收藏页「分类备份」弹窗 `BackupDialog` 自绘浮层 → 系统 `CustomDialog`（§6.11），位置/几何与同页前四个弹窗逐项一致。纯套 §4 模板（新的 `@Watch` 顶替原 `syncBackState`，桥接回调代调；新增 `closeBackupDialog()` 收敛四处关闭入口；内联 `CardDividerLine` 规避坑 16「@Builder 不能跨 struct」）。新增一条判据：**卡内「原本无底色的透明行」不要材质化** —— 挂 THIN 材质会在玻璃卡面多出一块玻璃瓦片；只有原本有底色的元素（按钮 / 卡片 / `bindSheet` 的实底行）换成「材质 + 半透明底」才是等价替换（§6.11）。§9.1 第 5 项标记完成。构建 `BUILD SUCCESSFUL` |
 | 2026-09-10 | 第十四处迁移（与上一处同批）：收藏页「导出备份授权」弹窗 `ExportDialog` → 系统 `CustomDialog`（§6.12），并按用户要求把两弹窗 UI 统一（同宽度 / 圆角 32vp / 底部锚点 / 遮罩 / `ImmMaterial.dialog()` / 同款标题区与分隔线 / 同款全宽 44 按钮，`SaveButton` 也从 200 固定宽改为卡片内全宽）。新增坑 29：**安全控件不支持通用属性**（只继承安全控件通用属性）—— 宽度必须传数值 vp、`margin` 不在白名单里要交给外层 `Row`，且样式不合法时报的是「授权失败（错误码 2）」+「文本截断即不授权」的静默失败。§9.1 第 6 项标记完成；该页五处弹窗已全部统一为系统弹窗。构建 `BUILD SUCCESSFUL`，HAP 已产出（`entry-default-unsigned.hap` 4.97MB） |
+| 2026-09-11 | 第十五处迁移（顶部槽位）：帖子详细页「查看更多楼中楼」`SubPostDetail.ets` 顶栏 → `Navigation` title 槽位（用户要求：返回按钮与吧标题要「帖子详细页一样几何」的沉浸光感）。开关 `SUBPOST_OFFICIAL_TITLE_BAR` / `SUBPOST_TITLE_BAR_HEIGHT = 98`，判据与 `ThreadDetail` 同（`&& this.materialSupported`）；`build()` 根 `Stack` 抽成 `SubPostContent()`、原 `TopBar()` 保留为 `LegacyTopBar()` 兜底；槽内 `SubPostTitleBar()` 几何逐项复刻 `DetailTitleBar` —— 返回 44 圆钮 + 吧名 58% 宽胶囊居中（差异仅「本页无分享钮，右侧只留 `Blank`」），两元素均 `backgroundColor(Transparent)` + `ImmMaterial.seg(false)` + `Radius.full`，不挂 border / backgroundBlurStyle / shadow。`Scroll` 首项占位仍为 98、消息定位偏移未变。构建 `BUILD SUCCESSFUL`（24s）；§9.3 表新增第 8 项并附落地清单 |
+| 2026-09-11 | 追加：`SubPostDetail.ets` 卡片圆角统一为 `SUBPOST_CARD_RADIUS = 26`（父楼层卡原 `Radius.lg(16)`、楼中楼回复卡原 `Radius.md(12)`），宽高 / 间距 / 内边距零改动；同页链接确认弹窗卡片仍是工程统一的 32vp。构建 `BUILD SUCCESSFUL`（22s） |
+| 2026-09-11 | 追加：`SubPostDetail.ets` 滚动区底部留白试改（`Spacing.xl(20)` → 160 → 96）后按用户要求**回退初始值 `Spacing.xl(20)`**，代码（去掉 `SUBPOST_SCROLL_BOTTOM_SPACE` 常量）与文档均复原。失败经验：`ThreadDetail` 该处 160 含底部悬浮回复岛让位 96，无悬浮栏的页面照抄会明显偏空 |
+
+

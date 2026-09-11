@@ -52,9 +52,17 @@ export class UsageHabitsManager {
       await cache.init(context);
       const saved = await cache.get(CACHE_KEY.HOME_ONLY_FOLLOW);
       AppStorage.setOrCreate('homeOnlyFollow', saved === '1');
+      // 深色模式设置：跟随系统（默认 true）与手动深色（默认 false）一并恢复；
+      // 旧版本未写过这两个 key 时，cache.get 返回 null，按默认值落地、保持原「跟随系统」行为。
+      const savedFollowSys = await cache.get(CACHE_KEY.FOLLOW_SYSTEM_DARK);
+      AppStorage.setOrCreate('appFollowSystemDark', savedFollowSys !== '0');
+      const savedDark = await cache.get(CACHE_KEY.DARK_MODE);
+      AppStorage.setOrCreate('appDarkMode', savedDark === '1');
     } catch (e) {
-      // 忽略缓存错误，使用默认值（关闭）
+      // 忽略缓存错误，使用默认值（关闭 / 跟随系统）
       AppStorage.setOrCreate('homeOnlyFollow', false);
+      AppStorage.setOrCreate('appFollowSystemDark', true);
+      AppStorage.setOrCreate('appDarkMode', false);
     }
   }
 
@@ -79,6 +87,67 @@ export class UsageHabitsManager {
         // 开关状态变化后旧缓存（可能未过滤/已过滤）不再可信，直接清除
         await cache.delete(CACHE_KEY.THREAD_LIST);
       }
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
+  /**
+   * 当前手动深色模式设置（仅当 followSystemDark=false 时生效）。
+   * 默认 false：旧版本用户未设置时，按 v1.x 「浅色」语义落地。
+   */
+  isDarkModeManual(): boolean {
+    return AppStorage.get<boolean>('appDarkMode') ?? false;
+  }
+
+  /**
+   * 设置手动深色模式：立即更新 AppStorage 并落盘。
+   * 注意：本方法只改持久化值，**不**触发 Configuration 重切；UI 需自行调 Theme.setDarkMode 让系统档位与状态栏跟随。
+   */
+  async setDarkModeManual(enabled: boolean): Promise<void> {
+    AppStorage.setOrCreate('appDarkMode', enabled);
+    this.persistDarkMode(enabled).catch(() => {
+    });
+  }
+
+  /**
+   * 当前是否「跟随系统深色模式」。默认 true，保持 v1.x 「跟随系统」行为。
+   */
+  isFollowSystemDark(): boolean {
+    return AppStorage.get<boolean>('appFollowSystemDark') ?? true;
+  }
+
+  /**
+   * 设置「跟随系统深色模式」开关。开启时只翻档位，调用方需另行调 Theme.setDarkMode 把当前系统态应用一遍；
+   * 关闭时只翻档位不切色，调用方需自行决定「以手动深色重新应用一遍」。
+   */
+  async setFollowSystemDark(enabled: boolean): Promise<void> {
+    AppStorage.setOrCreate('appFollowSystemDark', enabled);
+    this.persistFollowSystemDark(enabled).catch(() => {
+    });
+  }
+
+  private async persistDarkMode(enabled: boolean): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.DARK_MODE, enabled ? '1' : '0');
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
+  private async persistFollowSystemDark(enabled: boolean): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.FOLLOW_SYSTEM_DARK, enabled ? '1' : '0');
     } catch (e) {
       // 忽略持久化错误
     }

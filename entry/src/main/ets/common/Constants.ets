@@ -128,6 +128,10 @@ export interface CacheKeys {
   PIN_FOLLOW_FORUM: string;
   /** 首页推荐仅显示关注吧的帖子开关 */
   HOME_ONLY_FOLLOW: string;
+  /** 软件手动深色模式（仅当 FOLLOW_SYSTEM_DARK=false 时生效；冷启动不再跟随系统时的回退值） */
+  DARK_MODE: string;
+  /** 是否跟随系统深色模式开关（默认 true：保持原 v1.x 「跟随系统」行为，首次启动不读 DARK_MODE） */
+  FOLLOW_SYSTEM_DARK: string;
   /** 关注动态聚合结果（按账号隔离，stale-while-revalidate：命中即秒开再后台刷新） */
   FOLLOW_FEED: string;
   /** 关注用户列表快照（按账号隔离：冷启动命中免一次列表 RTT，后台刷新回写） */
@@ -174,6 +178,8 @@ export const CACHE_KEY: CacheKeys = {
   FOLLOW_FORUM_SORT: 'follow_forum_sort',
   PIN_FOLLOW_FORUM: 'pin_follow_forum',
   HOME_ONLY_FOLLOW: 'tieba_home_only_follow',
+  DARK_MODE: 'tieba_dark_mode',
+  FOLLOW_SYSTEM_DARK: 'tieba_follow_system_dark',
   FOLLOW_FEED: 'tieba_follow_feed',
   FOLLOW_USERS: 'tieba_follow_users',
   AUTO_SIGN_SLOW_MODE: 'auto_sign_slow_mode',

@@ -1065,6 +1065,8 @@ export struct FavoriteTab {
   @StorageLink('favOpenSearchRequest') @Watch('onOpenSearchRequest') favOpenSearchRequest: number = 0;
   // 收藏页常驻（不随 Tab 切换重建）：登录/登出/换号通知（Index.refreshLoginState 检测到登录态变化时递增）
   @StorageLink('favLoginRefresh') @Watch('onLoginRefresh') favLoginRefresh: number = 0;
+  // 深色模式切换通知：本页或宿主切换深色时递增 → 重读 isDarkMode()，保持与 ForumsTab/MineTab/HomeTab 同链路
+  @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   private pageSize: number = 20;
   private accountId: string = '';
   // v1.15 拖拽分类列表：Scroller 用于拖拽中手动 scrollBy 跟随手指；lastAutoScrollTime 节流
@@ -2569,6 +2571,11 @@ export struct FavoriteTab {
     this.searchMode = false;
     this.editMode = false;
     this.loadAll();
+  }
+
+  /** darkTick 递增（本页或宿主/其它 Tab 切换深色）→ 重读全局深色状态，保证整页背景/文字/按钮/卡片同步翻档 */
+  private onDarkTick(): void {
+    this.isDark = isDarkMode();
   }
 
   /** BUG-03：收藏本地过滤——匹配帖子标题 / 吧名 / 分类名（分类名命中 → 该分类下帖子纳入） */

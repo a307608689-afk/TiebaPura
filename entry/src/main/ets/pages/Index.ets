@@ -25,7 +25,7 @@ import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL, PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION } from '../common/Constants';
 import { FollowItem, UserInfo, UserStats } from '../model/DataModel';
-import { Theme, fs, isDarkMode, setDarkMode, ImmBlur, ImmMaterial, MaterialManager } from '../common/Theme';
+import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager } from '../common/Theme';
 import { FavoriteTab } from './Favorite';
 import { MessagesTab } from './MessagesTab';
 import { MineTab } from './MineTab';
@@ -101,9 +101,17 @@ struct Index {
     // 深色态必须先算：否则系统深色下占位底会先闪一帧浅色再切黑。
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported();
-    const sysDark = this.getUIAbilityContext().config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
-    this.isDark = sysDark;
-    setDarkMode(sysDark);
+    // 先初始化 UsageHabitsManager：恢复「跟随系统深色 / 手动深色」持久化值。
+    // 必须在读 config.colorMode 之前完成，否则冷启动会按 v1.x 「永远跟随系统」语义兜底，
+    // 旧用户启过深色模式再重启仍会被打回浅色。
+    await UsageHabitsManager.getInstance().init(this.getUIAbilityContext());
+    const followSys: boolean = UsageHabitsManager.getInstance().isFollowSystemDark();
+    const sysDark: boolean = this.getUIAbilityContext().config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    // 跟随系统：取系统当前态；否则按用户手动设置（首次启动默认 false=浅色）
+    const resolvedDark: boolean = followSys ? sysDark : UsageHabitsManager.getInstance().isDarkModeManual();
+    this.isDark = resolvedDark;
+    // 冷启动只同步应用内状态：此时必然与「用户最终选择态」一致，下发 setColorMode 是多余的重建
+    initDarkMode(resolvedDark);
     // 合规闸门：用户同意当前版本隐私政策前，不初始化登录态、不读业务缓存、不发任何请求
     // （应用市场强制要求：征得同意前不得收集任何信息。未同意时直接 return，initApp 整体不执行）
     if (!await this.isPrivacyAgreed()) {
