@@ -32,9 +32,32 @@
 - [x] **B3 补充可直达开发者的联系方式**
   已改：`docs/PRIVACY.md` 九、联系我们，已补入开发者邮箱 `a307608689@gmail.com`，并置于 GitHub Issue 之前（审核员或用户可直达，不必注册 GitHub 账号）。
 
-- [ ] **上架包必须使用发布证书签名**
-  位置：`build-profile.json5` 的 `signingConfigs`，当前为空数组 `[]`（签名材料由本地注入）。
-  待办：确认 release 包用的是发布证书（.p12 / .cer / .p7b），且证书指纹与市场后台登记的一致；不要打调试证书。
+- [x] **上架包必须使用发布证书签名（已实测通过，但踩过一次坑）**
+  位置：`build-profile.json5` 的 `signingConfigs` 是空数组 `[]`，属**有意设计**——发布材料由 `hvigorfile.ts` 从 `tools/signing.local.json` 注入；该文件被 `.gitignore` 第 31 行 `/tools/` 排除，仓库内不含任何 p12 / cer / p7b。
+  已核：`.cer` 是完整证书链（根 CA → Developer Relations CA → 叶证书 `CN="…\,Release"`，指纹 `6842BD54…`），与 `.p7b` 内嵌的 `distribution-certificate` 指纹**完全一致**；`.p7b` 为 `type: release` + `app-distribution-type: app_gallery`，`bundle-name` 为 `com.tiebapura.app`，有效期至 2029-09-11。
+  **踩过的坑**：构建目录里曾躺着一个 **debug 签名**的 `entry-default-signed.hap`——验签输出 `profile type is: debug` 且证书主体为 `\,Development`。成因是 DevEco 的「自动签名」接管：它会往 `build-profile.json5` 写本机路径与 debug 配置，事后 `git checkout` 还原后**文件看着干净、产物却仍是 debug 的**，光看文件名完全发现不了。
+  **强制动作：每次打包后必须验签，不要相信文件名里的 signed。**
+  ```powershell
+  # 期望看到 profile type is: release，且证书主体为 \,Release
+  # 把 $deveco 换成你本机 DevEco Studio 的安装目录
+  $deveco = '<DevEco Studio 安装目录>'
+  & "$deveco\jbr\bin\java.exe" -jar `
+    "$deveco\sdk\default\openharmony\toolchains\lib\hap-sign-tool.jar" `
+    verify-app -inFile entry\build\default\outputs\default\entry-default-signed.hap `
+    -outCertChain "$env:TEMP\chain.cer" -outProfile "$env:TEMP\profile.p7b"
+  ```
+
+- [ ] **不要在 DevEco Studio 里点「自动签名」**
+  它会用 debug 证书接管签名链路（见上一条）。统一走 `tools\build.ps1` 打包；若已误点，先 `git checkout -- build-profile.json5` 还原，再重新打包并验签。
+
+- [ ] **release 包开了混淆，但工程里没有任何 keep 规则**
+  位置：`entry/build-profile.json5` 的 `buildOptionSet`，`release` 分支 `obfuscation.ruleOptions.enable = true`；同时全工程**不存在 `obfuscation-rules.txt`**。
+  风险：本应用大量依赖贴吧接口返回的固定 JSON 字段名，一旦混淆触及属性名会**静默失效**（debug 包完全测不出来）。
+  待办：把 release 包装到真机跑一遍核心流程；若出现字段读不到，在工程里补 `obfuscation-rules.txt` 写 `-keep-property-name`，或直接关掉 release 混淆。
+
+- [ ] **安装验证必须用 release 包，不能用 debug 包**
+  `tools/build.ps1` 默认出 release；带 `-Debug` 出的包会携 `debug:true` 与 `sourceMaps`，仅供调试。
+  已核：当前 release 包的 `pack.info` 里 `bundleName=com.tiebapura.app`、`version.name=1.0.0`、`version.code=1000000`、`deviceType=["phone"]`、`compatible=23 / target=26`，且包内**无 sourceMaps / debug 条目**。
 
 - [ ] **政策改动必须推送到 GitHub**
   审核员看的是远端文件。本地改完不推送，等于没改——线上 URL 仍是旧内容。
@@ -71,9 +94,10 @@
   全工程未调用 `@ohos.net.connection`（无网络状态判断），因此**不需要** `GET_NETWORK_INFO`。
 - [x] 保存图片未申请写相册权限，走 `SaveButton` 安全控件。
   位置：`pages/Favorite.ets`、`pages/ImagePreview.ets`；与政策 1.3「特别说明」一致。
-- [ ] 市场后台需为每个敏感权限填写「使用理由」，理由文案必须与政策 1.3 表格的「用途」列一致。
-  - `VIBRATE` → 交互触觉反馈（点赞 / 签到 / 收藏）
-  - `KEEP_BACKGROUND_RUNNING` → 一键签到 / 后台签到期间保持任务完成
+- [ ] 市场后台需为每个敏感权限填写「使用理由」，文案必须与 `docs/PRIVACY.md` 1.3 表格的「用途」列口径一致。可直接粘贴：
+  - `ohos.permission.INTERNET` —— 用于访问百度贴吧官方接口、加载帖子正文与用户头像，是浏览功能所必需。本应用不使用该权限上传您的本地文件，也不会将数据发送至百度以外的任何服务器。
+  - `ohos.permission.VIBRATE` —— 用于点赞、签到成功、收藏成功等操作的触觉反馈，仅在您主动触发对应操作时短暂震动，不用于提醒或营销。
+  - `ohos.permission.KEEP_BACKGROUND_RUNNING` —— 仅在您主动发起「一键签到 / 后台签到」后启动长时任务（dataTransfer），用于避免应用退到后台时签到流程被系统中断；任务结束即停止，不用于任何其他后台行为。
 
 ---
 
@@ -96,6 +120,9 @@
 - [ ] 应用图标已定稿：`AppScope/resources/base/media/app_icon.png` 存在；如市场另有尺寸要求需单独出图。
 - [ ] 三方依赖为空，与政策「不嵌入任何第三方 SDK」一致。
   位置：根 `oh-package.json5` 与 `entry/oh-package.json5` 的 `dependencies` 均为 `{}`。
+- [ ] **开发者身份一致性**：用第一节的 verify-app 命令打印证书主体，确认它与你提交所用的市场后台账号一致。
+  证书主体形如 `CN="<实名>(<开发者账号ID>)\,Release"`——**实名与账号 ID 直接从证书里读，本文档不留档**；文档只记指纹：叶证书 `6842BD54…`。
+  另：`AppScope/app.json5` 的 `vendor` 目前是 `a307608689-afk`（GitHub 昵称）；若要在「关于本应用」展示真实开发者名称可一并调整，不改也不影响审核。
 
 ---
 
@@ -110,6 +137,8 @@
 - [ ] **通知授权时机正确**：通知授权框只在点「一键签到 / 后台签到」时弹出，**首启绝对不弹**（`AutoSignNotifier.ets` 的注释明确要求必须在手势中调用）。
 - [ ] **同意前零请求**：首启停留在弹窗时不应有任何网络请求（可用设备抓包或开发者工具确认）。
 - [ ] **权限拒绝后不崩**：系统设置里关掉震动/通知 → 应用各功能仍能正常使用（仅失去对应反馈）。
+- [ ] **release 包核心流程回归**（混淆与发布签名都只在 release 生效，debug 通过≠release 通过）：装 `entry-default-signed.hap`（验签为 release 的那个）→ 登录态读取、帖子正文与楼层渲染、图片加载、签到、收藏、发帖各走一遍，确认无字段读不到、无空白页。
+- [ ] **确认装上去的确实是 release 包**：别只认文件名，以「打包后验签输出 `profile type is: release`」为准。
 
 ---
 
