@@ -32,11 +32,13 @@
 - [x] **B3 补充可直达开发者的联系方式**
   已改：`docs/PRIVACY.md` 九、联系我们，已补入开发者邮箱 `a307608689@gmail.com`，并置于 GitHub Issue 之前（审核员或用户可直达，不必注册 GitHub 账号）。
 
-- [x] **上架包必须使用发布证书签名（已实测通过，但踩过一次坑）**
+- [x] **上架包必须使用发布证书签名（链路已实测通过；归档物一度写错，已更正）**
   位置：`build-profile.json5` 的 `signingConfigs` 是空数组 `[]`，属**有意设计**——发布材料由 `hvigorfile.ts` 从 `tools/signing.local.json` 注入；该文件被 `.gitignore` 第 31 行 `/tools/` 排除，仓库内不含任何 p12 / cer / p7b。
   已核：`.cer` 是完整证书链（根 CA → Developer Relations CA → 叶证书 `CN="…\,Release"`，指纹 `6842BD54…`），与 `.p7b` 内嵌的 `distribution-certificate` 指纹**完全一致**；`.p7b` 为 `type: release` + `app-distribution-type: app_gallery`，`bundle-name` 为 `com.tiebapura.app`，有效期至 2029-09-11。
-  **踩过的坑**：构建目录里曾躺着一个 **debug 签名**的 `entry-default-signed.hap`——验签输出 `profile type is: debug` 且证书主体为 `\,Development`。成因是 DevEco 的「自动签名」接管：它会往 `build-profile.json5` 写本机路径与 debug 配置，事后 `git checkout` 还原后**文件看着干净、产物却仍是 debug 的**，光看文件名完全发现不了。
-  **强制动作：每次打包后必须验签，不要相信文件名里的 signed。**
+  **两个真踩过的坑（2026-09-11 实测复现，都只能靠验签发现）：**
+  1. **IDE 会在后台把产物换掉。** DevEco「自动签名」用的是它自己那套 debug 材料（`~/.ohos/config/` 下的 `default_*.p7b`），而它的产物落在**与命令行完全相同**的 `entry/build/default/outputs/default/`。当天 IDE 反复构建，把 `entry-default-signed.hap` 覆盖成 `profile type is: debug`、证书主体 `\,Development` 的包；而 `build-profile.json5` 全程是干净的 `signingConfigs: []`——**只看工程文件根本发现不了**。
+  2. **归档进 `dist/` 的那个 HAP 曾是 unsigned。** 对它验签直接失败：`No Hap Signing Block before ZIP Central Directory`。它是引入本机签名机制之前的旧产物，文件名看不出任何区别，险些被当成可上架包。
+  **强制动作：每次打包后必须验签，并且要对 `dist/` 里的归档副本再验一次，不要相信文件名里的 signed。**
   ```powershell
   # 期望看到 profile type is: release，且证书主体为 \,Release
   # 把 $deveco 换成你本机 DevEco Studio 的安装目录
@@ -50,14 +52,18 @@
 - [ ] **不要在 DevEco Studio 里点「自动签名」**
   它会用 debug 证书接管签名链路（见上一条）。统一走 `tools\build.ps1` 打包；若已误点，先 `git checkout -- build-profile.json5` 还原，再重新打包并验签。
 
-- [ ] **release 包开了混淆，但工程里没有任何 keep 规则**
+- [x] **release 包开了混淆，但工程里没有任何 keep 规则——风险已排除（实测证据）**
   位置：`entry/build-profile.json5` 的 `buildOptionSet`，`release` 分支 `obfuscation.ruleOptions.enable = true`；同时全工程**不存在 `obfuscation-rules.txt`**。
-  风险：本应用大量依赖贴吧接口返回的固定 JSON 字段名，一旦混淆触及属性名会**静默失效**（debug 包完全测不出来）。
-  待办：把 release 包装到真机跑一遍核心流程；若出现字段读不到，在工程里补 `obfuscation-rules.txt` 写 `-keep-property-name`，或直接关掉 release 混淆。
+  原担心：本应用大量依赖贴吧接口返回的固定 JSON 字段名，一旦混淆触及**属性名**会**静默失效**（debug 包完全测不出来）。
+  实测结论：**默认规则不重命名属性名，不需要补 keep 规则**。两条独立证据：
+  1. ArkGuard 的名称缓存 `nameCache.json` 里 **`PropertyCache` 出现 0 次**；只有 47 个非空 `IdentifierCache` 与 45 个非空 `MemberMethodCache`——它记录的是**局部变量 / 参数**（形如 `CacheManager#delete#key → a`）与**成员方法名**，不含任何属性名。
+  2. 从最终签名包里取出 `ets/modules.abc`（1960368 字节）直接搜，贴吧协议字段**全部原样存活**：`error_code`、`error_msg`、`user_name`、`forum_name`、`forumName`、`is_like` 均命中。
+  仍需做：真机跑一遍 release 核心流程（第五节），但它已从「不知会不会崩」降级为常规回归。
 
 - [ ] **安装验证必须用 release 包，不能用 debug 包**
   `tools/build.ps1` 默认出 release；带 `-Debug` 出的包会携 `debug:true` 与 `sourceMaps`，仅供调试。
-  已核：当前 release 包的 `pack.info` 里 `bundleName=com.tiebapura.app`、`version.name=1.0.0`、`version.code=1000000`、`deviceType=["phone"]`、`compatible=23 / target=26`，且包内**无 sourceMaps / debug 条目**。
+  已核：当前 release 包的 `pack.info` 里 `bundleName=com.tiebapura.app`、`version.name=1.0.0`、`version.code=1000000`、`deviceType=["phone"]`、`compatible=23 / target=26`；包内共 8 个条目，**无 sourceMaps / `.map` / `.ts` / debug 残留**。
+  已核归档物：`dist\TiebaPura-v1.0.0-hap-2a368c8-20260911-155503.hap`，已对该副本**单独跑过一次 verify-app** 得到 `profile type is: release` + `Verify success`，SHA256 记在同目录 `.sha256` 文件里。
 
 - [ ] **政策改动必须推送到 GitHub**
   审核员看的是远端文件。本地改完不推送，等于没改——线上 URL 仍是旧内容。
@@ -127,6 +133,8 @@
 ---
 
 ## 五、真机验证（读代码读不出来，必须上机）
+
+> 前置条件：`hdc list targets` 非空（hdc 在 DevEco SDK 的 `toolchains\` 下）。**列表为空时本节一条都做不了**——此时不要靠「代码看得没问题」打勾，也不要拿构建目录里同名但来路不明的产物冒充已验证。
 
 - [ ] **首启只有弹窗**：卸载重装 → 启动瞬间不能闪出一帧主界面（验 `Index.ets` 的 `privacyPhase` 从 0 到 1 的过渡）。
 - [ ] **同意后不再弹**：点「同意并继续」→ 杀进程重开 → 直接进主页。
