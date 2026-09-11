@@ -572,6 +572,10 @@ export class Theme {
   static glassGlowStrong(isDark: boolean): string { return isDark ? '#A03173FF' : '#703173FF'; }
   static glassShadow(isDark: boolean): string { return isDark ? '#99000000' : '#3D102018'; }
   static glassControl(isDark: boolean): string { return isDark ? '#7A252A33' : '#B8FFFFFF'; }
+  // 实底档（图片浏览浮层三件套用）：不透明，取代半透明玻璃档。
+  // 原因：系统安全控件 SaveButton 自带不透明背托，无法玻璃化（材质属性不在其白名单内），
+  // 若外壳继续用半透明档，会出现「实底黑钮 vs 半透明玻璃钮」的割裂观感（坑 29）。
+  static glassControlSolid(isDark: boolean): string { return isDark ? '#1B1E24' : '#FFFFFF'; }
   static glassControlLine(isDark: boolean): string { return isDark ? '#58FFFFFF' : '#E6FFFFFF'; }
   static glassControlShadow(isDark: boolean): string { return isDark ? '#70000000' : '#30101824'; }
   static glassBrand(isDark: boolean): string { return isDark ? '#7A3173FF' : '#4C3173FF'; }

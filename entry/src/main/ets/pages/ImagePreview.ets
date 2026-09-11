@@ -16,9 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { common, abilityAccessCtrl } from '@kit.AbilityKit';
+import { common } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
+import { fileIo } from '@kit.CoreFileKit';
 import { HttpClient } from '../network/HttpClient';
 import { Theme, Spacing, Radius, isDarkMode, MaterialManager, fs } from '../common/Theme';
 
@@ -192,7 +193,7 @@ struct ImagePreview {
                 .fontSize(fs(14, this.fontScale))
                 .fontColor(Color.White)
             }
-            .backgroundColor(Theme.glassControl(true))
+            .backgroundColor(Theme.glassControlSolid(true))
             .border({ width: 0.5, color: Theme.glassControlLine(true) })
             .shadow({ radius: 8, color: '#33000000', offsetY: 1 })
             // 圆角 26：与全局卡片统一口径（本胶囊高约 28vp，圆角已被裁为全圆，视觉不变）
@@ -216,31 +217,55 @@ struct ImagePreview {
             .width(48)
             .height(48)
             .borderRadius(24)
-            .backgroundColor(Theme.glassControl(true))
+            .backgroundColor(Theme.glassControlSolid(true))
             .border({ width: 0.5, color: Theme.glassControlLine(true) })
             .shadow({ radius: 12, color: '#40000000', offsetY: 2 })
             .onClick(() => { this.getUIContext().getRouter().back(); })
 
+            // 保存改用系统安全控件 SaveButton：点击即临时获得图库写入授权（约 10 秒），
+            // 因此无需在 module.json5 声明 READ/WRITE_IMAGEVIDEO，也无需运行时弹权限申请。
+            // 外观为 48×48 实底圆钮（与左侧关闭钮逐项一致：同色实底 + 0.5vp 白描边 + 同款阴影），
+            // 只把内层图标换成系统保存图标。
             Stack() {
+              SaveButton({
+                icon: SaveIconStyle.LINES,
+                buttonType: ButtonType.Circle
+              })
+                .iconSize(fs(24, this.fontScale))
+                .iconColor(Color.White)
+                // 实底（不用 Color.Transparent）：安全控件自带不透明背托，透明底会被系统判为非法样式而回退，
+                // 观感变成与外壳割裂的纯黑圆盘；改传不透明实底后与背托同源，和关闭钮逐项一致
+                // （坑 29：backgroundColor 属安全控件白名单，材质类属性则不在白名单，禁止挂）
+                .backgroundColor(Theme.glassControlSolid(true))
+                .borderWidth(0)
+                // 44 < 外壳 48：border 绘制在子节点之下，控件填满会把外壳 0.5vp 白描边整圈盖掉，缩小后描边露出
+                .width(44)
+                .height(44)
+                .enabled(this.urls.length > 0)
+                .onClick(async (_event: ClickEvent, result: SaveButtonOnClickResult) => {
+                  if (this.saving || this.urls.length === 0) {
+                    return;
+                  }
+                  if (result !== SaveButtonOnClickResult.SUCCESS) {
+                    this.getUIContext().getPromptAction().showToast({ message: '未获得保存授权，请重试' });
+                    return;
+                  }
+                  await this.saveCurrentImage();
+                })
               if (this.saving) {
                 LoadingProgress()
                   .width(20)
                   .height(20)
                   .color(Color.White)
-              } else {
-                SymbolGlyph($r('sys.symbol.arrow_down'))
-                  .fontColor([Color.White])
-                  .fontSize(fs(24, this.fontScale))
               }
             }
             .width(48)
             .height(48)
             .borderRadius(24)
-            .backgroundColor(Theme.glassControl(true))
+            .backgroundColor(Theme.glassControlSolid(true))
             .border({ width: 0.5, color: Theme.glassControlLine(true) })
             .shadow({ radius: 12, color: '#40000000', offsetY: 2 })
-            .enabled(!this.saving && this.urls.length > 0)
-            .onClick(() => { this.saveCurrentImage(); })
+            .clip(true)
           }
           .width('100%')
           .padding({ left: Spacing.lg, right: Spacing.lg, bottom: 28 })
@@ -366,49 +391,40 @@ struct ImagePreview {
     this.dragReady = false;
   }
 
-  private async requestSavePermission(): Promise<boolean> {
-    try {
-      const atManager = abilityAccessCtrl.createAtManager();
-      const result = await atManager.requestPermissionsFromUser(
-        this.context,
-        ['ohos.permission.WRITE_IMAGEVIDEO', 'ohos.permission.READ_IMAGEVIDEO']
-      );
-      return result.authResults.every((auth: number) => auth === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED);
-    } catch (e) {
-      return false;
-    }
-  }
-
   private async saveCurrentImage(): Promise<void> {
     if (this.urls.length === 0 || this.saving) {
       return;
     }
     this.saving = true;
+    let createdUri: string = '';
     try {
-      const hasPermission = await this.requestSavePermission();
-      if (!hasPermission) {
-        this.getUIContext().getPromptAction().showToast({ message: '需要存储权限才能保存图片' });
-        return;
-      }
-      const imageUrl: string = this.urls[this.currentIndex];
-      const bytes: ArrayBuffer = await HttpClient.getBinary(imageUrl, {
-        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-        'Referer': 'https://tieba.baidu.com/'
-      });
-      if (bytes.byteLength === 0) {
-        throw new Error('图片内容为空');
-      }
       const helper = photoAccessHelper.getPhotoAccessHelper(this.context);
-      const request = photoAccessHelper.MediaAssetChangeRequest.createAssetRequest(
-        this.context,
-        photoAccessHelper.PhotoType.IMAGE,
-        'jpg',
-        { title: `tieba_${Date.now()}` }
-      );
-      request.addResource(photoAccessHelper.ResourceType.IMAGE_RESOURCE, bytes);
-      await helper.applyChanges(request);
+      // SaveButton 的临时授权窗口很短（约 10 秒），因此先在窗口内建好媒体库资源并拿到 fd，
+      // 之后的网络下载与写文件不再受该窗口限制。
+      createdUri = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, 'jpg');
+      const dest = await fileIo.open(createdUri, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
+      try {
+        const imageUrl: string = this.urls[this.currentIndex];
+        const bytes: ArrayBuffer = await HttpClient.getBinary(imageUrl, {
+          'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          'Referer': 'https://tieba.baidu.com/'
+        });
+        if (bytes.byteLength === 0) {
+          throw new Error('图片内容为空');
+        }
+        await fileIo.write(dest.fd, bytes);
+      } finally {
+        await fileIo.close(dest);
+      }
       this.getUIContext().getPromptAction().showToast({ message: '已保存到图库' });
     } catch (e) {
+      // 写入失败时清掉刚建好的空资源，避免图库里残留空白图片
+      if (createdUri.length > 0) {
+        try {
+          await photoAccessHelper.MediaAssetChangeRequest.deleteAssets(this.context, [createdUri]);
+        } catch (cleanupError) {
+        }
+      }
       this.getUIContext().getPromptAction().showToast({ message: '保存失败，请重试' });
     } finally {
       this.saving = false;
