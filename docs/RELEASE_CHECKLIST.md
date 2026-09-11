@@ -1,6 +1,6 @@
 # TiebaPura 上架自检清单
 
-> 适用版本：v1.0.0（versionCode `1000000`）
+> 适用版本：v1.0.1（versionCode `1000001`）
 > 核对基准：2026-09-11
 > 用法：每次向应用市场提交前从上到下过一遍。每条都标了「去哪个文件哪一行核对」，不要凭记忆打勾。
 > 本清单的核心是查**三处一致性**：App 内弹窗文案 / 在线隐私政策 / 市场后台表单——这三者互相对不上，是审核驳回最常见的理由。
@@ -115,9 +115,9 @@
 | 包名 | `com.tiebapura.app` | `AppScope/app.json5` 的 `bundleName` |
 | 开发者主体 | `a307608689-afk` | `AppScope/app.json5` 的 `vendor`（须与实名主体一致） |
 | 应用名称 | `TiebaPura` | `AppScope/resources/base/element/string.json` 的 `app_name` |
-| 版本号 | `1.0.0` | `AppScope/app.json5` 的 `versionName` |
-| 版本代码 | `1000000` | `AppScope/app.json5` 的 `versionCode` |
-| 支持的最低系统版本 | `6.1.0(23)` | `build-profile.json5` 的 `compatibleSdkVersion`——**别填成 26** |
+| 版本号 | `1.0.1` | `AppScope/app.json5` 的 `versionName` |
+| 版本代码 | `1000001` | `AppScope/app.json5` 的 `versionCode` |
+| 支持的最低系统版本 | `26.0.0` | `build-profile.json5` 的 `compatibleSdkVersion`（已与 `targetSdkVersion` 同为 `26.0.0`） |
 | 目标 API | `26.0.0` | `build-profile.json5` 的 `targetSdkVersion` |
 | 设备类型 | 仅手机 | `module.json5` 的 `deviceTypes`（仅 `phone`），后台勾选须一致 |
 | 隐私政策网址 | `https://github.com/a307608689-afk/TiebaPura/blob/main/docs/PRIVACY.md` | `common/Constants.ets` 的 `PRIVACY_POLICY_URL` |

@@ -4,7 +4,7 @@
 [![Platform](https://img.shields.io/badge/Platform-HarmonyOS%207%20%2F%20API%2026-000000.svg)](#)
 [![Language](https://img.shields.io/badge/Language-ArkTS%20%2F%20ArkUI-3178C6.svg)](#)
 
-**当前版本：`v1.0.0`** · 首个公开版本 · 2026-09-10
+**当前版本：`v1.0.1`** · 2026-09-11
 
 > **⚠️ 非官方声明**
 >
