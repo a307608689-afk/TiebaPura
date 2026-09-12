@@ -757,6 +757,17 @@ export struct ThreadCard {
           .columnsGap(8)
           .rowsGap(8)
           .width('100%')
+          // 关键：Grid 是可滚动容器，嵌在页面 Scroll 内会抢先接管 pan 手势判定，
+          // 内容不超高时它自己滚不动、外层 Scroll 又拿不到拖动 → 多图区域"断触/滑不动"。
+          // 关闭其自身滚动交互，手势全部交还外层 Scroll（纯手势开关，不影响布局与视觉）。
+          .enableScrollInteraction(false)
+          // 嵌套滚动策略：父容器（页面 Scroll）优先。
+          // 与上面的 enableScrollInteraction(false) 是同向的防御性双保险——若该开关将来被改回
+          // true，仍由 PARENT_FIRST 保证拖动优先交给外层 Scroll，不会回到"内层 Grid 抢手势"的老问题。
+          .nestedScroll({
+            scrollForward: NestedScrollMode.PARENT_FIRST,
+            scrollBackward: NestedScrollMode.PARENT_FIRST
+          })
         }
   }
 }

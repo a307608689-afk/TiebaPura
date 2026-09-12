@@ -5,9 +5,12 @@
 > **查「我现在要改一个点位，该怎么判、怎么写、怎么验」→ 就是本文。**
 >
 > 维护约定：只收**真机验证过的判断**、**可直接复制的模板**、**待办清单**。推断/未验证的必须显式标注。
-> 最后更新：2026-09-10（新增：① 系统 CustomDialog 吃官方材质；② 弹窗内的 `Button` 也吃材质；
+> 最后更新：2026-09-12（新增：① 系统 CustomDialog 吃官方材质；② 弹窗内的 `Button` 也吃材质；
 > ③ **顶部「`Navigation` 标题栏」槽位打通** —— 吸顶分段胶囊 / 44 圆钮可从页面主体搬进 `title` 槽位吃真材质，**真机已验生效**，见 §1.5 / §6.10；
-> ④ `Search.ets` 顶部（返回钮 / 搜索框 / 搜索钮）搬进 `title` 槽位，**代码已落地待真机验证**，见 §9.3 #7 落地清单）
+> ④ `Search.ets` 顶部（返回钮 / 搜索框 / 搜索钮）搬进 `title` 槽位，**代码已落地待真机验证**，见 §9.3 #7 落地清单；
+> ⑤ **自建「空 `Tabs` 壳」做 TabBar 槽位时，壳宽必须收敛到「目标元素实际占位」** —— 开全宽会让系统 TabBar 页签节点
+> 吞掉下层列表的滑动，且 `hitTestBehavior` 修不了（挂不到系统节点上），**两方案真机双向验证**；本工程两处壳
+> （`ThreadList` FAB 壳 80 / `ThreadDetail` 排序壳 148~172）**均已收窄并真机验收，存量清零**，见 §6.13 / §9.3 #6 / 坑 30）
 
 ---
 
@@ -21,6 +24,7 @@
 |---|---|---|
 | `Navigation` / `NavDestination` **标题栏** | ✅ | `.title()` 槽容器挂 `ImmMaterial.bar()` |
 | Tabs **`BarPosition.End` 底部页签**（`barOverlap=true` + `vertical=false` + `barPosition=End` 三条件齐） | ✅ | `barFloatingStyle({ systemMaterial: ImmMaterial.floatingBar() })` |
+| **自建「空 `Tabs` 壳」内的元素**（`Tabs{ TabContent().tabBar(...) }`，`barHeight` = 壳高 → 内容区恒 0，壳里只剩 tabBar） | ✅ | 与上一行同一槽位，壳内元素各自挂 `.systemMaterial(...)`；⚠️ **壳宽必须收敛到「目标元素实际占位」，不能开 `'100%'`** —— 否则系统页签节点横跨整行、吞掉下层列表的滑动 ← **本次新增能力**（§6.13 / 坑 30）；⚠️ **空壳上 `barFloatingStyle.systemMaterial` 不生成背板**（上一行的玩法只在「`TabContent` 有内容」的壳上成立）—— 空壳要整条玻璃，就把材质挂到**槽内那一条容器**上（坑 31 / §6.14）；⚠️ 这种「无背板托底」的栏材质要用**无阴影档** `floatingBarFlat()`（坑 32） |
 | **系统弹窗**：CustomDialog / AlertDialog / ActionSheet / Sheet / PromptAction / Menu / Toast / Tips / Popup | ✅ | `options.systemMaterial = ImmMaterial.dialog()` ← **本次新增能力**<br>⚠️ `AlertDialog` 名义在列，实则**版式被系统写死**（标题/正文/按钮排布固定），且不显式传 `systemMaterial` 就是纯白底 → 本工程的二次确认统一改用 `CustomDialog`（§6.5） |
 | **系统弹窗子树内的 `Button`**（挂在 `CustomDialog` 内的按钮） | ✅ | 按钮自身 `.systemMaterial(ImmMaterial.accent()/cardAction())`，可与半透明 `backgroundColor` + `shadow` 共存 ← **本次新增能力**（§6.2） |
 | **Slider / Toggle / Select / Chip / ChipGroup / SegmentButton / SelectionMenu** | ✅ | 组件级字段，工程暂未用 |
@@ -239,6 +243,19 @@ onShowSignAllChanged(): void {
 | 遮罩 `Column.onClick(() => closeXxx())` | `onWillDismiss: () => this.closeXxx()` | ✅（**同时覆盖返回键**） |
 | `if (this.showXxx) { this.XxxDialog() }` | `@State @Watch('onShowXxxChanged')` + `open()/close()` | ✅ |
 | 卡片：`backgroundColor(sheetGlass)` + `backgroundBlurStyle(Regular, 0.85)` + `border(0.5, manualGlassBorder)` + `shadow({ radius: 48 })` | **`systemMaterial: ImmMaterial.dialog()`** | ✅ 换玻璃（观感不可能像素级一致） |
+
+> ⚠️ **表中 `offset.dy = -110` 不是全局常量，必须按宿主页面「底部实际占位」逐页推算**（2026-09-12 的教训）。
+> `-110` 只适用于「底部只有一层悬浮栏」的页面：悬浮栏底距 30 + 高 66 → 占「距底 30~96」，
+> `-110` 时卡片底边落在悬浮栏上方 14vp。宿主底部每多叠一层，`dy` 就得相应加大：
+>
+> | 宿主页面 | 底部占位（距底 vp） | 弹窗 `dy` | 卡片底边落在 |
+> |---|---|---|---|
+> | 收藏页（置顶确认 §6.4 / 批量删除 §6.5）、进吧页（一键签到 §6.1 / 关注吧长按菜单 §6.3） | 悬浮栏 30~96 | `-110` | 悬浮栏上方 14vp |
+> | **帖子详细页**（跳转官方贴吧 §6.15） | 悬浮栏 30~96 **+ 排序胶囊行 96~142**（钮体本体 104~138） | **`-140`** | 排序胶囊钮体上方 2vp（紧贴但不压字） |
+>
+> 教训来源：帖子详细页初版照搬 `-110`，卡片正好压在「正序 / 只看全部」两枚胶囊上（用户真机反馈）；
+> 先取安全值 170（钮体上方 28vp），用户复看后指定收到 **140**（紧凑贴合）。
+> 通式：`dy ≈ 宿主底部最上层元素的顶边 + 余量`，余量取 2（用户指定紧凑）~ 28（默认安全）vp。
 
 ### 4.4 卡内必须删掉的五项
 
@@ -956,6 +973,159 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 
 ---
 
+### 6.13 第十六处迁移：吧列表页悬浮 FAB（刷新 / 加号两钮）→ 自建「空 tabBar 壳」槽位（2026-09-12，真机已验）
+
+**对象**：`ThreadList.ets` 右下角两枚悬浮圆钮（56 圆钮 / 两钮间距 12 / 右缘 28 / 加号底距 36、刷新底距 104）。
+机制与 `ThreadDetail.SortPillShell()` 同构（§9.3 #6），新坑一个：**空壳自身会挡住下层列表滚动**。
+> 本页落地后，`ThreadDetail.SortPillShell()` 也按同法收窄（该页排序行**靠左**排列，额外垫了一层全宽 `Row` 复位左缘，见 §9.3 #6 落地清单 2026-09-12 段 / §12 第十七处迁移）。
+
+| 项 | 内容 |
+|---|---|
+| 改造前 | 页面 body 内两枚独立 `Stack`：`Theme.segGlass` + `manualGlassBorder` + `backgroundBlurStyle` + `segGlassShadow` 四项自绘玻璃 + `zIndex(20)`（属 B 档越界，从不渲染材质） |
+| 改造后 | 新增 `FabSlotShell()`（「只有 tabBar 的真实 Tabs」壳）+ 槽内列 `FabSlotColumn()`；两钮换 `ImmMaterial.segFlat(false)`（无阴影档，理由同 §6.10 修复⑥） |
+| 壳几何 | `height` = `barHeight` = `THREAD_LIST_FAB_SHELL_HEIGHT`(124 = 56 + 12 + 56)；`margin.bottom` = 36；**`width` = `THREAD_LIST_FAB_SHELL_WIDTH`(84)，不是 `'100%'`** |
+| 显隐动效 | `fabReveal` 淡出 + 缩小 + 下沉（220ms `FastOutSlowIn`）整体作用在壳上；搜索态两钮各自 `hitTestBehavior(this.searchMode ? None : Default)` |
+| 结果 | ✅ 构建 `BUILD SUCCESSFUL`；真机确认「已正常」（该行左右两侧可滑动 + 两钮可点 + 几何与改造前逐项一致） |
+| 后续变更（2026-09-12） | ① **刷新钮按用户要求移除** → 壳内只剩加号：`THREAD_LIST_FAB_SHELL_HEIGHT` `124 → 56`、列表让位 `166 → 98`（兜底路径 `150 → 104`），刷新入口改由「重复点击当前排序」承担；② **加号材质由 `segFlat(false)` 换 `fabFlat()`**（THIN + `applyShadow: false` + **`colorInvert: true`**），图标色由 `Theme.textPrimary(this.isDark)` 换 **`$r('sys.color.font_primary')`** —— 用户反馈「底栏和底栏内文字随背景变色、加号不会」：材质缺 `colorInvert`、图标又是自绘 hex 时，两者都不参与官方材质的背景反色（底栏 `floatingBarFlat` 自带 `colorInvert` + 用 `$r('sys.color.font_*')` 故正常） |
+
+**壳的写法（与 `SortPillShell` 同构，可直接复制）**：
+
+```ts
+@Builder
+FabSlotShell() {
+  Tabs({ barPosition: BarPosition.End }) {
+    TabContent()
+      .tabBar(this.FabSlotColumn())              // ← 目标元素全部放进 tabBar
+  }
+  .width(THREAD_LIST_FAB_SHELL_WIDTH)            // ← ★ 84，见下方核心经验
+  .height(THREAD_LIST_FAB_SHELL_HEIGHT)          // 124
+  .vertical(false)
+  .scrollable(false)
+  .barHeight(THREAD_LIST_FAB_SHELL_HEIGHT)       // barHeight = 壳高 → 内容区恒 0，壳里只有 tabBar
+  .barBackgroundColor(Color.Transparent)
+  .barBackgroundBlurStyle(BlurStyle.NONE)        // 坑 26：必写，否则渲染默认磨砂背板
+  .backgroundColor(Color.Transparent)
+  .clip(false)
+  .margin({ bottom: THREAD_LIST_FAB_SHELL_BOTTOM })
+  .zIndex(20)
+  .opacity(this.fabReveal())
+  .scale({ x: this.fabReveal(), y: this.fabReveal() })
+  .translate({ y: (1 - this.fabReveal()) * 20 })
+  .hitTestBehavior(HitTestMode.None)
+  .animation({ duration: 220, curve: Curve.FastOutSlowIn })
+}
+```
+
+**★ 核心经验：空壳**必须**收窄到「目标元素那一列」，不能开全宽。**
+
+| 判断 | 状态 |
+|---|---|
+| 壳上挂 `hitTestBehavior(HitTestMode.None)`，下层列表能否恢复滚动 | ❌ **真机实测无效**（`None` 语义「自身不参与触摸测试、子节点照常」确实生效了 —— 两钮照点、壳自身不受测，但滚动仍被挡） |
+| 把壳宽从 `'100%'` 收成 `84`，能否恢复滚动 | ✅ **真机实测有效**（用户确认「已正常」） |
+| 成因 | **推断 + 实测锁定的节点**：拦路的是 `Tabs` 内部**系统 TabBar 页签节点**，不是我们写的 `TabContent` / `@Builder` 容器。它的命中区恒等于自身矩形，而 `hitTestBehavior` 只能挂在我们自己创建的节点上 → 「空区不吃触摸」在它身上做不到，**只能靠收窄几何把死区限制在目标元素范围内**（方案 A 生效、方案 B 无效，已双向验证） |
+
+**收窄宽度的算式**：壳宽 = **右缘 28 + 元素宽 56 = 84**。壳内目标元素照旧写
+`.width('100%')` + `.alignItems(HorizontalAlign.End)` + `.padding({ right: 28 })` —— `100%` 自动跟随壳宽
+（84 − 28 = 56 = 钮宽），**故元素尺寸 / 右缘 / 底距逐项不变**。壳的宿主是
+`Stack({ alignContent: Alignment.BottomEnd })`，壳变窄后自动靠右停靠，位置无需另调。
+
+**附带收益**：壳开全宽时 `scale` 的缩放原点是「屏幕横向中点」→ 淡入时两钮像从屏幕左侧滑进来；
+收窄后原点落到**两钮自身中心**，`fabReveal` 更贴形（终态 `scale(1)` / `translate(0)` 未变，纯收益）。
+
+> **通用口径**：自建空 `Tabs` 壳的宽度 = **目标元素的实际占位**，不要把「壳」当成悬浮层去开全宽。
+> ✅ **2026-09-12 已按本条经验落地并真机验收**：`ThreadDetail.SortPillShell()`（§9.3 #6）原为 `.width('100%')` 且未挂
+> `hitTestBehavior`，那 46 高横带内同样吞掉下层帖子列表的竖滑（此前从未在该页反馈，属坑 30 的同类存量）。
+> 现改为 `.width(this.sortPillShellWidth())` —— 两枚胶囊宽度随字号自适应，故按字号实时推算：
+> `64 + 6 × fs(12, fontScale) + 12`（= 两钮左右 `padding` 4×14 + 钮间 `space` 8 + 文字宽 + 度量余量），
+> **标准字号 148 / 极大字号(1.35) 172**，宁宽不挤（偏宽只多几 vp 死区，偏窄会被 `Tabs` 压缩/裁掉胶囊文字）。
+> 壳外包一层**全宽 `Row`** 用 `padding({ left: 32 })` 把壳钉回改造前左缘 —— 排序行是**靠左排列**，
+> 而 `Stack(alignContent: Bottom)` 会把收窄后的壳水平居中（且靠 `margin` 拉不回，居中是按含 margin 的外框算的），
+> 故必须垫这层全宽 `Row`；`Row` 与壳都挂 `hitTestBehavior(HitTestMode.None)`（与 `ThreadList` FAB 壳同款）。
+> 壳内 `SortRowInSlot()` 的行宽同步由写死的「屏宽 − 64vp」改为 `'100%'`（参照物已从屏宽变成壳宽，写死会溢出）。
+> 结果：**两枚胶囊的位置 / 大小 / 间距与改造前逐项一致，46 高横带内目标元素左右两侧恢复可竖向滑动，真机确认正常**。
+
+---
+
+### 6.14 第十八处迁移（**首次把「整条栏」做成空壳槽位内的玻璃**）：吧主页排序栏 → 屏幕底部官方底栏（2026-09-12）
+
+**对象**：`ThreadList.ets` 吧主页排序栏（热门 / 最新 / 精选）。用户要求「改成跟首页一样的沉浸光感底栏样式」，并把右下角两枚 FAB（刷新 / 加号）上挪避让。
+
+| 项 | 内容 |
+|---|---|
+| 改造前 | 三枚胶囊在 `Scroll` 内容区、吧头下方（属 B 档越界，从不渲染材质，玻璃靠 `Theme.segGlass` + `backgroundBlurStyle` 真模糊自绘） |
+| 改造后 | 搬到**屏幕底部**，做成与首页 / 搜索页底栏同构的官方玻璃悬浮栏：`SortSlotShell()`（空壳槽位）+ 槽内 `SortSegBar()` / `SortSegButton()`（纯文字三等分） |
+| 壳几何 | 壳宽 = `sortBarWidth()`（**屏宽 − 116**，下限 184）；壳高 = `barHeight` = `THREAD_LIST_SORT_BAR_HEIGHT`（**56**，栏内纯文字无图标，比首页 / 搜索页底栏的 74 矮 18，圆角 `Radius.full` 收成 28）；底距 30 由**外层全宽 `Row` 的 margin** 承担；**左缘定位**由该 `Row` 的 `justifyContent(Start)` + `padding({ left: 24 })` 承担（栏宽不再左右对称，用 `Center` 会被推到左边距 60；坑 30：壳收窄后仍要垫全宽定位容器，`Stack` 的居中会按含 `margin` 的外框算） |
+| 同排布局（2026-09-12 追加） | 底栏收窄后**加号钮与底栏同排**（底边一条线），两框**分离**不并成一条：`左 24 | 底栏 | 缝 12 | 加号 56 | 右 24` → 栏宽 = 屏宽 − 116，底栏右缘距屏右 92 = 24 + 56 + 12；加号右缘由 28 收到 **24**（与底栏左缘对称）；栏高 **56 = 加号直径**、圆角 **28 = 加号圆角**（高度对齐的落点），栏内钮高靠 padding `6 → 5` 保住 **46（几何零变化）**；加号底距 `108 → 30`（同排），刷新钮底距 `30 + 56 + 12 = 98` → **孤悬在加号正上方**（右侧仅 56 宽放不下两钮横排，塞两个等于合框，用户已确认接受）；壳宽 `84 → 80`、壳高 124 未变 |
+| 材质来源 | **槽内那条 `Row`** 挂 `ImmMaterial.floatingBarFlat()` + `Radius.full`（与首页底栏同档同形，仅 `applyShadow: false` —— 本栏下方没有官方背板托底，带阴影版会在栏体四周压出突兀暗晕，真机反馈要求去除，2026-09-12；见坑 32），栏内三枚钮保持透明 |
+| 开关与兜底 | `THREAD_LIST_OFFICIAL_SORT_BAR = true`；低版本 / 无材质 / 开关关闭 → 排序栏回到吧头下方原位（`SortTabsBuilder()` 原样保留）。**兜底路径的自绘 FAB 不动**（仍贴底 36 / 104）：兜底路径没有底部排序栏，加号贴底本就无同排对象，强行对齐无意义 |
+| FAB 让位 | 槽位壳底距 `36 → 124`（底栏上沿 104 + 20 呼吸）→ 随底栏变矮同步 `108`（上沿 88 + 20 呼吸）→ **同排后定为 `30`**（= 底栏底距）；列表底部让位 `150 → 260 → 244` → **`166`**（= 刷新钮顶 154 + 12 呼吸；最高点由加号换成刷新钮，列表可视区同步白赚 78）。**2026-09-12 二次调整：右下角刷新钮按用户要求移除** —— 壳高 `124 → 56`（`THREAD_LIST_FAB_SHELL_HEIGHT`，壳内只剩加号、`FabSlotColumn` 的 `Column({space:12})` 去掉 space）、槽位路径列表让位 `166 → 98`（加号顶 86 = 底距 30 + 56，+ 12 呼吸）、兜底路径让位 `150 → 104`（自绘加号底距 36 → 顶 92，+ 12 呼吸；原 150 是给「贴底 104 的刷新钮 + 加号」两钮留的余量）；刷新入口改由「重复点击当前排序」承担（`refreshByRetap` → `handleRefresh`） |
+| 下限调整 | 旧下限 240 必须废除：同排后 W = 320 时可用宽仅 200，下限 240 会把底栏推到加号身上（重叠 28vp）。新下限 **184 = 3 × 56 + 16**（每钮至少 56 宽、与加号同宽），屏宽 ≥ 300 时公式自然 ≥ 184 |
+| 交互（2026-09-12 追加） | 点**未选中**的钮 = 切换排序（**双拍转场**：旧内容反向轻推淡出 → 新内容自对侧阻尼推入，见下方「转场」行；命中 `sortSession` 快照秒开，原逻辑不变）；点**已选中**的钮（当前在热门再点热门，最新 / 精选同理）= **回顶 + 刷新该排序**：`selectSort` 的同值分支由原来的 `return` 改为调 `refreshByRetap(sort)` —— 先立即 `listScroller.scrollTo(0,0)`（300ms `EaseOut`，不等网络），再复用 FAB 刷新钮的 `handleRefresh()`（同一条链路：网络刷新第 1 页、8s 超时兜底、「刷新成功 / 失败」toast、转圈反馈、后台昵称校准与缓存回写；busy 时只回顶不重复发请求）。两处路径共用 `selectSort`，**兜底路径的 `SortTabsBuilder` 自动同行为**，无需额外改动 |
+| 转场（2026-09-12 定稿·第三次） | 排序切换 = **照搬首页 `switchTab` 的「两页连着」过场**：新页自对侧整屏（±100%）进入，**旧页同时向反侧整屏滑出**，二者在同一个 `animateTo`（320ms `springMotion(0.72, 0.86)`）里对向平移。首页每个 Tab 都是常驻组件（`visibility` 隐藏、切页只改位移），旧页天然在树上；本页只有一个列表、数据被整体替换，故在**点击那一刻**用 `componentSnapshot.getSync` **同步**截下当前屏幕（旧内容 + 旧滚动位置）作旧页，由一层 `Image` 承载滑出，`SORT_ANIM_SETTLE=420ms` 收口后释放。★ 关键认知：前两版「单侧滑入」「退场+入场双拍」都错在**旧页不在场 / 被瞬间替换** —— 首页那种"顺滑、不过度"的本质是**两页相接同时移动**，与单页的位移曲线、时长关系不大。未命中缓存时收口过场 + 骨架屏轻淡入（150ms），网络返回再对向平移；`refreshSilently` 在过场窗口（`sortAnimUntil` = 起滑 + 420ms）内只回写缓存不上屏。**2026-09-12 追加·位移作用域收窄到「列表区」**（用户反馈「吧主页切换动画顶部吧信息能否不跟着切换」）：位移原挂在 `Scroll` 上，而吧头是 `Scroll` 内容里的普通子项 → 吧头被一起带着滑（首页切 Tab 时标题栏 / 底栏是静止的，两者不一致）。现改为：新页位移下移到 `Scroll` 内的**列表区**那一层（内容 / 骨架屏 / 空态 / 错误），吧头与兜底排序栏不参与位移；旧页快照用 `SnapshotOptions.region`（**px**，API 15+）裁掉吧头，旧页层再按 `exitClipTop` 下移并收窄高度，与只含列表区的新页严格对齐 —— 屏幕上"吧头原地不动、只有下方列表对向平移"，与首页头部固定、内容平移同构；吧头已滚出屏 / 吧头高未测到时不裁（整屏即列表内容，自动降级） |
+| 结果 | 构建 `BUILD SUCCESSFUL`（25s）；材质来源修正 + 转场手感待真机复核 |
+
+**壳的写法（可直接复制）**：
+
+```ts
+@Builder
+SortSlotShell() {
+  Row() {                                        // ← 全宽定位容器：左缘 + 底距（坑 30 要求）
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent()
+        .tabBar(this.SortSegBar())               // ← 槽内元素自己挂材质（坑 31）
+    }
+    .width(this.sortBarWidth())                  // ← ★ 收窄到目标元素占位（屏宽 − 116 / 下限 184），不是 '100%'
+    .height(THREAD_LIST_SORT_BAR_HEIGHT)         // 56 = 右下加号钮直径（同排高度对齐）
+    .vertical(false)
+    .scrollable(false)
+    .barHeight(THREAD_LIST_SORT_BAR_HEIGHT)      // barHeight = 壳高 → 内容区恒 0
+    .barBackgroundColor(Color.Transparent)
+    .barBackgroundBlurStyle(BlurStyle.NONE)      // 坑 26：必写
+    .backgroundColor(Color.Transparent)
+    .clip(false)
+    .hitTestBehavior(HitTestMode.None)
+    // ★ 不传 barFloatingStyle —— 空壳上它不生成官方背板（坑 31）
+  }
+  .width('100%')
+  .height(THREAD_LIST_SORT_BAR_HEIGHT)
+  // ★ 栏宽不再左右对称（左 24 / 右 92，右侧留给同排的加号 + 12 缝）：
+  //   用 Center 会被推到左边距 60，必须 Start + padding-left 钉回左缘
+  .justifyContent(FlexAlign.Start)
+  .padding({ left: 24 })
+  .margin({ bottom: THREAD_LIST_SORT_BAR_BOTTOM })
+  .zIndex(19)
+  .hitTestBehavior(HitTestMode.None)
+}
+```
+
+**★ 本次唯一的坑（坑 31）：空壳上没有官方背板可拿。**
+
+> 首版按「§1.1 第 26 行 = `barFloatingStyle.systemMaterial`」直接给空壳配上 `barFloatingStyle`，**编译通过、运行期一条材质都没有**
+> （真机反馈「底栏没沉浸光感材质」，且无 `out of scope` 日志可查）。对照已落地三处空壳（`ThreadDetail.SortPillShell` /
+> `ThreadList.FabSlotShell`）发现：它们**从不传 `barFloatingStyle`**，材质一律由**槽内元素自己挂**。
+> 结论：`barFloatingStyle` 只重构「`TabContent` 有内容」的壳的 bar；**空壳要「整条玻璃」，就把材质挂到槽内那一条容器上**
+> （本例是 `Radius.full` 的整栏 `Row` + 材质；2026-09-12 起该材质用**无阴影档** `ImmMaterial.floatingBarFlat()`
+> —— 空壳路径下这条栏下方没有官方背板托底，带阴影版的投影会摊成一圈突兀暗晕，见坑 32）。
+
+### 6.15 第十九处迁移：帖子详细页「跳转官方贴吧」确认浮层 → 系统 `CustomDialog`（2026-09-12）
+
+**对象**：`ThreadDetail.ets` 底部胶囊行「跳转」钮 → 确认弹窗（原 `@Builder JumpConfirmDialog()`）。
+
+| 项 | 内容 |
+|---|---|
+| 改造前 | 页面 body 顶层 `Stack` 自绘浮层（暗蒙层 + 居中卡片 + 确定 / 取消竖排按钮），卡上写了 `.systemMaterial(ImmMaterial.control())` |
+| 关键发现 | 那行 `systemMaterial` **一直在空转**：body 内自绘浮层不在官方材质生效范围内（§1.2），真正起作用的是同层自绘的 `.backgroundEffect(ImmBlur.control())` —— 典型"能编译不生效"残留（与 §9.2 第 3 条同源） |
+| 改造后 | 换成系统 `CustomDialog`：顶层新增 `@CustomDialog struct JumpTiebaDialogCard`，宿主新增 `jumpDialogController`，玻璃交给 `options.systemMaterial: ImmMaterial.dialog()` |
+| 几何对齐 | 宽度 `calc(100% - 48vp)` → `width: this.dialogCardWidth()`（屏宽 − 48，与 `ThreadList` / `Favorite` 同源实现）；圆角 32；遮罩 `#06000000`；标题 / 说明 / 链接预览 / 两枚按钮的字号、尺寸、间距**逐项未动**（按钮仍是竖排全宽） |
+| 落点（同日三次调整，已定型） | 初版按"原地就是居中卡片"取 `DialogAlignment.Center` → 用户要求「与置顶弹窗一致」改用 **`DialogAlignment.Bottom` + `offset.dy = -110`** → 用户反馈 -110 与「正序」胶囊贴在一起，先取安全值 `-170` → **用户复看后指定 `offset: { dx: 0, dy: -140 }`（最终值）**。依据：本页底部比收藏 / 进吧页多叠一层 —— 评论悬浮岛占「距底 30~96」（底距 30 + 高 66），排序胶囊行（底距 `30+66 = 96` + 高 46）占「距底 96~142」，行内 padding top4/bottom8 托着高 34 的钮体（本体距底 104~138）；`-140` 时弹窗底边落在钮体顶边 138 之上 2vp —— 紧贴但不压胶囊文字。⚠️ 勿改回 `Center`，也勿改回 `-110` |
+| 状态桥接 | `showJumpDialog` 由普通 `@State` 改 `@State @Watch('onShowJumpChanged')`，既有 `this.showJumpDialog = true/false` 调用点零改动（§4.2 第 ③ 步）；`openJumpDialog()` 打开前写 `jumpUrlPreview` 快照（`threadWebUrl()` 是宿主方法，弹窗内取不到） |
+| 关闭语义 | `onWillDismiss` → `closeJumpDialog()`，一并覆盖「点遮罩 / 返回键 / 侧滑」（与自绘时期点蒙层关闭一致，§4.5）；确定钮走 `confirmJump()`（内部仍先置 false 再拉起贴吧，业务零改动） |
+| 卡内删除 | `backgroundColor` / `backgroundEffect` / `border` / `shadow` ×2 / `systemMaterial` 全删（材质接管，§4.4）；按钮例外 —— 主钮 `ImmMaterial.accent()` + `#CC3173FF` + 同色浮起阴影，次钮 `ImmMaterial.cardAction()` + 半透明底 + 中性轻投影（§6.2 / 坑 11） |
+| 附带 | 本页此前**没有任何系统弹窗**，故一并补齐 `import { display }`（卡片宽度用）与 `dialogCardWidth()`；删除 `DetailRoot` 内的浮层挂载与旧 builder（−86 行） |
+| 结果 | 构建 `BUILD SUCCESSFUL`（24s）；真机观感待复核 |
+
+---
+
 ## 7. 已知偏差与遗留问题
 
 | # | 偏差 | 说明 | 处置 |
@@ -1003,6 +1173,9 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 27 | 材质参数写 `lightEffect: { color: undefined }`，以为"颜色未设=不启用" | **等于显式启用白色流光**：官方语义是「传**对象**=启用、`{color}` 缺省默认 `Color.White`；传 `null`=显式禁用；不传(`undefined`)=跟随组件默认」。悬浮玻璃岛上沿会出现一条白色光感线（左侧圆角处向外探出，极易误认成布局多出来的描边） | 想去掉光感线：该材质槽位改 `lightEffect: null`。`ImmMaterial.floatingBar()` 已改（2026-09-10 真机反馈）；其余槽位（`bar/control/seg/tab/accent/...`）目前仍显式启用，若哪处也嫌光感线明显，同法处理 |
 | 28 | 迁移弹窗时把卡内**原本透明的行**（无底色、只靠卡片玻璃承托）也"顺手"挂上 `systemMaterial` | 玻璃卡面多出一块 THIN 材质瓦片，行区与卡面出现突兀分界，与改造前观感不符 | 材质化只针对**原本有底色**的元素：按钮 / 卡片 / 实底行 → 换「材质 + **半透明**底」（坑 11）；原本透明的行**保持透明**（§6.11） |
 | 29 | 安全控件（`SaveButton` / `PasteButton`）按普通组件写法迁移：`.width('100%')` / `calc()` 百分比宽、直接在控件上挂 `margin` | `SaveButton` **不支持通用属性**（只继承安全控件通用属性）：百分比/calc 行为未定义、`margin` 根本不在属性清单里；更麻烦的是样式"不合法"时表现是**授权失败（错误码 2）而不是报错**，通常还伴随「文本被截断即点击不授权」的静默失败 | 安全控件只用其白名单属性（`width/height/size/padding/borderRadius/fontSize/fontColor/...`），且 `width` 传**数值 vp**（怕百分比失效就用宿主算好的 vp 常量）；margin / 居中 / 等分交给外层普通容器（`Row().padding().justifyContent()`）；务必保留 `ButtonType.Capsule` + 正常尺寸、避免被遮挡或超出屏幕（§6.12） |
+| 30 | 自建「空 `Tabs` 壳」开**全宽**（`'100%'`）把目标元素送进 TabBar 槽位 | 壳本身看不出问题，但**下层列表在那一条横带里滑不动**（该行整段竖滑被吞）；且给壳挂 `hitTestBehavior(HitTestMode.None)` **修不了** —— 拦路的是系统 TabBar **页签节点**，命中区恒等于自身矩形，该属性挂不到它身上 | 把壳宽收成「**目标元素实际占位**」（`ThreadList` FAB 壳 = 右缘 **24** + 钮宽 56 = **80**，右缘由 28 收成 24 以与排序栏左缘对称；`ThreadDetail` 排序壳 = 按字号推算 `64 + 6 × fs(12) + 12` → 148 / 172），死区随之缩小到目标元素那一列；壳内元素照旧 `width('100%')` 跟随壳宽，**尺寸 / 底距零改动**（§6.13）。⚠️ 若目标元素**靠左/居中**排列（非贴右），壳收窄后还需垫一层全宽定位容器（`Row` + `padding-left`）把壳钉回原位 —— `Stack` 的居中会按含 `margin` 的外框计算，仅调 `margin` 拉不回来（`ThreadDetail` 实例）。⚠️ 若目标元素**左右不对称**（如 `ThreadList` 排序栏收窄让位给同排加号后为「左 24 / 右 92」），全宽容器**必须用 `Start` + `padding-left`**，`Center` 会把它按左右均分的 60 推进去（§6.14 实例） |
+| 31 | 在**空 `Tabs` 壳**上写 `barFloatingStyle({ systemMaterial: ImmMaterial.floatingBar() })`，以为能拿到「整条官方玻璃背板」 | 编译通过、**运行期完全不渲染材质**，且无 `out of scope` 日志可查（`ThreadList` 底部排序栏首次落地即由此翻车：真机反馈「底栏没沉浸光感材质」） | 空壳路径**没有**官方背板可拿：`barFloatingStyle` 重构的是「`TabContent` 有内容」的壳的 bar（`Index.FloatingTabsShell` / `Search.ImmersiveShell` / `ThreadDetail.ImmersiveDockShell` 的 `TabContent` 都装了页面），空壳里它不生成背板。空壳要整条玻璃，就把材质**挂到槽内那一条容器**上（§6.14：整栏 `Row` 挂 `ImmMaterial.floatingBarFlat()` + `Radius.full`，栏内元素保持透明）—— 这正是 §1.1 第 27 行「壳内元素各自挂」的同一条路（`ThreadDetail.SortPillShell` / `ThreadList.FabSlotShell` 一直是这么做的，故从未遇到此坑） |
+| 32 | 给**页面元素自己挂材质**的悬浮栏用带阴影版 `ImmMaterial.floatingBar()`（`applyShadow: true`） | 栏体四周被压出**一圈突兀暗晕**（真机截图反馈「吧主页底栏有层突兀阴影」）—— 该栏浮在列表内容之上、下方没有官方背板托底，材质自带投影无处可落，只能摊在内容与页底上 | 这类「**无背板托底**」的悬浮栏换**无阴影档** `ImmMaterial.floatingBarFlat()`（`applyShadow: false`，其余 THIN / 无流光 / `colorInvert` 逐项一致）；走 `barFloatingStyle` 的官方悬浮岛（首页 / 搜索页 / `ThreadDetail` 底栏）**仍用带阴影版** —— 那里的阴影是悬浮岛观感的一部分。同族先例：`segFlat`（详情页排序胶囊 2026-09-10）、FAB 的 `segFlat(false)`（2026-09-11）。⚠️ **判据**：材质挂在「自己就是最终形状、下方无背板」的元素上时，一律优先无阴影档 |
 
 ---
 
@@ -1026,6 +1199,7 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 12 | `UserProfile.ets` | 帖子排序下拉 `PostSortMenu` | 自绘浮层（**不透明** `bgElevated` + 无效 `systemMaterial`） | **`bindMenu`** + `MenuOptions.systemMaterial`（原浮层用不透明底且材质 out of scope，改后真材质生效，WARN 一并消失） | ✅ **已完成**（§6.9） |
 | 13 | `FollowList.ets` | 排序下拉 `SortMenuPanel` | 自绘浮层（**不透明** `bgElevated` + 无效 `systemMaterial`） | **`bindMenu`** + `MenuOptions.systemMaterial`（与第 8 项同款残留，随 §6.9 一并改） | ✅ **已完成**（§6.9） |
 | 14 | `BlacklistManager.ets` | 排序下拉 `SortMenuPanel` | 自绘浮层（**不透明** `bgElevated` + 无效 `systemMaterial`） | **`bindMenu`** + `MenuOptions.systemMaterial`（与第 8 项同款残留，随 §6.9 一并改） | ✅ **已完成**（§6.9） |
+| 15 | `ThreadDetail.ets` | 跳转官方贴吧确认 `JumpConfirmDialog` | 自绘浮层 + **空转的 `systemMaterial(ImmMaterial.control())`** | `CustomDialog` + `ImmMaterial.dialog()`（同页 `LinkConfirmDialog` 形态同款、同样空转，本次未在范围内） | ✅ **已完成**（§6.15） |
 
 > **迁移时顺手做**：弹窗卡内的按钮按 §6.2 挂 `systemMaterial`（主按钮 `ImmMaterial.accent()`、危险主按钮 `ImmMaterial.danger()`、次按钮 `ImmMaterial.cardAction()`），底色保持半透明 + 保留自定义轻投影。
 > **新点位优先复用 `ConfirmDialogCard`**（`pages/Favorite.ets` 顶层）：凡是「标题 + 正文 + 取消/确认」形态的二次确认，直接加一组快照状态 + 一个 controller 即可，不要重复铺模板。
@@ -1034,6 +1208,7 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 
 - **`AlertDialog` 已全工程清零** ✅：最后一处（分类管理菜单里的「删除分类」）已换成 `ConfirmDialogCard` + `danger: true`（§6.7）。现源码中已无任何 `AlertDialog.show()` 调用，`ForumsTab.ets` 仅剩文档注释里提到 `AlertDialogParam`。
 - 二级页（`ThreadList` / `ThreadDetail` / `Search` / `FollowList` / `PersonalContent` / `UsageHabitsPage` / `Login` / `Compose`）里的自绘弹窗是否还有遗漏，需逐页排查。
+  - ✅ `ThreadDetail` 已排查（2026-09-12）：「跳转官方贴吧」确认已迁系统弹窗（§6.15）；同页 `LinkConfirmDialog`（链接跳转确认，复制链接 / 确认 / 取消三枚竖排钮）**形态同款、卡上同样挂着空转的 `systemMaterial(ImmMaterial.control())`**，可直接复用同一套模板迁走 —— ⬜ 待办。
 - **页面主体仍在挂 `systemMaterial` 的遗留点位**（`FollowList` 等）→ 构建 WARN 持续出现，属"能编译不生效"，应清理或改走 `backgroundBlurStyle`。
 
 ---
@@ -1050,7 +1225,7 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 3 | `Favorite.ets` | TopBar 五种形态（根态 / 编辑态 / 搜索态 / 分类内 / 吧内） | 同上：五形态塞进同一个 title builder 条件渲染 | ✅ **已完成**（见下方落地清单） |
 | 4 | `ForumsTab.ets` | TopBar（标题「进吧」+ 一键签到 / 排序 ⇅ / 深色切换） | `Navigation` title 槽位 + `ImmMaterial.seg(false)`（三钮同档） | ✅ **已完成**（见下方落地清单） |
 | 5 | `UserProfile.ets` / `FollowList.ets` / `BlacklistManager.ets` | TopBar + 排序钮（三页同构） | 同上，可一次改完 | ⬜ 待办 |
-| 6 | `ThreadDetail.ets` | 沉浸顶栏（返回钮 / 吧名胶囊 / 分享钮）+ 排序胶囊（正序 / 只看全部）+ **底部已是官方 `Tabs` 悬浮条** | 顶栏走 `Navigation` title 槽位；排序胶囊走自建「空 tabBar 壳」槽位 —— 均 `ImmMaterial.seg(...)` | ✅ **已完成**（见下方落地清单；该页为「上下两端官方槽位」样板；排序胶囊的「TabBar 槽位子树」新判据待真机复核） |
+| 6 | `ThreadDetail.ets` | 沉浸顶栏（返回钮 / 吧名胶囊 / 分享钮）+ 排序胶囊（正序 / 只看全部）+ **底部已是官方 `Tabs` 悬浮条** | 顶栏走 `Navigation` title 槽位；排序胶囊走自建「空 tabBar 壳」槽位 —— 均 `ImmMaterial.seg(...)` | ✅ **已完成 + 真机已验**（见下方落地清单；该页为「上下两端官方槽位」样板；排序胶囊的「TabBar 槽位子树挂材质生效」与「壳宽收窄消滚动死区」两项判据均已真机确认） |
 | 7 | `Search.ets` | 顶部返回 + 搜索框（`TextInput`）+ **底部已是官方 `Tabs` 悬浮条** | `Navigation` title 槽位 + `ImmMaterial.seg(false)`（返回钮 / 搜索框 / 搜索钮三元素同档）；⚠️ 搜索框搬进标题栏后**聚焦 / 键盘避让 / 输入态**行为待真机验证 | ⏳ **代码已落地**（见下方落地清单） |
 | 8 | `SubPostDetail.ets`（楼中楼页） | TopBar（返回 44 圆钮 / 吧名居中文字） | `Navigation` title 槽位，**几何对齐 `ThreadDetail` 顶栏**（返回 44 圆钮 + 吧名 58% 宽胶囊居中），两元素同挂 `ImmMaterial.seg(false)` | ✅ **代码已落地**（见下方落地清单） |
 
@@ -1145,7 +1320,20 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
   bar 本体」这一条（§1.1 第 22 行），**子树内元素挂材质尚无真机验证**。若 hilog 报 `Material inactive: out of scope`，两枚胶囊会
   退化成「透明底」（自绘玻璃已按官方口径删除）→ 把 `THREAD_DETAIL_SORT_OFFICIAL_SLOT` 置 `false` 即整行回退。
   同时需确认：① 新壳没有引入多余背板 / 阴影；② 排序行位置与改造前像素级一致（钮底距岛顶 8vp、宽 = 屏宽 - 64vp、靠左排列）；
-  ③ 该 46 高区域的点击与滚动穿透行为与改造前一致（壳宽 100%，与旧 `Column` 同款覆盖范围）。
+  ③ 该 46 高区域的点击与滚动穿透行为与改造前一致（~~壳宽 100%，与旧 `Column` 同款覆盖范围~~ → 该推断已被推翻，见下方 2026-09-12 更正）。
+
+> **2026-09-12 更正并已落地（真机验收）**：上面第 ③ 条是按**错误前提**写的（当时以为「覆盖范围与旧 `Column` 相同」就等于「行为一致」）。
+> 经 `ThreadList` 同类空壳实测（§6.13 / 坑 30）：**空 `Tabs` 壳开全宽时，系统 TabBar 页签节点会吞掉该横带内下层列表的竖滑**，
+> 且 `hitTestBehavior` 挂不到系统节点上、修不了（已双向验证）→ 本壳 `.width('100%')` 时那 46 高区域内确实吃掉了滚动。
+> 修复（A 方案，与 `ThreadList` FAB 壳同一套做法）：
+> ① 壳宽 `.width('100%')` → `.width(this.sortPillShellWidth())` = `64 + 6 × fs(12, fontScale) + 12`
+> （两枚胶囊宽度随字号自适应，标准 148 / 极大 172，宁宽不挤）；
+> ② 因排序行**靠左**排列，壳外垫一层**全宽 `Row`**（`justifyContent(Start)` + `padding({ left: 32 })`）把壳钉回改造前左缘
+> —— `Stack(alignContent: Bottom)` 会把收窄后的壳**水平居中**，且 `margin` 拉不回来（居中是按含 margin 的外框算的）；
+> ③ `Row` 与壳都挂 `hitTestBehavior(HitTestMode.None)`；
+> ④ 壳内 `SortRowInSlot()` 行宽由写死的「屏宽 − 64vp」改 `'100%'`（参照物从屏宽变壳宽，写死会溢出）。
+> 结果：**两枚胶囊位置 / 大小 / 间距与改造前逐项一致（左缘 32 = 悬浮岛内评论条同一条竖线），46 高横带内两侧恢复可竖向滑动，
+> 真机确认正常**。32 的来路：改造前行宽 = 屏宽 − 64vp 由撑满壳宽的 `Column` 居中 → 左缘 = (屏宽 − (屏宽 − 64)) / 2 = 32。
 
 **`Search.ets` 落地清单（2026-09-10，与 `HomeTab` / `ThreadDetail` 同机制；⏳ 待真机验证）**：
 
@@ -1222,6 +1410,7 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 - [ ] **顶部槽位点位**（§6.10）：标题栏内材质生效 + 四边几何与改造前逐项一致 + 内容让位常量未被改坏
 - [ ] **引入 `Navigation` 壳的页面**：页面内手势（`parallelGesture` / 横滑）/ 系统返回键 / 宿主切 Tab 全部回归
 - [ ] 滚动内容从标题栏下穿过时的层次与流畅度（`clip(false)` + `barStyle: STACK`）
+- [ ] **自建空 `Tabs` 壳（TabBar 槽位）**：壳宽已收敛到「目标元素实际占位」（非 `'100%'`）+ 显式 `.barBackgroundBlurStyle(BlurStyle.NONE)` + **在壳所在的那一条横带上、目标元素左右两侧拖动，下层列表仍能正常滚动**（§6.13 / 坑 30）
 
 ---
 
@@ -1265,5 +1454,20 @@ Button() { SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.colo
 | 2026-09-11 | 第十五处迁移（顶部槽位）：帖子详细页「查看更多楼中楼」`SubPostDetail.ets` 顶栏 → `Navigation` title 槽位（用户要求：返回按钮与吧标题要「帖子详细页一样几何」的沉浸光感）。开关 `SUBPOST_OFFICIAL_TITLE_BAR` / `SUBPOST_TITLE_BAR_HEIGHT = 98`，判据与 `ThreadDetail` 同（`&& this.materialSupported`）；`build()` 根 `Stack` 抽成 `SubPostContent()`、原 `TopBar()` 保留为 `LegacyTopBar()` 兜底；槽内 `SubPostTitleBar()` 几何逐项复刻 `DetailTitleBar` —— 返回 44 圆钮 + 吧名 58% 宽胶囊居中（差异仅「本页无分享钮，右侧只留 `Blank`」），两元素均 `backgroundColor(Transparent)` + `ImmMaterial.seg(false)` + `Radius.full`，不挂 border / backgroundBlurStyle / shadow。`Scroll` 首项占位仍为 98、消息定位偏移未变。构建 `BUILD SUCCESSFUL`（24s）；§9.3 表新增第 8 项并附落地清单 |
 | 2026-09-11 | 追加：`SubPostDetail.ets` 卡片圆角统一为 `SUBPOST_CARD_RADIUS = 26`（父楼层卡原 `Radius.lg(16)`、楼中楼回复卡原 `Radius.md(12)`），宽高 / 间距 / 内边距零改动；同页链接确认弹窗卡片仍是工程统一的 32vp。构建 `BUILD SUCCESSFUL`（22s） |
 | 2026-09-11 | 追加：`SubPostDetail.ets` 滚动区底部留白试改（`Spacing.xl(20)` → 160 → 96）后按用户要求**回退初始值 `Spacing.xl(20)`**，代码（去掉 `SUBPOST_SCROLL_BOTTOM_SPACE` 常量）与文档均复原。失败经验：`ThreadDetail` 该处 160 含底部悬浮回复岛让位 96，无悬浮栏的页面照抄会明显偏空 |
+| 2026-09-12 | 第十六处迁移（**首次把「空 tabBar 壳」用在可滚动列表之上**）：吧列表页 `ThreadList.ets` 右下角悬浮 FAB 两钮（刷新 / 加号）→ 自建「只有 tabBar 的 `Tabs`」壳槽位（§6.13），两钮换 `ImmMaterial.segFlat(false)`（无阴影档）。新增**坑 30 —— 本次唯一的坑，且两个方案双向验证**：空壳开全宽时**下层列表在壳所在那条横带内滑不动**，而给壳挂 `hitTestBehavior(HitTestMode.None)` **实测无效**（拦路的是 `Tabs` 内部**系统 TabBar 页签节点**，命中区恒等于自身矩形，该属性挂不到它身上）；唯一解是把**壳宽收窄成「目标元素实际占位」**：`width('100%')` → `THREAD_LIST_FAB_SHELL_WIDTH = 84`（右缘 28 + 钮宽 56），壳内元素照旧 `width('100%')` 跟随壳宽，故**两钮尺寸 / 右缘 / 底距逐项不变**，真机确认「已正常」。附带收益：`scale` 缩放原点随壳收窄落到两钮自身中心，`fabReveal` 淡入更贴形。同步更新：§1.1 速查表新增「自建空 `Tabs` 壳内的元素」一行、§8 补坑 30、§10 补自测项；另标注 ⚠️ `ThreadDetail.SortPillShell()` 仍是全宽壳、待复核（**下一条已销项**）。构建 `BUILD SUCCESSFUL` |
+| 2026-09-12 | 第十七处迁移（**收口坑 30 在本工程的最后一处存量，A 方案正式版**）：帖子详细页 `ThreadDetail.ets` 排序胶囊壳 `SortPillShell()` 由**全宽壳**收窄为「两枚胶囊那一列」，消除该 46 高横带内吞掉下层帖子列表竖滑的死区（与 `ThreadList` FAB 壳同一套做法，双向验证过的唯一解）。三处改动全在 `ThreadDetail.ets`：① 新增 `sortPillShellWidth()` —— 两枚胶囊宽度随字号自适应，故按字号实时推算 `64 + 6 × fs(12, fontScale) + 12`（两钮左右 `padding` 4×14 + 钮间 `space` 8 + 文字宽 ≈ 6×字号 + 度量余量），标准字号 **148** / 极大字号(1.35) **172**，宁宽不挤；② `SortPillShell()` 的 `.width('100%')` → `.width(this.sortPillShellWidth())`，并**外包一层全宽 `Row`**（`justifyContent(Start)` + `padding({ left: 32 })` + `hitTestBehavior(None)`）把壳钉回改造前左缘、壳自身也挂 `hitTestBehavior(None)`、底距 `margin` 从壳移交外层 `Row`；③ `SortRowInSlot()` 行宽由写死的「屏宽 − 64vp」改 `'100%'` 跟随壳宽（参照物从屏宽变壳宽）。新增关键经验：**目标元素非贴右排列（靠左/居中）时，壳收窄后必须垫一层全宽定位容器复位** —— `Stack` 的居中是按**含 `margin` 的外框**计算的，仅调 `margin` 拉不回原位；32 的来路 = 旧行宽「屏宽 − 64vp」居中后的左缘 `(屏宽 − (屏宽 − 64)) / 2`，与悬浮岛内评论条左缘同一条竖线。两枚胶囊位置 / 大小 / 间距逐项未变，真机确认「正常」。同步更新：§6.13 通用口径（⚠️ 待复核 → ✅ 已落地并附算式与定位容器写法）、§8 坑 30（补「靠左/居中需垫全宽定位容器」）、§9.3 #6 状态改为「已完成 + 真机已验」、`ThreadDetail` 排序胶囊落地清单的 2026-09-12 更正段改为已落地。构建 `BUILD SUCCESSFUL` |
+| 2026-09-12 | 第十八处迁移（**首次把「整条栏」做成空壳槽位内的玻璃**）：吧主页 `ThreadList.ets` 排序栏（热门 / 最新 / 精选）从「Scroll 内容区、吧头下方的三枚自绘真模糊胶囊」搬到**屏幕底部**，做成与首页 / 搜索页底栏同构的官方沉浸光感悬浮底栏（用户要求「跟首页一样的底栏样式」，同时右下角两枚 FAB 上挪避让）。落地四步：① 新增 `SortSlotShell()` —— 外层全宽 `Row`（`justifyContent(Center)` + `hitTestBehavior(None)`）负责居中定位与底距 `margin`，内层空壳 `Tabs` 壳宽 = `sortBarWidth()`（屏宽 − 48，下限 240，同时满足坑 30 的收窄要求）、壳高 = `barHeight` = 74、不传 `barOverlap`、显式 `barBackgroundBlurStyle(BlurStyle.NONE)`；② 新增 `SortSegBar()` / `SortSegButton()`：纯文字三等分（`layoutWeight(1)` / 高 58），选中态只用系统强调色 + 加粗，**整条背板材质由槽内那一条 `Row` 自己承担**（`ImmMaterial.floatingBar()` + `Radius.full`）；③ 开关 `THREAD_LIST_OFFICIAL_SORT_BAR` + 低版本 / 无材质回退（原 `SortTabsBuilder` 原位保留）；④ FAB 槽位壳底距 `36 → 124`（= 底栏上沿 104 + 20 呼吸），列表底部让位 `150 → 260`。**新增坑 31**：空壳上写 `barFloatingStyle` **不生成官方背板**（首次落地正是这么写的 → 真机反馈「底栏没有沉浸光感材质」），改回「材质挂槽内元素」即解决 —— 与 `FabSlotShell` / `SortPillShell` 一直是同一路数。同步更新：§1.1 速查表第 27 行补「空壳没有 `barFloatingStyle` 背板」、新增 §6.14、§8 补坑 31。构建 `BUILD SUCCESSFUL` |
+| 2026-09-12 | 追加（用户反馈「底栏里没有图标、内部高度空余太多，把内部高度调低些」）：`ThreadList.ets` 底部排序栏栏高 `74 → 58`（`THREAD_LIST_SORT_BAR_HEIGHT`）、栏内三钮高 `58 → 46`，并新增 `THREAD_LIST_SORT_BAR_PADDING = 6` 让「钮高 = 栏高 − 2 × 6」自动联动（`SortSegBar` 的 `padding` 与 `SortSegButton` 的 `height` 共用这一处常量），`Radius.full` 圆角随之由 37 收成 29；栏宽（屏宽 − 48）、底距 30、三钮等分均未动。联动清理三处：① FAB 槽位壳底距 `124 → 108`（= 新底栏上沿 88 + 20 呼吸，两钮 56+12+56 与右缘 28 未变）；② 列表底部让位 `260 → 244`（= FAB 顶 232 + 12 呼吸）；③ `THREAD_LIST_FAB_SHELL_HEIGHT`(124) 与兜底路径自绘 FAB（贴底 104）未动。文档同步 §6.14 表格与代码块。构建 `BUILD SUCCESSFUL`（26s） |
+| 2026-09-12 | 追加·**同排重构**（用户要求「底栏宽度调窄，把加号挪到与底栏同一排（两个框要分离开），底栏内高度与加号按钮对齐」）：`ThreadList.ets` 底部排序栏与右下加号钮改为**同排两框**。几何定稿：`左 24 | 底栏 | 缝 12 | 加号 56 | 右 24` → 栏宽 **屏宽 − 116**（旧 屏宽 − 48）、下限 **184**（旧 240，W = 320 时旧下限会把底栏推到加号身上重叠 28vp）；栏高 **56 = 加号直径**（旧 58），`THREAD_LIST_SORT_BAR_PADDING` `6 → 5` 把栏内钮高**保住 46**（文字块几何零变化），`Radius.full` 圆角 29 → **28 = 加号圆角**；加号底距 `108 → 30`（= 底栏底距，底边一条线）、刷新钮底距 `30 + 56 + 12 = 98` **孤悬在加号正上方**（已与用户确认接受：右侧仅 56 宽放不下两钮横排，塞两个等于合框）；FAB 壳宽 `84 → 80`（右缘由 28 收到 **24**，与底栏左缘对称）、壳高 124 不变；列表底部让位 `244 → 166`（最高点由加号换成刷新钮 154 + 12 呼吸，可视区白赚 78）。**新增关键经验（已回写坑 30）**：目标元素**左右不对称**时全宽定位容器**必须 `Start` + `padding-left`**，`Center` 会把它按左右均分的 60 推进去 —— 本处栏宽左 24 / 右 92 不对称，`SortSlotShell()` 的 `justifyContent(Center)` 已改 `Start` + `padding({ left: 24 })`。新增常量 `THREAD_LIST_SORT_BAR_GAP = 12`，`sortBarWidth()` 由写死减法改为 `24 + THREAD_LIST_FAB_SHELL_WIDTH + GAP`（缝隙与壳宽联动）。兜底路径（低版本 / 无材质 / 开关关闭）**不动**：它没有底部排序栏，加号贴底本就无同排对象。文档同步：§6.14 表格新增「同排布局」「下限调整」两行并重写壳几何行、代码块（56 / Start + padding-left）、§1.1 表头 84 → 80、坑 30 补「左右不对称须 Start」与 80 的来历。构建 `BUILD SUCCESSFUL`（26s） |
+| 2026-09-12 | 追加·**去阴影**（真机截图反馈「吧主页底栏有层突兀阴影」）：定位为**材质自带投影**（`ImmMaterial.floatingBar()` 的 `applyShadow: true`）—— 空壳槽位路径下这条栏由槽内 `Row` 自己挂材质、下方没有官方背板托底，投影无处可落便摊在内容与页底上成一圈暗晕（与 2026-09-10 详情页排序胶囊的「一层淡阴影」同源，即修复⑥）。`Theme.ets` 新增**无阴影档** `ImmMaterial.floatingBarFlat()`（`_matFloatingFlat` 单例 + `ensureFloatingBarFlat()`，与 `floatingBar` 仅 `applyShadow: false` 之差：THIN / `interactive: false` / `lightEffect: null` / `colorInvert: true` 逐项一致），`ThreadList.SortSegBar()` 的 `.systemMaterial(...)` 换用该档；走 `barFloatingStyle` 的官方悬浮岛（首页 / 搜索页 / 帖子详情页底栏）**不动**（那里阴影属悬浮岛观感）。新增**坑 32**（判据：材质挂在「自己就是最终形状、下方无背板」的元素上时一律优先无阴影档；同族先例 `segFlat` / FAB 的 `segFlat(false)`）。同步更新：§6.14「材质来源」行与坑 31 正文、§8 补坑 32、`immersive-material-guide.md` 材质速查表补 `floatingBarFlat()` 一行。构建 `BUILD SUCCESSFUL`（36s） |
+| 2026-09-12 | 追加·**重复点击排序 = 回顶刷新**（用户要求「当前在热门，再点热门就刷新内容并回到最顶上，最新 / 精选同理」）：`ThreadList.ets` 的 `selectSort` 同值分支由 `return` 改为 `this.refreshByRetap(sort)` —— 新增 `refreshByRetap()`：① 立即 `listScroller.scrollTo({0,0})`（300ms `EaseOut`，不等网络，等待期间用户已看到顶部）；② 复用 FAB 刷新钮的 `handleRefresh()`（同一条链路：网络拉第 1 页、8s 超时兜底、「刷新成功 / 失败」toast、转圈反馈、后台昵称校准 + 缓存回写；busy 时只回顶不重复发请求，与 `handleRefresh` 的 busy 短路口径一致）。数据侧附带收益：新列表经 `threads` 的 `@Watch`（`onThreadsChanged`）自动回写 `sortSession`，切走再切回拿到的已是刷新后数据。**零新增分支成本**：槽位路径（`SortSegButton`）与兜底路径（`SortTabsBuilder`）三处 onClick 都调 `selectSort`，故两条路径自动同行为。§6.14 表格补「交互」行；`SortSegBar` / `SortTabsBuilder` / `selectSort` 注释同步。构建 `BUILD SUCCESSFUL`（26s） |
+| 2026-09-12 | 追加·**移除右下角刷新钮**（用户要求「去掉吧主页右下角的刷新按钮」）：`ThreadList.ets` 两处一起删 —— ① 官方槽位路径 `FabSlotColumn` 里的刷新钮 `Stack`（`arrow_clockwise` + `refreshSpin` 自转 + `systemMaterial(segFlat(false))` + `onClick → handleRefresh`），`Column({space:12})` → `Column()`、壳高常量 `THREAD_LIST_FAB_SHELL_HEIGHT` `124 → 56`（壳内只剩加号，仍与底部排序栏同排：底距 30、高 56、占 30~86）；② 兜底路径（`ThreadListContent` 的 else 分支）同款自绘刷新钮（`segGlass` / `manualBorder` / `backgroundBlurStyle` / `segShadow`），加号保持改造前的底距 36。连带回收：转圈机制整体删除（`@State refreshSpin`、`private refreshTimer`、`startRefreshSpin()` / `stopRefreshSpin()`、`handleRefresh` 内两处调用、`aboutToDisappear` 里唯一用途的 clearInterval —— 方法随之整体移除）；列表底部让位 `contentBottomSpace()` 槽位路径 `166 → 98`（加号顶 86 + 12 呼吸）/ 兜底路径 `150 → 104`（自绘加号顶 92 + 12 呼吸）；`withRefreshTimeout` 注释改写（界面已无转圈图标，兜底改为保护 busy 门不被挂起请求长期占住）。刷新入口现在只有「重复点击当前排序」（`refreshByRetap`）。§6.14 表格「FAB 让位」行与 `FabSlotShell` / `FabSlotColumn` / `fabReveal` / 常量注释同步。构建 `BUILD SUCCESSFUL`（26s） |
+| 2026-09-12 | 追加·**加号材质随背景反色**（用户反馈「底栏和底栏内文字会随背景变色、加号不会，看着有些别扭」）：`Theme.ets` 新增材质档 **`ImmMaterial.fabFlat()`**（`ensureFabFlat` + `_matFabFlat` 缓存）= THIN / `interactive: true` / `lightEffect: { color: undefined }` / `applyShadow: false` / **`colorInvert: true`** —— 与底栏 `floatingBarFlat()` 同档，仅 `interactive`（保留圆钮按压形变）之差。`ThreadList.FabSlotColumn` 加号：`.systemMaterial(ImmMaterial.segFlat(false))` → `.systemMaterial(ImmMaterial.fabFlat())`，图标色 `Theme.textPrimary(this.isDark)` → **`$r('sys.color.font_primary')`**（系统语义色，与底栏三钮文字同源）。**判据**：`colorInvert` 是「材质随背景明暗自动翻转」的开关，且只作用于材质内的**系统语义色内容** —— 自绘 hex（`Theme.textPrimary` / `iconPrimary`）一律不参与反色；无材质的兜底自绘路径（`ThreadListContent` else 分支）仍保持 `Theme.textPrimary` 不动。文档同步：`immersive-material-guide.md` §4.2 材质表新增 `fabFlat()` 行 + `createMaterial` 模板 `colorInvert` 注释、§6.13 追加「后续变更」行、`ensureFloatingBarFlat` / `SortSegBar` 注释里的旧提法。构建 `BUILD SUCCESSFUL`（34s） |
+| 2026-09-12 | 追加·**排序切换转场丝滑化**（用户反馈「热门 / 最新 / 精选的左右滑动动画有些生硬，要非常丝滑」）：旧实现是**单侧滑入**（`SORT_SWITCH_SLIDE=120` / 300ms `FastOutSlowIn` / 起点 opacity 0.6，见本次删除的常量），旧内容被瞬时整块替换、只有新内容孤零零平移归位。重构为**方向感知的双拍接力**（参数以 `ThreadList.ets` 文件头 `SORT_OUT_*` / `SORT_IN_*` 常量注释为准）：① **退场** = 当前内容反向轻推 40vp + 淡到 0.25 + 微缩 0.985，130ms `Curve.EaseIn`（起步快、收得利落，点击即有反馈、不等网络）；② **入场** = 新内容自对侧 140vp、以**与退场终点同档**的透明度 / 缩放起步（衔接处不见明暗跳变），320ms `curves.springMotion(0.72, 0.86)` 阻尼吸附归位 —— 与首页 5 Tab `switchTab`、底栏选中缩放同一套弹簧参数，全站手感统一。数据替换发生在两拍之间（屏幕外偏移 + 低透明度处，替换本身不可见）。**新增转场管线**：`SortDisplay` 数据包（sort / threads / page / hasMore / state，`sort` 做连点竞态校验）+ `stageSortEnter`（退场未收口则入队 `pendingEnter`，收口后落位）/ `applySortDisplay`（起点态先渲染一帧 → 下一帧播动画，`SORT_FRAME_GAP=24` 防起点被吞）/ `playSortExit` / `finishSwitchImmediately`（快速连点立即收口并落位已到数据），取代旧的 `pendingShift` + 零散 `enterTimer` 复位；`loadThreads` 的**五处上屏点**（页内快照命中 / 缓存命中 / 未命中转 Loading / 网络返回 / catch）全部改经转场入口，`catch` 同时复位转场态（否则错误页会歪在退场偏移上）。**未命中缓存**（首次切过去且无缓存）改「退场 → 骨架屏淡入（`SORT_SKELETON_DURATION=220`）→ 网络返回入场」，旧内容停在退场终点等网络、不回弹不闪空，取代原先的硬切。另两处配套：① **换排序同步无动画回顶**（旧滚动偏移对新内容集没有意义）；② `refreshSilently` 增加「转场中只回写缓存、不上屏」守卫，消除"滑入途中列表被静默刷新整块替换"的跳变。渲染层新增 `.scale(this.contentScale)`（与 `.translate` 同挂内容层）。构建 `BUILD SUCCESSFUL`（25s） |
+| 2026-09-12 | 追加·**排序切换转场二次收敛**（真机反馈「动画太过度，还会卡一下，我只想要类似首页界面切换那种效果，首页和收藏页的切换就顺滑、也不过度」）：上一版的双拍接力被判过度 —— **过度**来自位移幅度与叠在一起的三类变化（140vp 位移 + 透明度 0.25→1 + 缩放 0.985→1），**卡顿**来自两拍之间的等待（退场播完到入场播放之间内容静止约 160ms）以及入场前强制停一帧（24ms）才能摆起点。现**收敛为 `Index.switchTab` 完全同款的一段式**：`SORT_SLIDE=100`（同首页 `inOffset`/`outOffset`）/ `SORT_DURATION=320` / `curves.springMotion(0.72, 0.86)`，渲染层只挂 `.translate`（删 `.scale`，透明度不再参与动画）。写法同样取首页口径：`applySortDisplay` 在**同一调用栈**内先无动画摆起点（`contentShift = dir * 100`）再 `animateTo` 归位 —— 渲染出的首帧即"新内容位于对侧"，不闪叠、无等待帧（首页生产代码已验证「同帧赋值 + animateTo」起点生效）。删除整套过渡态机制：常量 `SORT_OUT_*` / `SORT_IN_*` / `SORT_FRAME_GAP` / `SORT_SKELETON_DURATION`，方法 `playSortExit` / `stageSortEnter` / `finishSwitchImmediately`，字段 `contentScale` / `sortExitBusy` / `sortExitTimer` / `pendingEnter` / `enterTimer`（**排序切换路径已无任何定时器**；快速连点由新的 `animateTo` 自然接管，Spring 从当前值续播，不再需要"收口"逻辑）。未命中缓存仍走「骨架屏轻淡入（`SORT_SKELETON_FADE=150`）→ 网络返回滑入」；`refreshSilently` 的转场窗口守卫改用时间戳 `sortAnimUntil`（= 起滑时刻 + 320ms）。构建 `BUILD SUCCESSFUL`（26s） |
+| 2026-09-12 | 追加·**排序切换转场三次定稿 = 复刻首页「两页连着」**（真机反馈「现在变回之前那种生硬感，我希望左右滑动切换动画，有种两个界面仿佛连着的感觉，那种顺滑感」）：第 ③ 版"只有新页滑入"被判生硬，根因是**旧页不在场**（被瞬间替换）—— 屏幕上只是"一块内容换成另一块"，没有两页相接的连续移动。回读首页生产代码 `Index.switchTab`（348-379 行）确认其本质：`prevTab` 让旧页继续留在树上渲染，**同一个 `animateTo` 里新页 `inOffset` +100%→0、旧页 `outOffset` 0→-100%**，两页对向平移整屏、320ms `springMotion(0.72,0.86)`，420ms 定时器收口卸载旧页（`tabOffset()` 按 `selectedTab` 取 in/out，`tabLayer()` 令进场页盖在退场页之上）。本页只有一个列表、数据在切换时被整体替换，旧内容无处可寻，故新增「旧页快照」机制：常量 `SORT_ANIM_DURATION=320` / `SORT_ANIM_SETTLE=420` / `THREAD_SCROLL_SNAPSHOT_ID`；字段 `@State inOffset` / `@State outOffset` / `@State exitSnapshot: image.PixelMap \| null` / `sortSettleTimer`；方法 `captureExitSnapshot()`（`componentSnapshot.getSync` **同步**截图 —— 异步版赶不上"页内快照同步命中"的同一帧，旧页中途冒出比不做更糟；失败 catch 降级 null = 只有新页滑入）/ `clearSortSettle()` / `scheduleSortSettle()`。`selectSort` 顺序：收口上一次 → **同步截图**（必须在数据替换前）→ 记方向 → 加载；`applySortDisplay` 起点态 `inOffset = dir*100 / outOffset = 0` 后同帧 `animateTo`（`inOffset = 0 / outOffset = -dir*100`）。渲染层：`.id()` + `.translate({x: inOffset%})` 挂到 **Scroll**（新页整层），其前插一层 `Image(exitSnapshot).translate({x: outOffset%})`（旧页，`hitTestBehavior(None)`）；顶栏 / 底栏槽位不参与位移（同首页）。未命中缓存时收口 + 骨架屏淡入，网络返回再对向平移。构建 `BUILD SUCCESSFUL`（26s） |
+| 2026-09-12 | 追加·**过场作用域收窄到列表区 —— 吧头 / 顶栏 / 底栏静止**（用户反馈「吧主页切换动画顶部吧信息能否不跟着切换」，确认按方案 A 实施）：位移原挂在 `Scroll` 上，而吧头（吧名 / 头像 / 关注签到）是 `Scroll` 内容里的普通子项 → 吧头被一起带着滑；首页切 Tab 时标题栏与底栏静止，两者观感不一致。改动五处：① 新页 `.translate` 从 `Scroll` 下移到 `Scroll` 内的**列表区**那一层（内容 / 骨架屏 / 空态 / 错误那个 `Stack`），吧头与兜底路径 `SortTabsBuilder` 不参与位移（槽位路径底部排序栏本就在 `Scroll` 之外）；② 旧页快照改用 `SnapshotOptions.region`（**单位 px**，API 15+，本机 SDK `componentSnapshot.d.ts` 已确认 `SnapshotRegion{left,right,top,bottom}` 均为 px）裁掉吧头，边界 y = `THREAD_LIST_HEADER_TOP_SPACE(90) + headerBlockH − listScroller.currentOffset().yOffset`（即吧头块底边在 `Scroll` 视口里的位置），存入新 `@State exitClipTop`，旧页 `Image` 再 `.translate({ y: exitClipTop })` 下移 + `.height(Math.max(0, viewportH − exitClipTop))` 收窄，与只含列表区的新页严格对齐；③ 新增测量：吧头块 `Column`（吧头 + 兜底排序栏）挂 `onAreaChange` 回填 `headerBlockH`（普通字段，避免测量触发重建）、`onViewportAreaChange` 增记 `viewportW`（region 需要）；④ 顶栏占位 `Column().height(90)` 改用新常量 `THREAD_LIST_HEADER_TOP_SPACE = 90`，与裁剪公式同源；⑤ `clearSortSettle` / `scheduleSortSettle` 收口时一并复位 `exitClipTop = 0`。**两档降级**：吧头已滚出屏幕上方（`clipTop ≤ 0`）或吧头高 / 视口宽高未测到 → 不裁，整屏即列表内容，行为与调整前一致。只做水平位移、垂直位置不动，故列表区不会与静止的吧头几何重叠。构建 `BUILD SUCCESSFUL`（25s，release 签名版）；真机观感待复核 |
+| 2026-09-12 | 第十九处迁移·**帖子详细页「跳转官方贴吧」确认浮层 → 系统 `CustomDialog`**（用户要求「帖子详细页的跳转官方帖子改沉浸光感」）：`ThreadDetail.ets` 原 `@Builder JumpConfirmDialog()` 是页面 body 顶层自绘浮层、卡上挂着 `.systemMaterial(ImmMaterial.control())` —— 按 §1.2 该位置材质**必然 out of scope**，实际只有自绘 `backgroundEffect` 真模糊生效，属"能编译不生效"残留。照 §4 模板三步改：① 顶层新增 `@CustomDialog struct JumpTiebaDialogCard`（标题 / 说明 / 链接预览 / 确定 + 取消竖排全宽钮，卡内文案与几何逐项照搬；删掉卡上 `backgroundColor` / `backgroundEffect` / `border` / `shadow`×2 / `systemMaterial` 五项，改由材质接管）；② 宿主新增 `jumpDialogController`（`width: this.dialogCardWidth()` = 屏宽 − 48、`cornerRadius: 32`、`maskColor: '#06000000'`、`alignment: DialogAlignment.Center`、开合动画 220/200ms、`systemMaterial: ImmMaterial.dialog()`、`onWillDismiss → closeJumpDialog()` 一并覆盖点遮罩 / 返回键 / 侧滑、`customStyle: false`），`showJumpDialog` 改 `@State @Watch('onShowJumpChanged')` 桥接（既有 `this.showJumpDialog = x` 调用点零改动）；③ `openJumpDialog()` 打开前写 `jumpUrlPreview` 链接快照（`threadWebUrl()` 是宿主方法，不能进弹窗），删掉 `DetailRoot` 里的浮层挂载与旧 builder（−86 行）。按钮按 §6.2 挂材质：主钮 `ImmMaterial.accent()` + `#CC3173FF` + 同色浮起阴影，次钮 `ImmMaterial.cardAction()` + 半透明底 + 中性轻投影（底色必须带透明度，坑 11）。本页此前无任何系统弹窗，故一并补 `import { display }`（`@kit.ArkUI`）与 `dialogCardWidth()`（与 `ThreadList` / `Favorite` 同源实现）。文档同步：新增 §6.15、§9.1 清单加第 15 行、§9.2 补 `ThreadDetail` 排查结论（同页 `LinkConfirmDialog` 同款待办）。构建 `BUILD SUCCESSFUL`（24s） |
+| 2026-09-12 | 落点二次 + 三次调整·**帖子详细页「跳转官方贴吧」弹窗位置**：初版按"改造前就是屏幕居中卡片"取 `alignment: DialogAlignment.Center`；用户要求「位置与首页置顶弹窗一致」→ 改为工程同款确认卡片统一口径 **`DialogAlignment.Bottom` + `offset.dy = -110`**（与 `Favorite.pinConfirmController` 置顶确认 §6.4 / `deleteConfirmController` 批量删除 §6.5、`ForumsTab` 一键签到 §6.1 / 关注吧长按菜单 §6.3 同一落点）；用户随后反馈 **-110 时弹窗与「正序」胶囊贴在一起** → 先抬到安全值 `-170`（钮体上方 28vp），**用户复看后指定收到 `offset: { dx: 0, dy: -140 }`（最终值，钮体上方 2vp，紧贴不压字）**（本页底部两层：评论悬浮岛距底 30~96、排序胶囊行距底 96~142、钮体本体 104~138）。**该页从此不再与收藏 / 进吧页同落点**，其余参数（`width: dialogCardWidth()` / 圆角 32 / 遮罩 #06000000 / 220、200ms 开合动画 / `systemMaterial: ImmMaterial.dialog()`）不变。结论已回写 §4.3 落点口径：**同款卡片的 `dy` 不是全局常量，须按宿主底部实际占位（悬浮栏 / 排序行 / 输入条）逐页推算**。构建 `BUILD SUCCESSFUL`（24s） |
 
 

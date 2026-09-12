@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { curves } from '@kit.ArkUI';
+import { curves, display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
@@ -302,6 +302,109 @@ struct AvatarImage {
   }
 }
 
+/**
+ * 跳转官方贴吧确认弹窗（系统 CustomDialog + API 26 沉浸光感）。
+ *
+ * 原为「页面 body 顶层 Stack 自绘浮层」（宿主 @Builder JumpConfirmDialog）→ 换成系统 CustomDialog。
+ * 依据（工程文档 §1.2 / §8）：官方沉浸材质生效范围只有**系统弹窗（CustomDialog）/ 半模态 / Navigation
+ * 标题栏 / 底部 Tabs 槽位**，页面 body 内的自绘浮层挂 systemMaterial 必然判
+ * `Material inactive: out of scope` —— 改造前卡上那行 `.systemMaterial(ImmMaterial.control())` 一直在空转，
+ * 真正起作用的只有自绘 `backgroundEffect` 真模糊（比官方材质低一档的观感）。
+ *
+ * 几何与内容对齐（§4.3 对齐表，逐项与改造前一致）：
+ * - 宽度 `calc(100% - 48vp)` → `options.width` 数值 vp（宿主 dialogCardWidth()）；
+ *   圆角 32vp、遮罩 #06000000、居中锚点（改造前本就是屏幕居中卡片）；
+ *   标题 / 说明 / 链接预览 / 两枚按钮的字号、尺寸、间距全部原样保留（按钮仍是竖排全宽）。
+ * - 卡内不再自绘 backgroundColor / backgroundEffect / border / shadow / systemMaterial 五项（材质会接管）。
+ * - 两枚按钮挂材质 + 半透明底 + 轻投影，与收藏页确认弹窗、进吧页一键签到弹窗同源（文档 §6.2）；
+ *   底色必须带透明度，不透明底会完全盖掉材质滤镜（坑 11）。
+ *
+ * 数据传递：链接预览走 @Link 快照 —— `threadWebUrl()` 是宿主方法，弹窗内取不到。
+ */
+@CustomDialog
+struct JumpTiebaDialogCard {
+  /** 系统弹窗必须声明 CustomDialogController 类型属性（ArkTS 编译期强校验，§3.3） */
+  controller?: CustomDialogController;
+  @Link isDark: boolean;
+  @Link fontScale: number;
+  /** 目标链接预览（宿主在打开前算好并写入） */
+  @Link targetUrl: string;
+  /** 确定：拉起官方贴吧（业务全在宿主 confirmJump，弹窗只负责回调） */
+  onConfirm: () => void = () => {};
+  /** 取消 / 点遮罩 / 返回键（同源，宿主 onWillDismiss 与取消钮共用） */
+  onDismiss: () => void = () => {};
+
+  build() {
+    Column() {
+      // 标题 + 说明 + 目标链接预览
+      Column({ space: 6 }) {
+        Text('跳转到官方贴吧')
+          .fontSize(fs(17, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary(this.isDark))
+          .textAlign(TextAlign.Center)
+        Text('将在官方贴吧中打开本帖（仅携带帖子 ID，不含登录信息）')
+          .fontSize(fs(13, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .lineHeight(fs(18, this.fontScale))
+          .textAlign(TextAlign.Center)
+        Text(this.targetUrl)
+          .fontSize(fs(12, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .textAlign(TextAlign.Center)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.lg, bottom: Spacing.md })
+
+      // 确定 / 取消（竖排全宽，与改造前逐项一致）
+      Column({ space: Spacing.sm }) {
+        Button() {
+          Text('确定')
+            .fontSize(fs(15, this.fontScale))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Color.White)
+        }
+        .width('100%')
+        .height(44)
+        // 品牌蓝主按钮：材质 + 半透明底 + 同色浮起阴影（与收藏页确认弹窗主按钮同源）
+        .systemMaterial(ImmMaterial.accent(this.isDark))
+        .backgroundColor('#CC3173FF')
+        .borderRadius(Radius.full)
+        .shadow({
+          radius: 14,
+          color: this.isDark ? '#663173FF' : '#4D3173FF',
+          offsetY: 4
+        })
+        .accessibilityText('确认跳转官方贴吧')
+        .onClick(() => { this.onConfirm(); })
+
+        Button() {
+          Text('取消')
+            .fontSize(fs(15, this.fontScale))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.textPrimary(this.isDark))
+        }
+        .width('100%')
+        .height(44)
+        // 次按钮：材质 + 半透明底 + 中性轻投影（底色不透明会盖掉材质）
+        .systemMaterial(ImmMaterial.cardAction())
+        .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
+        .borderRadius(Radius.full)
+        .shadow({ radius: 10, color: this.isDark ? '#4D000000' : '#1F101824', offsetY: 3 })
+        .accessibilityText('取消跳转')
+        .onClick(() => { this.onDismiss(); })
+      }
+      .width('100%')
+      .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
+    }
+    .width('100%')
+    .padding({ top: Spacing.md })
+  }
+}
+
 @Entry
 @Component
 struct ThreadDetail {
@@ -362,8 +465,15 @@ struct ThreadDetail {
   }
   @State pendingLinkUrl: string = '';
   @State showLinkDialog: boolean = false;
-  // 跳转官方贴吧确认弹窗
-  @State showJumpDialog: boolean = false;
+  /**
+   * 跳转官方贴吧确认弹窗显隐（系统 CustomDialog + API 26 沉浸光感）。
+   * 宿主已由「页面 body 内自绘 Stack 浮层」换成系统 CustomDialog —— 官方材质只认系统弹窗类宿主，
+   * 自绘浮层挂 systemMaterial 必然判 out of scope（工程文档 §1.2 / §8）。
+   * 保留单一布尔状态，真正 open/close 由 @Watch 驱动，既有 `this.showJumpDialog = x` 调用点零改动。
+   */
+  @State @Watch('onShowJumpChanged') showJumpDialog: boolean = false;
+  /** 弹窗内的链接预览快照（`threadWebUrl()` 是宿主方法，不能进 @CustomDialog，§6.3） */
+  @State jumpUrlPreview: string = '';
   @State focusInput: boolean = false;
   @State forumName: string = '';
   @State forumId: string = '';
@@ -955,10 +1065,8 @@ struct ThreadDetail {
       if (this.showLinkDialog) {
         this.LinkConfirmDialog()
       }
-      // 跳转官方贴吧确认浮层（同款卡片，确定/取消两枚按钮）
-      if (this.showJumpDialog) {
-        this.JumpConfirmDialog()
-      }
+      // 跳转官方贴吧确认弹窗已迁到系统 CustomDialog（见宿主 jumpDialogController / JumpTiebaDialogCard）：
+      // 原自绘浮层挂在页面 body 内，systemMaterial 必然判 out of scope，只有系统弹窗宿主才吃官方沉浸材质
     }
     .width('100%')
     .height('100%')
@@ -1011,6 +1119,23 @@ struct ThreadDetail {
   /** 官方悬浮岛总高（vp）：仅包裹评论条(66)；排序切换行已移出为独立悬浮胶囊层 */
   private dockPillHeight(): number {
     return 66;
+  }
+
+  /**
+   * 排序壳宽（vp，A 方案）：壳只占「两枚胶囊这一列」，不再开全宽。
+   * 依据：TabBar 页签节点的命中区恒等于自身矩形，壳全宽时该节点横跨整行，空区照样吞走竖向滑动手势
+   * （该节点是系统内部节点，`hitTestBehavior` 挂不到它身上，B 方案已实测无效）；与 ThreadList 的
+   * `THREAD_LIST_FAB_SHELL_WIDTH`(84) 同一套做法，区别只在那边是两枚定宽 56 圆钮（28+56），
+   * 这边两枚胶囊宽度随字号自适应，故按字号实时推算。
+   * 推导（胶囊几何一字未动，只累加它们实际占宽）：
+   *   64 = 两枚胶囊左右 padding 4×14 + 钮间 space 8；
+   *   6 × fs(12, fontScale) = 文字宽（正序/倒序 2 字 + 只看楼主/只看全部 4 字，汉字宽 ≈ 字号）；
+   *   +12 为字重切换（Medium/Regular）与字体度量的余量 —— 宁宽不挤：壳偏宽只多几 vp 死区，
+   *   偏窄会让 Tabs 压缩/裁掉胶囊文字。
+   * 结果：标准字号 148、极大字号(1.35) 172，仍远小于全宽，该行两侧余下大片可滑动区。
+   */
+  private sortPillShellWidth(): number {
+    return 64 + 6 * fs(12, this.fontScale) + 12;
   }
 
   /** API26+ 悬浮玻璃路径：真实 Tabs 单内容承载页叠层，底部 Dock 放入 .tabBar() 槽位
@@ -1077,39 +1202,63 @@ struct ThreadDetail {
    * 依据：官方 A 档「按钮与选择类」只有 Slider / Toggle / Select，Button / Chip / SegmentButton 全属 B 档，
    * 仅在 Navigation 标题栏与 Tabs(barPosition: End) 底部 TabBar 内生效（官方文档 §4.1/§4.2）；
    * 而这两枚胶囊悬浮在页面中部，原写法必判 Material inactive: out of scope。
-   * 关键两点：
+   * 关键三点：
    * ① TabContent 留空（内容区高度 = 壳高 46 - barHeight 46 = 0），壳里实际只有 tabBar 一行；
    * ② 不传 .barFloatingStyle(...) —— 官方悬浮背板整体不生成，不会凭空多出一条玻璃底
-   *    （Index.ets 收藏编辑态已验证「不传 floating style 即彻底移除官方背板」）。
+   *    （Index.ets 收藏编辑态已验证「不传 floating style 即彻底移除官方背板」）；
+   * ③ **壳宽收窄成「两枚胶囊这一列」**（A 方案，宽度见 sortPillShellWidth）：页签节点的命中区
+   *    恒等于壳矩形，壳开全宽时该节点横跨整行、空区照样吞掉竖向滑动（该节点是系统内部节点，
+   *    hitTestBehavior 挂不到它身上，B 方案已在 ThreadList 实测无效）；收窄后死区与两枚胶囊重合，
+   *    该行两侧恢复可滑动。
    * 几何：壳高 = barHeight = 46；底距 = 岛底余量(30) + 岛高(66) —— 与改造前 SortRowOverlay 的
-   * margin-bottom 逐项相同，故胶囊行位置/大小/间距一行未改，只是玻璃来源换成官方材质。
+   * margin-bottom 逐项相同；壳宽收窄后由外层全宽 Row 用 padding-left 32 钉回改造前的左缘，
+   * 故两枚胶囊的位置/大小/间距一行未改，只是玻璃来源换成官方材质、壳不再横跨整行。
    */
   @Builder
   SortPillShell() {
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent()
-        .tabBar(this.SortRowInSlot())
+    // 外层全宽 Row 只负责「定位」：Stack(alignContent: Bottom) 会把收窄后的壳水平居中，且靠 margin
+    // 拉不回左缘（Stack 居中是按含 margin 的外框算的），故垫一层全宽 Row，用 justifyContent(Start)
+    // + padding-left 32 把壳钉回改造前的左缘。
+    // 32 的来路：改造前 SortRowInSlot 的 Row 宽 = 屏宽 - 64vp、由撑满壳宽的 Column 水平居中
+    // → 左缘 = (屏宽 - (屏宽 - 64)) / 2 = 32，与悬浮岛内评论条左缘（岛左缘 24 + 岛内 padding 8）同一条竖线。
+    // Row 与壳都挂 hitTestBehavior(None)：自身不参与触摸测试，子节点（两枚胶囊）与兄弟节点照常
+    // （与 ThreadList FabSlotShell 的同名处理一致）。
+    Row() {
+      Tabs({ barPosition: BarPosition.End }) {
+        TabContent()
+          .tabBar(this.SortRowInSlot())
+      }
+      .width(this.sortPillShellWidth())
+      .height(THREAD_DETAIL_SORT_ROW_HEIGHT)
+      .vertical(false)
+      .scrollable(false)
+      // 不挂 barOverlap：官方说明 barOverlap(true) 会把底栏默认模糊触发为 BlurStyle.COMPONENT_THICK，
+      // 残留的模糊背板/阴影会投在胶囊下方（真机可见一条全宽渐变带 + 细线）；本壳 TabContent 为空、
+      // 内容区高度恒 0，barOverlap 无任何布局作用，纯负资产。底栏岛壳 ImmersiveDockShell 内容要延伸
+      // 到悬浮岛之下才需要 barOverlap，且有 barFloatingStyle 重构整条 bar，故不受影响。
+      .barHeight(THREAD_DETAIL_SORT_ROW_HEIGHT)
+      .barBackgroundColor(Color.Transparent)
+      // 去掉底栏默认模糊背板：barBackgroundBlurStyle 默认值是 BlurStyle.COMPONENT_REGULAR，
+      // 不显式关掉时即使 barBackgroundColor 透明，槽内仍会渲染一条磨砂板遮挡内容。
+      .barBackgroundBlurStyle(BlurStyle.NONE)
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      .hitTestBehavior(HitTestMode.None)
     }
     .width('100%')
     .height(THREAD_DETAIL_SORT_ROW_HEIGHT)
-    .vertical(false)
-    .scrollable(false)
-    // 不挂 barOverlap：官方说明 barOverlap(true) 会把底栏默认模糊触发为 BlurStyle.COMPONENT_THICK，
-    // 残留的模糊背板/阴影会投在胶囊下方（真机可见一条全宽渐变带 + 细线）；本壳 TabContent 为空、
-    // 内容区高度恒 0，barOverlap 无任何布局作用，纯负资产。底栏岛壳 ImmersiveDockShell 内容要延伸
-    // 到悬浮岛之下才需要 barOverlap，且有 barFloatingStyle 重构整条 bar，故不受影响。
-    .barHeight(THREAD_DETAIL_SORT_ROW_HEIGHT)
-    .barBackgroundColor(Color.Transparent)
-    // 去掉底栏默认模糊背板：barBackgroundBlurStyle 默认值是 BlurStyle.COMPONENT_REGULAR，
-    // 不显式关掉时即使 barBackgroundColor 透明，槽内仍会渲染一条磨砂板遮挡内容。
-    .barBackgroundBlurStyle(BlurStyle.NONE)
-    .backgroundColor(Color.Transparent)
-    .clip(false)
+    .justifyContent(FlexAlign.Start)
+    .padding({ left: 32 })
+    .hitTestBehavior(HitTestMode.None)
+    // 底距沿用原壳上的 margin（岛底余量 30 + 岛高 66），margin 已移交外层 Row，壳自身不再设
     .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight() })
   }
 
-  /** 排序行（官方槽位版）：外层 Column 撑满壳宽使内层 Row 水平居中，几何与 SortRowOverlay 内
-   *  ReplyControls 完全一致（宽 = 屏宽 - 64vp、space 8、padding top4/bottom8、两钮靠左排列） */
+  /** 排序行（官方槽位版）：外层 Column 撑满壳宽，内层 Row 塞满 Column，几何与 SortRowOverlay 内
+   *  ReplyControls 逐项一致（space 8、padding top4/bottom8、两钮靠左排列）。
+   *  行宽跟随壳宽（'100%'）而非写死「屏宽 - 64vp」：A 方案把壳宽收窄成两枚胶囊这一列后，
+   *  若行仍按屏宽算宽度会溢出壳，且 100% 的参照物已从「屏宽」变成「壳宽」，必须同步改。
+   *  左缘 32 由 SortPillShell 外层 Row 的 padding-left 承担，本行不再负责定位。 */
   @Builder
   SortRowInSlot() {
     Column() {
@@ -1123,7 +1272,7 @@ struct ThreadDetail {
           this.loadDetail();
         })
       }
-      .width('calc(100% - 64vp)')
+      .width('100%')
       .padding({ top: 4, bottom: 8 })
       .justifyContent(FlexAlign.Start)
     }
@@ -2563,11 +2712,71 @@ struct ThreadDetail {
     return `https://wapp.baidu.com/p/${this.tid}`;
   }
 
+  /**
+   * 弹窗卡片宽度（vp）= 屏幕宽 - 48vp，等价于改造前自绘浮层的 `calc(100% - 48vp)`。
+   * ArkTS 的 Dimension 只接受数值 / 百分比 / 资源，不接受 calc 字符串，故换算成数值。
+   * 取屏幕宽（display）而非窗口宽：弹窗容器宽度本身还受系统上限（默认 400vp）约束，
+   * 分屏 / 折叠态由该上限兜底（与 ThreadList / Favorite 同源实现）。
+   */
+  private dialogCardWidth(): number {
+    const info: display.Display = display.getDefaultDisplaySync();
+    const widthVp: number = info.width / info.densityPixels;
+    return Math.max(200, widthVp - 48);
+  }
+
+  /**
+   * 跳转官方贴吧确认弹窗（系统 CustomDialog + API 26 沉浸光感）。
+   * 取自工程内同款确认卡片的口径（§4.3 / §6.4）：宽度 dialogCardWidth()、圆角 32、
+   * 遮罩 #06000000、底部锚点、开合动画 220/200ms；玻璃层交给 options.systemMaterial
+   * （ImmMaterial.dialog()）。
+   * **上移量不是收藏 / 进吧页的 110 而是 140** —— 本页底部比它们多叠了一层「排序胶囊行」，
+   * 110 会正好压在「正序 / 只看全部」两枚胶囊上（推导见下方 offset 注释）。
+   * onWillDismiss 承接「点遮罩 / 返回键 / 侧滑」→ 与取消钮共用 closeJumpDialog（§4.5）。
+   */
+  private jumpDialogController: CustomDialogController = new CustomDialogController({
+    builder: JumpTiebaDialogCard({
+      isDark: $isDark,
+      fontScale: $fontScale,
+      targetUrl: $jumpUrlPreview,
+      onConfirm: () => { this.confirmJump(); },
+      onDismiss: () => { this.closeJumpDialog(); }
+    }),
+    autoCancel: true,
+    // 底部锚点 + 上移 140vp（用户指定值）。本页底部比收藏页多叠一层，不能套收藏页的 -110：
+    //   评论悬浮岛：底距 30 + 高 66 → 占「距底 30~96」；
+    //   排序胶囊行：底距 96 + 高 46 → 占「距底 96~142」，行内 padding top4/bottom8 托着
+    //   高 34 的钮体 → 钮体本体占「距底 104~138」。
+    // 140 时弹窗底边落在钮体顶边(138)之上 2vp —— 刚好擦过胶囊行上沿、不盖住两枚胶囊文字。
+    // ⚠️ 无特殊要求勿改回 -110（会实压在排序胶囊上），勿改回居中。
+    alignment: DialogAlignment.Bottom,
+    offset: { dx: 0, dy: -140 },
+    maskColor: '#06000000',
+    cornerRadius: 32,
+    width: this.dialogCardWidth(),
+    customStyle: false,
+    systemMaterial: ImmMaterial.dialog(),
+    openAnimation: { duration: 220, curve: Curve.EaseOut },
+    closeAnimation: { duration: 200, curve: Curve.EaseInOut },
+    // 点遮罩 / 返回键统一走 closeJumpDialog（与自绘浮层时期「点蒙层关闭」语义一致）
+    onWillDismiss: () => { this.closeJumpDialog(); }
+  });
+
+  /** showJumpDialog 变化即驱动系统弹窗 open/close（既有 `this.showJumpDialog = x` 调用点零改动） */
+  onShowJumpChanged(): void {
+    if (this.showJumpDialog) {
+      this.jumpDialogController.open();
+    } else {
+      this.jumpDialogController.close();
+    }
+  }
+
   private openJumpDialog(): void {
     if (this.tid.length === 0) {
       this.getUIContext().getPromptAction().showToast({ message: '帖子信息暂不可用' });
       return;
     }
+    // 打开前算好链接预览快照（弹窗内取不到宿主方法 threadWebUrl）
+    this.jumpUrlPreview = this.threadWebUrl();
     this.showJumpDialog = true;
   }
 
@@ -2864,92 +3073,6 @@ struct ThreadDetail {
     ))
   }
 
-  // 跳转官方贴吧确认：暗蒙层 + 沉浸光感磨砂玻璃居中卡片 + 确定/取消两枚按钮（与链接确认弹窗同款）
-  @Builder
-  JumpConfirmDialog() {
-    Stack() {
-      // 暗色蒙层，点击外部关闭
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor('#06000000')
-        .onClick(() => { this.closeJumpDialog(); })
-        .transition(TransitionEffect.opacity(0).animation({ duration: 180, curve: Curve.EaseOut }))
-
-      Column() {
-        // 标题 + 说明 + 目标链接预览
-        Column({ space: 6 }) {
-          Text('跳转到官方贴吧')
-            .fontSize(fs(17, this.fontScale))
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Theme.textPrimary(this.isDark))
-            .textAlign(TextAlign.Center)
-          Text('将在官方贴吧中打开本帖（仅携带帖子 ID，不含登录信息）')
-            .fontSize(fs(13, this.fontScale))
-            .fontColor(Theme.textSecondary(this.isDark))
-            .lineHeight(fs(18, this.fontScale))
-            .textAlign(TextAlign.Center)
-          Text(this.threadWebUrl())
-            .fontSize(fs(12, this.fontScale))
-            .fontColor(Theme.textSecondary(this.isDark))
-            .textAlign(TextAlign.Center)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-        .width('100%')
-        .alignItems(HorizontalAlign.Center)
-        .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.lg, bottom: Spacing.md })
-
-        // 确定 / 取消
-        Column({ space: Spacing.sm }) {
-          Button() {
-            Text('确定')
-              .fontSize(fs(15, this.fontScale))
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Color.White)
-          }
-          .width('100%')
-          .height(44)
-          .backgroundColor(Theme.brand())
-          .borderRadius(Radius.full)
-          .accessibilityText('确认跳转官方贴吧')
-          .onClick(() => { this.confirmJump(); })
-
-          Button() {
-            Text('取消')
-              .fontSize(fs(15, this.fontScale))
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Theme.textPrimary(this.isDark))
-          }
-          .width('100%')
-          .height(44)
-          .backgroundColor(Theme.bgCard(this.isDark))
-          .borderRadius(Radius.full)
-          .accessibilityText('取消跳转')
-          .onClick(() => { this.closeJumpDialog(); })
-        }
-        .width('100%')
-        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
-      }
-      .width('calc(100% - 48vp)')
-      .padding({ top: Spacing.md })
-      .backgroundColor(Theme.sheetBg(this.isDark))
-      .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.control())
-      .systemMaterial(ImmMaterial.control())
-      .borderRadius(32)
-      .border({ width: { top: 1.5 }, color: Theme.sheetTopGlow(this.isDark) })
-      .shadow({ radius: 48, color: '#3D000000', offsetY: 18 })
-      // 弹出动画与项目其它居中确认卡一致：缩放 + 上移 + 淡入
-      .transition(TransitionEffect.scale({ x: 0.92, y: 0.92 }).combine(TransitionEffect.translate({ y: 24 })).combine(TransitionEffect.opacity(0)).animation({ duration: 220, curve: Curve.EaseOut }))
-    }
-    .width('100%')
-    .height('100%')
-    .zIndex(100)
-    .transition(TransitionEffect.asymmetric(
-      TransitionEffect.IDENTITY,
-      TransitionEffect.opacity(0).animation({ duration: 200, curve: Curve.EaseInOut })
-    ))
-  }
 
   /** 底部评论输入条外壳：inIsland=true（官方悬浮岛路径）外壳透明，胶囊与官方材质由悬浮条本体承担；
    *  inIsland=false（旧叠放路径）保留整条玻璃大胶囊兜底。内部内容两路径共用 CommentBarBody。 */

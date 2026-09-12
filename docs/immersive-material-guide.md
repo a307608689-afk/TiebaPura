@@ -101,10 +101,12 @@ export class MaterialManager {
 | `control()` | ULTRA_THIN | true | 顶栏 44×44 圆形控制钮（返回/搜索/更多） |
 | `bar()` | ULTRA_THIN | false | 容器栏；`colorInvert: true`（底色反相适配亮/暗） |
 | `floatingBar()` | THIN | false | **悬浮玻璃胶囊专用**：原生 `barFloatingStyle` 的 `systemMaterial` |
+| `floatingBarFlat()` | THIN | false | 同 `floatingBar`，仅 `applyShadow: false`（无材质投影）：用于**页面元素自己挂 `systemMaterial`** 的悬浮栏（空壳槽位路径，无官方背板托底 → 带阴影版会在栏体四周压出突兀暗晕，如吧主页底部排序栏） |
 | `tab()` | REGULAR | true | 胶囊分段 Tab（未选中） |
 | `tabActive(isDark)` | REGULAR | true | 选中 Tab：深色 `#553173FF` / 亮色 `#383173FF` 品牌赋色 |
 | `cardAction()` | THIN | true | 卡片内操作钮 |
 | `fab()` | THICK | true | FAB 悬浮操作钮，最强模糊 |
+| `fabFlat()` | THIN | true | 槽位 FAB 圆钮（`applyShadow: false` + `colorInvert: true`）：用于与底部悬浮栏**同排**的 FAB，如吧主页右下加号 —— 与同排底栏同档才能一起随背景翻色；钮内图标须用系统语义色（`$r('sys.color.font_primary')`），自绘 hex 不受 `colorInvert` 影响 |
 | `accent(isDark)` | THIN | true | 品牌主按钮：深色 `#663173FF` / 亮色 `#4C3173FF` |
 | `bottomGlow(isDark)` | THICK | false | 底栏选中项高光：`#553173FF` / `#383173FF` |
 | `rowItem()` | REGULAR | true | 列表条目钮 |
@@ -117,7 +119,7 @@ new uiMaterial.ImmersiveMaterial({
   interactive: false,
   lightEffect: { color: undefined },   // 不额外上色，保留玻璃本色
   applyShadow: true,                    // 官方阴影，避免再叠 .shadow
-  colorInvert: true,                    // 仅 bar/floatingBar 用
+  colorInvert: true,                    // 仅 bar / floatingBar / floatingBarFlat / fabFlat 用
 });
 ```
 

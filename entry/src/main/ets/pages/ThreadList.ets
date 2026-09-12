@@ -20,7 +20,8 @@ import { common, Want } from '@kit.AbilityKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
-import { display } from '@kit.ArkUI';
+import { display, curves, componentSnapshot } from '@kit.ArkUI';
+import { image } from '@kit.ImageKit';
 import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { ForumSignStore } from '../service/ForumSignStore';
 import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail } from '../model/DataModel';
@@ -68,14 +69,43 @@ const SEARCH_SCAN_MAX_PAGES: number = 80;
 const SEARCH_AUTO_CONTINUE_MS: number = 120;
 
 /**
- * 排序 tab 切换（命中缓存时的覆盖式转场）：
- * SORT_SWITCH_SLIDE 滑入距离（约 1/3 屏宽量级），使"从对侧进入"的方向感明确；
- * SORT_SWITCH_DURATION 归位时长；SORT_SWITCH_OPACITY 起点透明度，
- * 配合 FastOutSlowIn 形成"浮现 + 阻尼吸附"的观感，替代瞬时的整块替换。
+ * 排序 tab 切换（热门 / 最新 / 精选）——**照搬首页 `Index.switchTab` 的「两页连着」过场**：
+ * 数据就位的那一帧，新内容自对侧整屏（±100%）进入，**旧内容同时向反侧整屏滑出**，二者在同一个
+ * `animateTo`（320ms / `springMotion(0.72, 0.86)`）里对向平移 —— 屏幕上任一瞬间都是"两页相接在移动"，
+ * 这正是首页 5 个 Tab 切页那种"仿佛两个界面连在一起"的顺滑感来源。
+ *
+ * 演进（三次真机反馈，教训都留在这里）：
+ *   ① 单侧滑入 120 / 300ms `FastOutSlowIn` → 起点慢、收尾也慢，被判"生硬"；
+ *   ② 「退场 + 入场」双拍（130ms 反向退场 + 微缩 + 淡到 0.25 + 140vp 入场）→ 被判**"太过度、中间还会卡一下"**：
+ *      过度来自位移幅度与叠在一起的三类变化（位移 / 透明度 / 缩放），卡顿来自两拍之间的等待帧
+ *      （退场播完到入场播放之间内容静止约 160ms）与入场前的强制停帧（24ms）；
+ *   ③ 收缩为"只有新页滑入"的一段式（100vp）→ 被判"变回生硬"：**旧页不动、被瞬间替换掉**，
+ *      本质只是"一块内容换成另一块"，缺少两页相接的连续感；
+ *   ④ 现按首页原样复刻：新页 ±100%、旧页反向 ±100%、同一个 `animateTo` —— **关键在旧页不消失**。
+ *
+ * 「旧页画面」从哪来：首页每页都是常驻组件（`visibility` 隐藏、切页只改位移），所以旧页天然在树上；
+ * 本页只有一个列表、数据在切换那一刻被整体替换，旧内容无处可寻，故在**点击那一刻**
+ * 用 `componentSnapshot.getSync`（同步）截下列表区（旧内容 + 旧滚动位置，吧头由 region 裁掉）存为 PixelMap，
+ * 由一层 `Image` 承载滑出，动画收口后释放。同步截图取的是上一帧已渲染的成品，不阻塞布局、
+ * 不引入等待帧、也不改变任何现有几何。
+ *
+ * 「平移作用域 = 只到列表区，吧头 / 顶栏 / 底栏静止」（2026-09-12 真机反馈后的调整）：
+ *   位移原挂在 Scroll 上，而吧头（吧名 / 头像 / 关注签到）是 Scroll 内容里的普通子项，于是**吧头被一起带着滑**；
+ *   首页切 Tab 时标题栏与底栏都是静止的，只有内容页对向平移 —— 两者观感不一致。现改为：
+ *   ① 新页位移缩到 Scroll 内的「列表区」那一层（内容 / 骨架屏 / 空态 / 错误），吧头与兜底排序栏不参与位移；
+ *   ② 旧页快照用 `SnapshotOptions.region`（单位 px，API 15+）裁掉吧头、只留列表区，快照层再按裁剪量下移到
+ *      列表区位置 —— 屏幕上于是"吧头原地不动、只有下方列表对向平移"，与首页头部固定、内容平移同构；
+ *   ③ 吧头已滚出屏幕上方（或高度尚未测到）时不裁：整屏即列表内容，行为与调整前一致，属自动降级。
+ *   注意：只做水平位移、垂直位置不动，故列表区不会与静止的吧头在几何上重叠。
  */
-const SORT_SWITCH_SLIDE: number = 120;
-const SORT_SWITCH_DURATION: number = 300;
-const SORT_SWITCH_OPACITY: number = 0.6;
+const SORT_ANIM_DURATION: number = 320;     // 对向平移时长（ms）：与首页 Tab 切换同值
+const SORT_ANIM_SETTLE: number = 420;       // 动画收口时刻（≈时长的 1.3 倍）：卸载旧页快照 + 复位位移
+const SORT_SKELETON_FADE: number = 150;     // 未命中缓存时骨架屏淡入时长（ms，不与滑入叠加）
+/** Scroll 首项「顶栏让位」高度 vp：也即吧头块在 Scroll 内容坐标里的顶边。
+ *  渲染层首个占位项必须与本值同源；旧页快照的裁剪边界（= 本值 + 吧头块实测高 − 当前滚动偏移）由它推出。 */
+const THREAD_LIST_HEADER_TOP_SPACE: number = 90;
+/** 内容滚动容器 id：`componentSnapshot` 按它截取旧页（见上方 SORT_ANIM_* 注释） */
+const THREAD_SCROLL_SNAPSHOT_ID: string = 'threadListScrollSnapshot';
 
 /**
  * 吧主页官方槽位开关（§6.10 模板）：true 且设备支持材质时，顶栏整行（返回 / 搜索框 / 搜索钮 / 更多钮）
@@ -86,12 +116,52 @@ const THREAD_LIST_OFFICIAL_TITLE_BAR: boolean = true;
  *  内容让位（Scroll 首项占位 90）一行未改。 */
 const THREAD_LIST_TITLE_BAR_HEIGHT: number = 98;
 /**
- * 悬浮 FAB 官方槽位壳（刷新 / 加号两钮）高度 = 56(刷新) + 12(两钮间距) + 56(加号) = 124，
- * 底距 36 = 改造前加号钮 `margin({ bottom: 36 })`；刷新钮底距即 36 + 56 + 12 = 104，与改造前
- * `margin({ bottom: 104 })` 逐项相同（右缘同为 28）。
+ * 悬浮 FAB 官方槽位壳（**壳内只剩加号一枚**）：刷新钮已于 2026-09-12 按用户要求移除，
+ * 刷新入口改由「重复点击当前排序」承担（见 `refreshByRetap` / SortSegBar 注释），
+ * 故壳高由 124（56 + 12 + 56）回到 **56**。
+ * 底距 30 = 排序底栏底距 —— **加号钮与底部排序栏同排**（底边一条线，高 56 与栏高 56 顶边也一条线），
+ * 故加号钮占 30~86（右缘 24）。
+ * （兜底路径的自绘 FAB 不受影响，仍按改造前的 36 贴底：兜底路径没有底部排序栏，
+ *   加号贴底本就无同排对象，强行对齐无意义。）
  */
-const THREAD_LIST_FAB_SHELL_HEIGHT: number = 124;
-const THREAD_LIST_FAB_SHELL_BOTTOM: number = 36;
+const THREAD_LIST_FAB_SHELL_HEIGHT: number = 56;
+const THREAD_LIST_FAB_SHELL_BOTTOM: number = 30;
+/** 壳宽 = 右缘 24 + 钮宽 56 = 80（A 方案）：壳与页签只占「按钮这一列」。
+ *  依据：TabBar 页签节点的命中区恒等于自身矩形，壳开全宽时该节点横跨整行、空区照样吞走
+ *  竖向滑动手势（`hitTestBehavior` 设不到系统页签节点上，B 方案已实测无效）。
+ *  收窄后死区与加号钮重合，列表其余区域无遮挡。
+ *  右缘由 28 收到 24：同排后与排序底栏左缘 24 左右对称、同一条基准线。 */
+const THREAD_LIST_FAB_SHELL_WIDTH: number = 80;
+
+/**
+ * 吧主页底部排序栏（热门 / 最新 / 精选）官方槽位开关（§6.10 模板）：
+ * true 且设备支持材质时，排序栏从 Scroll 内容区（吧头下方）搬到屏幕底部，做成与首页 / 搜索页
+ * 完全同款的官方沉浸光感悬浮底栏；false 或低版本自动回退到内容区自绘真模糊胶囊（改造前原样）。
+ *
+ * 为什么必须搬家：页面主体（含 Scroll 内元素）挂 `systemMaterial` 必判
+ * `Material inactive: out of scope`，官方沉浸材质只在「Navigation 标题栏 / Tabs(barPosition: End)
+ * 底部 tabBar」两类槽位生效 —— 故整条排序栏做成「只有 tabBar 的真实 Tabs 壳」。
+ * 材质来源：空壳路径**不能**靠 `barFloatingStyle` 生成官方背板（真机已验证不渲染），
+ * 必须由**槽内元素自己挂** `.systemMaterial(ImmMaterial.floatingBarFlat())`（§1.1「自建空 Tabs 壳内的元素」）；
+ * 用**无阴影档**而非 `floatingBar()`：本栏下方没有官方背板托底，带阴影版会在栏体四周压出突兀暗晕。
+ */
+const THREAD_LIST_OFFICIAL_SORT_BAR: boolean = true;
+/** 排序栏高 56 = 右下加号钮直径（两框同排后**高度对齐**，`Radius.full` 收成 28 与加号同圆）；
+ *  栏内只有文字、没有图标，故比首页 / 搜索页底栏（74 = 图标 + 文字）矮 18；
+ *  栏内三枚钮高 = 56 − 上下 padding 5×2 = 46（与加号同排改造前逐项一致，只是外框矮 2） */
+const THREAD_LIST_SORT_BAR_HEIGHT: number = 56;
+/** 排序栏内上下留白：钮高 = 栏高 − 2 × 本值（SortSegBar 的 padding 与 SortSegButton 的高度共用）。
+ *  取 5 而非 6：栏高由 58 收成 56 后，靠留白 6 → 5 把钮高 46 保住，栏内文字块几何零变化。 */
+const THREAD_LIST_SORT_BAR_PADDING: number = 5;
+/** 排序栏底距 30 = 右下加号钮底距（同排对齐的基线，同时与首页底栏 `barBottomMargin` 一致）；
+ *  槽位壳收窄后底距由外层全宽 `Row` 的 margin 承担（壳自身不设 margin，见 SortSlotShell） */
+const THREAD_LIST_SORT_BAR_BOTTOM: number = 30;
+/** 排序栏与加号钮之间的横向缝隙（两框**分离开**、不并成一条）：左 24 | 底栏 | 12 | 加号 | 右 24 */
+const THREAD_LIST_SORT_BAR_GAP: number = 12;
+/** 列表底部让位（槽位路径）：加号钮顶 86（底距 30 + 56）+ 12 呼吸 = 98
+ *  （刷新钮移除后最高点由刷新钮退回加号，故比原值 166 少 68、比更早的 244 少 146，
+ *    列表可视区同步变大）。 */
+const THREAD_LIST_CONTENT_BOTTOM_SPACE: number = 98;
 
 /** 吧列表本地快照（含吧头信息），命中缓存即秒开再后台静默刷新 */
 interface ForumListCache {
@@ -112,6 +182,20 @@ interface SortSession {
 
 /** 排序会话快照保鲜期：期间内切回已看过的排序直接秒开 */
 const SORT_SESSION_TTL: number = 120000;
+
+/**
+ * 排序切换「上屏」数据包：`applySortDisplay` 的统一入参 —— 数据来源（页内快照 / 本地缓存 / 网络）
+ * 不同，但「替换 + 回顶 + 起滑」这套上屏动作完全一致。
+ * `sort` 用于竞态校验：快速连点时丢弃不属于当前排序的迟到数据。
+ */
+interface SortDisplay {
+  sort: number;
+  threads: ThreadItem[];
+  page: number;
+  hasMore: boolean;
+  /** Success / Empty = 直接上屏播入场；Loading = 未命中缓存，落骨架屏等网络 */
+  state: LoadState;
+}
 
 /**
  * 吧主页右上角「更多」操作面板（系统 CustomDialog + API 26 沉浸光感）。
@@ -253,6 +337,11 @@ struct ThreadList {
   // 吧主页预加载：测量值 + 节流/竞态（普通字段，避免高频回调触发 UI 重建）
   private contentH: number = 0;
   private viewportH: number = 0;
+  /** 视口宽（vp）：仅旧页快照的 region 需要（region 四边单位是 px，见 captureExitSnapshot） */
+  private viewportW: number = 0;
+  /** 吧头块实测高（vp）= 吧头（+ 兜底排序栏）那一层，由渲染层 onAreaChange 回填。
+   *  旧页快照的裁剪边界由它推出；未测到（≤ 0）时不裁、自动降级回调整前的整屏裁剪行为 */
+  private headerBlockH: number = 0;
   private lastPrefetchY: number = -10000;
   private loadToken: number = 0;
   @State selectedSort: number = 0;
@@ -272,9 +361,6 @@ struct ThreadList {
   // 吧主页关注/取消关注进行中，防止重复点击
   @State forumFollowBusy: boolean = false;
   @State refreshing: boolean = false;
-  // 刷新旋转角度：由定时器驱动自增，避免依赖 iterations:-1 无限动画（其停止不可靠，会导致图标转不停）
-  @State refreshSpin: number = 0;
-  private refreshTimer: number = -1;
   // 列表滚动控制器：刷新成功后回到顶部，立即看到最新内容
   private listScroller: Scroller = new Scroller();
   // 本吧搜索：服务端搜索优先（/c/s/searchpost，TiebaLite 同款端点），失败降级为本地扫描吧内分页
@@ -310,6 +396,9 @@ struct ThreadList {
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位、FAB 走「空 tabBar 壳」槽位，
    *  否则回退页面主体自绘玻璃（与 ThreadDetail 同判据） */
   @State materialSupported: boolean = false;
+  /** 根容器实宽（vp）：底部排序栏槽位壳的 `barWidth` 只接受数值（Dimension 不收 'calc(100% - 48vp)'，
+   *  同 Search.ets / 本页 dialogCardWidth 的换算口径），由 ThreadListContent 根 Stack 的 onAreaChange 维护 */
+  @State currentWidth: number = 0;
 
   onPageShow(): void {
     this.fontSizeTick++;
@@ -329,12 +418,20 @@ struct ThreadList {
   // 骨架屏→内容交叉淡入淡出（同帖详情方案A）：内容初始透明淡入，骨架屏淡出后由 loadState 切换移除
   @State contentOpacity: number = 0.0;
   @State skeletonOpacity: number = 1.0;
-  // 排序 tab 切换滑入位移：命中缓存的切换，内容层先渲染带方向偏移的一帧再归位，形成水平滑入
-  @State contentShift: number = 0;
-  // 切换方向缓存（±1，0=无方向）：命中缓存才消费做位移；未命中走骨架屏加载不位移
-  private pendingShift: number = 0;
-  // 滑入动画定时器：快速连切 tab 时先清理，避免残留动画与新状态互相干扰
-  private enterTimer: number = -1;
+  // 排序切换过场：新页位移 / 旧页快照位移（百分比，相对各自宽度 = 屏宽），与首页 switchTab 同款
+  @State inOffset: number = 0;
+  @State outOffset: number = 0;
+  // 旧页快照（点击那一刻同步截下的**列表区**内容，吧头已被 region 裁掉）：切换期间由一层 Image 承载滑出，收口后释放
+  @State exitSnapshot: image.PixelMap | null = null;
+  // 旧页快照的顶部裁剪量（vp，点击那一刻算好）：= 吧头块底边在 Scroll 视口里的 y，≥ 0；
+  // 0 = 整屏都是列表内容（吧头已滚出屏 / 吧头高未测到）；> 0 时旧页层下移该距离、高度相应收窄，落在列表区上
+  @State exitClipTop: number = 0;
+  // 本次切换方向（±1；0 = 非排序切换）：位移方向，同时是"是否走排序切换动画"的判据
+  private enterDir: number = 0;
+  // 动画窗口的结束时刻（ms 时间戳）：窗口内静默刷新只回写缓存不上屏，避免"滑到一半内容变了"
+  private sortAnimUntil: number = 0;
+  // 过场收口定时器：动画结束后卸载旧页快照并复位位移（快速连切时先清掉上一个）
+  private sortSettleTimer: number = -1;
   // tab 按压回弹：点击瞬间缩一下再弹回，增强切换按键手感
   @State pressedTab: number = -1;
   private pulseTimer: number = -1;
@@ -552,26 +649,56 @@ struct ThreadList {
     }
   }
 
+  /**
+   * 排序切换入口（热门 / 最新 / 精选）——首页 `switchTab` 同款的「两页对向平移」，见文件头 SORT_ANIM_* 注释。
+   *
+   * ① 收口上一次未播完的过场（快速连切，避免两条动画互相覆盖）→ ② **同步截下当前列表区**作为旧页
+   * （此刻旧内容还完整在场、滚动位置正确，早于此或晚于此都截不到；吧头由 region 裁掉，见
+   * `captureExitSnapshot`）→ ③ 记方向、换排序与分页状态
+   * → ④ 数据侧加载（loadThreads）。数据就位后由 `applySortDisplay` 在同一帧内完成
+   * 「替换 + 回顶 + 摆起点 + 双页对向起滑」，中途不插等待帧、没有第二段动画 ——
+   * 页内快照是同步命中，所以最常走的路径就是"点下去那一帧两页就开始对向平移"。
+   *
+   * 注意：此处**不清空** `this.threads` —— 数据到达前保持旧列表可见，避免闪空；
+   * 若本次未命中缓存，则由 `applySortDisplay` 落骨架屏等网络返回（网络回来才走过场）。
+   */
   private selectSort(sort: number): void {
     if (this.selectedSort === sort) {
+      // 重复点击当前排序 = 刷新该排序（先回顶、再拉第 1 页，见 refreshByRetap）。
+      // 与切排序不同：不动选中态、不播过场动画，只做「回顶 + 刷新」。
+      this.refreshByRetap(sort);
       return;
     }
-    // 若上一次切换的等待帧尚未播放（24ms 内），先清理并复位，避免与新切换叠加
-    if (this.enterTimer !== -1) {
-      clearTimeout(this.enterTimer);
-      this.enterTimer = -1;
-      this.contentShift = 0;
-      this.contentOpacity = 1;
-    }
-    // 记录切换方向：目标 tab 在右侧（索引增大）→ 新列表从右侧滑入，反向则从左侧滑入
-    this.pendingShift = sort > this.selectedSort ? 1 : -1;
+    // ① 收口上一次过场（同时释放上一次的旧页快照）
+    this.clearSortSettle();
+    // ② 旧页快照：同步截取当前屏幕（必须在数据被替换之前）
+    this.captureExitSnapshot();
+    // ③ 方向：目标 tab 在右侧（索引增大）→ 新页自右侧进入、旧页向左滑出，反向则相反
+    this.enterDir = sort > this.selectedSort ? 1 : -1;
     this.selectedSort = sort;
     this.page = 1;
     this.hasMore = true;
     this.stalledPages = 0;
-    // 注意：此处不清空 this.threads——命中缓存时用旧列表兜底到新数据上屏，
-    // 避免清空后异步缓存读取期间渲染出"空列表帧"导致闪烁（未命中时 loadThreads 内再清空换骨架屏）
+    // ④ 数据侧：页内快照 / 本地缓存 / 网络在 loadThreads 内依次尝试（命中快照时同步上屏，见其注释）
     this.loadThreads();
+  }
+
+  /**
+   * 重复点击当前排序（当前已是「热门」再点热门，最新 / 精选同理）：**回到列表顶部 + 重新拉取第 1 页**。
+   * 本页刷新入口自 2026-09-12 起**只此一处**（右下角刷新钮已按用户要求移除），链路即 `handleRefresh()`：
+   * 网络刷新第 1 页、8s 超时兜底、「刷新成功 / 失败」toast、后台昵称校准与缓存回写；
+   * 多出的一步是**先立即回顶**（不等网络返回），让等待期间用户已经看到顶部内容
+   * （handleRefresh 成功后还会再回顶一次，幂等）。
+   * busy（已有刷新在跑）时只回顶、不重复发请求 —— 与 handleRefresh 的 busy 短路口径一致。
+   * 数据侧的附带收益：新列表经 `threads` 的 @Watch（onThreadsChanged）自动回写 `sortSession` 快照，
+   * 切走再切回该排序拿到的已是刷新后的数据。
+   */
+  private refreshByRetap(sort: number): void {
+    console.info(`[SORT] retap cur=${sort} -> scroll top + refresh`);
+    // ① 立即回顶：动画与刷新成功后的回顶保持一致（不阻塞、不等待网络）
+    this.listScroller.scrollTo({ xOffset: 0, yOffset: 0, animation: { duration: 300, curve: Curve.EaseOut } });
+    // ② 复用既有刷新链路（内部自带 busy 短路、超时兜底与 toast 反馈）
+    this.handleRefresh();
   }
 
   /** tab 点击按压脉冲：缩小一下再弹回，提升切换按键手感 */
@@ -1206,29 +1333,133 @@ struct ThreadList {
   }
 
   /**
-   * 排序切换命中缓存：内容层先渲染"带方向偏移"的一帧，下一帧再播放归位滑入动画。
-   * 同时兜底 opacity（若上次淡入尚未完成），避免内容替换后仍处于透明/骨架屏残留状态。
+   * 收口排序过场：清掉收口定时器 → 位移归零 → 释放旧页快照。
+   * 快速连切时先调用（上一次动画可能正跑到一半），复位后再由 `applySortDisplay` 摆新起点。
    */
-  private enterListWithShift(): void {
-    const dir: number = this.pendingShift;
-    this.pendingShift = 0;
-    if (this.enterTimer !== -1) {
-      clearTimeout(this.enterTimer);
-      this.enterTimer = -1;
+  private clearSortSettle(): void {
+    if (this.sortSettleTimer !== -1) {
+      clearTimeout(this.sortSettleTimer);
+      this.sortSettleTimer = -1;
     }
-    // 初始状态：内容位于目标 tab 的对侧（dir=1 向右切换 → 从右侧往左滑入），
-    // 且轻微透明，让"内容浮现 + 平移归位"替代瞬时的整块替换
-    this.contentShift = dir * SORT_SWITCH_SLIDE;
-    this.contentOpacity = SORT_SWITCH_OPACITY;
-    // 先让初始状态的一帧渲染生效，再播放归位动画
-    this.enterTimer = setTimeout(() => {
-      animateTo({ duration: SORT_SWITCH_DURATION, curve: Curve.FastOutSlowIn }, () => {
-        this.contentShift = 0;
-        this.contentOpacity = 1;
-        this.skeletonOpacity = 0;
+    this.inOffset = 0;
+    this.outOffset = 0;
+    this.exitSnapshot = null;
+    this.exitClipTop = 0;
+  }
+
+  /**
+   * 注册过场收口：动画播完后卸载旧页快照并复位位移。
+   * （`animateTo` 无结束回调，与首页 `switchTab` 一样用定时器兜底；时长取动画的约 1.3 倍，
+   *   让弹簧末段的回弹也播完再收，避免旧页被提前抽走。）
+   */
+  private scheduleSortSettle(): void {
+    if (this.sortSettleTimer !== -1) {
+      clearTimeout(this.sortSettleTimer);
+    }
+    this.sortSettleTimer = setTimeout(() => {
+      this.sortSettleTimer = -1;
+      this.inOffset = 0;
+      this.outOffset = 0;
+      this.exitSnapshot = null;
+      this.exitClipTop = 0;
+    }, SORT_ANIM_SETTLE);
+  }
+
+  /**
+   * 截取旧页：把当前屏幕上的**列表区**（旧排序的内容 + 它的滚动位置）同步截成 PixelMap，供过场里滑出的那一层使用。
+   *
+   * 用 `getSync` 是刻意的：异步版要等回调，而页内快照是**同步命中**的 —— 异步截图赶不上同一帧起滑，
+   * 旧页会在动画中途才冒出来（闪一下，比不做更糟）。同步截图取的是上一帧已渲染的成品，
+   * 不触发重新布局、不改动任何几何，耗时在点击这一帧内消化。
+   *
+   * 裁剪（2026-09-12）：位移只作用于列表区、吧头是静止的，若旧页快照仍带着吧头，旧页滑出时吧头会跟着滑。
+   * 故按 `SnapshotOptions.region` 把吧头顶部裁掉 —— 边界 y = 「顶栏让位 + 吧头块高 − 当前滚动偏移」，
+   * 即吧头块底边在 Scroll 视口里的位置；快照层再按同一个值下移，正好落在列表区上（见旧页 Image 层）。
+   * 该值 ≤ 0（吧头已滚出屏幕上方）或吧头高尚未测到 → 不裁，整屏即列表内容，与调整前行为一致。
+   * region 的四个值单位是 **px**（vp2px），且取值必须落在组件矩形内，故对宽高做了保护。
+   *
+   * 失败（组件未就绪 / 平台不支持）时静默降级为 null —— 过场退化成"只有新页滑入"，功能不受影响。
+   */
+  private captureExitSnapshot(): void {
+    // 裁剪边界：吧头块底边在 Scroll 视口里的 y（vp）。吧头高未测到时不裁，避免旧页内容整体错位
+    const listTop: number = THREAD_LIST_HEADER_TOP_SPACE + this.headerBlockH
+      - this.listScroller.currentOffset().yOffset;
+    const clipTop: number = (this.headerBlockH > 0 && this.viewportH > 0)
+      ? Math.max(0, Math.min(listTop, this.viewportH)) : 0;
+    this.exitClipTop = clipTop;
+    try {
+      if (clipTop > 0 && this.viewportW > 0) {
+        const ui = this.getUIContext();
+        // region 四边均为 px，且必须落在 [0, 组件宽/高] 区间内（否则截图报错）
+        const region: componentSnapshot.SnapshotRegion = {
+          left: 0,
+          top: ui.vp2px(clipTop),
+          right: ui.vp2px(this.viewportW),
+          bottom: ui.vp2px(this.viewportH)
+        };
+        const options: componentSnapshot.SnapshotOptions = { region: region };
+        this.exitSnapshot = componentSnapshot.getSync(THREAD_SCROLL_SNAPSHOT_ID, options);
+        console.info(`[SORT] exit snapshot captured clipTop=${clipTop} headerH=${this.headerBlockH}`);
+      } else {
+        // 吧头不在屏内（或尚未测到）：整屏都是列表内容，无需裁剪
+        this.exitSnapshot = componentSnapshot.getSync(THREAD_SCROLL_SNAPSHOT_ID);
+        console.info(`[SORT] exit snapshot captured (full) clipTop=${clipTop} headerH=${this.headerBlockH}`);
+      }
+    } catch (e) {
+      // 截图不可用（组件未就绪 / 平台限制）：降级为"只有新页滑入"，并在日志里留下线索
+      this.exitSnapshot = null;
+      console.warn(`[SORT] exit snapshot failed: ${(e as BusinessError).message ?? e}`);
+    }
+  }
+
+  /**
+   * 排序数据上屏（唯一入口）：**同一帧**完成「替换数据 + 回顶 + 双页对向起滑」。
+   *
+   * 与首页 `switchTab` 逐项同款：新页先无动画摆到对侧（`inOffset = dir * 100`）、旧页快照摆在
+   * 原位（`outOffset = 0`），紧接着在同一个调用栈里 `animateTo` —— 新页归零、旧页跑到反侧，
+   * 两页在同一段时间里对向平移、屏幕上始终相接，这就是"两个界面仿佛连着"的观感来源。
+   * 位移只作用在「列表区」这一层（吧头、顶栏、底栏静止），旧页来自 `captureExitSnapshot`
+   * （点击那一刻的列表区），所以它的内容与滚动位置天然正确。
+   *
+   * 未命中缓存（`state = Loading`）时改落骨架屏：不走双页过场（半透明骨架块与旧页叠映反而脏），
+   * 直接收口过场 + 骨架屏轻淡入，等网络返回再走双页过场。
+   * 换排序 = 换内容集，列表同步无动画回顶（保留旧偏移对新排序没有意义）。
+   */
+  private applySortDisplay(d: SortDisplay): void {
+    // 竞态：数据归属的排序已不是当前排序（快速连点），丢弃
+    if (d.sort !== this.selectedSort) {
+      return;
+    }
+    this.page = d.page;
+    this.hasMore = d.hasMore;
+    if (d.state === LoadState.Loading) {
+      // 未命中缓存：收口过场（旧页不再需要）+ 骨架屏轻淡入，等网络返回再对向平移
+      this.clearSortSettle();
+      this.threads = [];
+      this.loadState = LoadState.Loading;
+      this.contentOpacity = 0;
+      this.getUIContext().animateTo({ duration: SORT_SKELETON_FADE, curve: Curve.EaseOut }, () => {
+        this.skeletonOpacity = 1;
       });
-      this.enterTimer = -1;
-    }, 24);
+      return;
+    }
+    const dir: number = this.enterDir !== 0 ? this.enterDir : 1;
+    this.enterDir = 0;
+    this.threads = d.threads;
+    this.loadState = d.state;
+    this.listScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    // 起点态（无动画赋值）：新页在对侧整屏外、旧页快照留原位待退场 —— 与首页 switchTab 写法一致
+    this.inOffset = dir * 100;
+    this.outOffset = 0;
+    this.contentOpacity = 1;
+    this.sortAnimUntil = Date.now() + SORT_ANIM_SETTLE;
+    this.getUIContext().animateTo({ duration: SORT_ANIM_DURATION, curve: curves.springMotion(0.72, 0.86) }, () => {
+      this.inOffset = 0;
+      this.outOffset = -dir * 100;
+      this.skeletonOpacity = 0;
+    });
+    // 动画收口：卸载旧页快照 + 复位位移（快速连切时会被下一次切换先行清掉）
+    this.scheduleSortSettle();
   }
 
   /**
@@ -1244,14 +1475,18 @@ struct ThreadList {
       // 页内会话快照命中（本次进吧期间刚看过该排序）：0 开销秒开，数据足够新不做后台刷新
       const session = this.sortSession.get(this.selectedSort);
       if (session && session.threads.length > 0 && Date.now() - session.ts < SORT_SESSION_TTL) {
-        this.threads = session.threads;
-        this.page = session.page;
-        this.hasMore = session.hasMore;
         this.stalledPages = 0;
-        this.loadState = LoadState.Success;
-        if (this.pendingShift !== 0) {
-          this.enterListWithShift();
+        if (this.enterDir !== 0) {
+          // 排序切换命中页内快照（快照命中在本 async 函数的第一段、同步执行）：同帧替换 + 起滑
+          this.applySortDisplay({
+            sort: this.selectedSort, threads: session.threads,
+            page: session.page, hasMore: session.hasMore, state: LoadState.Success,
+          });
         } else {
+          this.threads = session.threads;
+          this.page = session.page;
+          this.hasMore = session.hasMore;
+          this.loadState = LoadState.Success;
           // 首次进入/重试且透明度尚未就绪时平滑淡入（已就绪则 fadeInContent 直接落定，无副作用）
           this.fadeInContent(LoadState.Success);
         }
@@ -1261,19 +1496,22 @@ struct ThreadList {
         // 与首页推荐流同构：过期缓存也返回（stale-while-revalidate），保证任何时刻重进该吧都秒开
         const cached = await CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey());
         if (cached && cached.data.threads.length > 0) {
-          this.threads = cached.data.threads;
           if (cached.data.forumInfo) {
             this.forumInfo = cached.data.forumInfo;
           }
           this.hasMore = true;
           this.stalledPages = 0;
-          this.loadState = LoadState.Success;
           // 命中缓存（含过期 TTL）：秒开显示，后台静默刷新保持数据新鲜；刷新失败保留旧内容
           this.refreshSilently();
-          // 排序切换命中缓存：内容从对应方向水平滑入；首次进入无切换方向则按原淡入逻辑
-          if (this.pendingShift !== 0) {
-            this.enterListWithShift();
+          if (this.enterDir !== 0) {
+            // 排序切换命中本地缓存：同帧替换 + 起滑（与首页 Tab 切换同一形态）
+            this.applySortDisplay({
+              sort: this.selectedSort, threads: cached.data.threads,
+              page: this.page, hasMore: true, state: LoadState.Success,
+            });
           } else {
+            this.threads = cached.data.threads;
+            this.loadState = LoadState.Success;
             // 内容淡入（首次进入时 contentOpacity=0 → 平滑淡入）
             this.fadeInContent(LoadState.Success);
           }
@@ -1285,28 +1523,41 @@ struct ThreadList {
         // 缓存读取失败则走正常网络加载
       }
     }
-    this.loadState = LoadState.Loading;
-    // 排序切换且未命中缓存：旧列表让位给骨架屏（首次进入/重试时列表本就为空）
-    if (this.pendingShift !== 0) {
-      this.pendingShift = 0;
-      this.threads = [];
+    if (this.enterDir !== 0) {
+      // 排序切换未命中缓存：落骨架屏（轻淡入）等网络返回，返回后由 applySortDisplay 滑入
+      this.applySortDisplay({
+        sort: this.selectedSort, threads: [], page: this.page, hasMore: true, state: LoadState.Loading,
+      });
+    } else {
+      this.loadState = LoadState.Loading;
+      // 首次进入/重试：复位可能残留的过场位移与旧页快照，骨架屏从正确位置出现
+      this.inOffset = 0;
+      this.outOffset = 0;
+      this.exitSnapshot = null;
+      // 每次加载重置过渡透明度：骨架屏覆盖、内容透明，等待淡入
+      this.contentOpacity = 0.0;
+      this.skeletonOpacity = 1.0;
     }
-    // 复位可能残留的滑入位移：骨架屏必须从正确位置出现
-    this.contentShift = 0;
-    // 每次加载重置过渡透明度：骨架屏覆盖、内容透明，等待淡入
-    this.contentOpacity = 0.0;
-    this.skeletonOpacity = 1.0;
     try {
       const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, this.page, this.selectedSort, false);
       // 竞态防护：请求期间用户已切换排序/刷新，丢弃晚归结果，避免旧排序内容覆盖当前列表
       if (myToken !== this.loadToken || mySort !== this.selectedSort) {
         return;
       }
-      this.threads = result.list;
-      this.hasMore = result.list.length > 0;
       this.stalledPages = 0;
-      // 不直接切走 Loading：先让骨架屏淡出，动画结束后由 fadeInContent 落定目标态
-      this.fadeInContent(result.list.length > 0 ? LoadState.Success : LoadState.Empty);
+      if (this.enterDir !== 0) {
+        // 排序切换（未命中缓存）：网络返回后同帧替换 + 起滑
+        this.applySortDisplay({
+          sort: this.selectedSort, threads: result.list, page: this.page,
+          hasMore: result.list.length > 0,
+          state: result.list.length > 0 ? LoadState.Success : LoadState.Empty,
+        });
+      } else {
+        this.threads = result.list;
+        this.hasMore = result.list.length > 0;
+        // 不直接切走 Loading：先让骨架屏淡出，动画结束后由 fadeInContent 落定目标态
+        this.fadeInContent(result.list.length > 0 ? LoadState.Success : LoadState.Empty);
+      }
       // 首次成功展示后后台预热其它两个排序，使后续切换首次即命中缓存（一次性，失败静默）
       this.warmupSortCaches();
       const header = TiebaService.getInstance().getCachedForumHeader();
@@ -1325,6 +1576,10 @@ struct ThreadList {
         this.autoLoadMore();
       }
     } catch (e) {
+      // 失败也要收口过场：否则新页会停在侧偏位置，错误页跟着歪在一边
+      this.enterDir = 0;
+      this.clearSortSettle();
+      this.contentOpacity = 1;
       this.loadState = LoadState.Error;
       this.errorMsg = (e as Error).message ?? '加载失败';
     }
@@ -1337,6 +1592,13 @@ struct ThreadList {
     const mySort: number = this.selectedSort;
     TiebaService.getInstance().fetchForumThreads(this.forumName, 1, this.selectedSort, false).then((result) => {
       if (myToken !== this.loadToken || mySort !== this.selectedSort || result.list.length === 0) {
+        return;
+      }
+      // 排序切换的过场窗口内（`SORT_ANIM_SETTLE` ≈ 420ms）：只回写缓存、不上屏 ——
+      // 否则两页对向平移的途中列表内容会被静默刷新整块替换，出现"滑到一半内容变了"的跳变。
+      // 丢弃的这次上屏由下一次切换 / 下拉刷新补上，缓存不受影响。
+      if (this.enterDir !== 0 || Date.now() < this.sortAnimUntil) {
+        this.saveForumCache(result.list);
         return;
       }
       this.page = 1;
@@ -1582,16 +1844,17 @@ struct ThreadList {
     }
   }
 
-  /** 视口尺寸变化：记录视口高；搜索态下同时补一次自动续载判定 */
+  /** 视口尺寸变化：记录视口高 / 宽（宽供旧页快照 region 裁剪用）；搜索态下同时补一次自动续载判定 */
   private onViewportAreaChange(_old: Area, n: Area): void {
     this.viewportH = n.height as number;
+    this.viewportW = n.width as number;
     if (this.searchMode) {
       this.maybeAutoContinueSearch();
     }
   }
 
   /**
-   * 右下角悬浮按钮（刷新 / 发帖）显隐系数：搜索态整体隐去，退出搜索回到吧主页时复原。
+   * 右下角悬浮按钮（只剩「发帖」加号）显隐系数：搜索态整体隐去，退出搜索回到吧主页时复原。
    * 用系数而非条件渲染，配合 .animation 做淡出 + 下沉 + 缩小过渡；
    * 隐藏时命中模式设为 None，避免不可见按钮仍拦截搜索结果的滑动/点击。
    */
@@ -1686,10 +1949,27 @@ struct ThreadList {
   ThreadListContent() {
     Stack({ alignContent: Alignment.BottomEnd }) {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 排序切换过场·旧页层（对应首页 switchTab 的"退场页"）：点击那一刻同步截下的**列表区**内容，
+      // 在新页滑入的同时向反侧整屏滑出 —— 两页相接移动，即"两个界面仿佛连着"的来源。
+      // 快照已按吧头底边裁过（见 captureExitSnapshot），故这里下移 exitClipTop、高度收到列表区，
+      // 与同样只含列表区的新页严格对齐；吧头在这层上方静止不动。
+      // 收口（SORT_ANIM_SETTLE）后卸载；首次加载、未命中缓存、搜索态或截图失败时该层不存在（自动降级）。
+      if (this.exitSnapshot !== null) {
+        Image(this.exitSnapshot)
+          .width('100%')
+          // 高 = 视口高 − 裁剪量（未裁时即整屏高），与快照像素 1:1
+          .height(Math.max(0, this.viewportH - this.exitClipTop))
+          // 截图与展示区同尺寸，Cover 在此等价 1:1 铺满，不会变形
+          .objectFit(ImageFit.Cover)
+          // y 落到列表区顶边（水平位移才是过场：百分比相对自身宽 = 屏宽）
+          .translate({ x: `${this.outOffset}%`, y: this.exitClipTop })
+          .hitTestBehavior(HitTestMode.None)
+      }
+      // 新页（当前内容）：位移与旧页层对向，见 Scroll 链上的 translate
       Scroll(this.listScroller) {
         Column() {
-          // 预留顶栏高度作为初始间距
-          Column().width('100%').height(90)
+          // 预留顶栏高度作为初始间距（与旧页快照的裁剪边界同源，见 THREAD_LIST_HEADER_TOP_SPACE）
+          Column().width('100%').height(THREAD_LIST_HEADER_TOP_SPACE)
 
           // 本吧本地搜索态：隐藏吧头/排序 Tab，仅显示搜索结果
           // 转场：进入搜索向上轻收淡出、退出搜索自上方落下淡入（与下方结果区反向，形成"换场"层次）
@@ -1697,9 +1977,16 @@ struct ThreadList {
             Column() {
               this.ForumHeaderBuilder()
 
-              this.SortTabsBuilder()
+              // 排序栏在槽位路径下已搬到屏幕底部（SortSlotShell），内容区不再重复一份；
+              // 仅兜底路径（低版本 / 无材质 / 开关关闭）沿用改造前的自绘真模糊胶囊
+              if (!(THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported)) {
+                this.SortTabsBuilder()
+              }
             }
             .width('100%')
+            // 回填吧头块实测高（吧头 + 兜底排序栏）：旧页快照的裁剪边界由它推出（见 captureExitSnapshot）。
+            // 只在布局变化时回调；用普通字段而非 @State，避免测量本身触发重建
+            .onAreaChange((_old: Area, n: Area) => { this.headerBlockH = n.height as number; })
             .transition(this.searchSwap(0, -16))
           }
 
@@ -1807,15 +2094,20 @@ struct ThreadList {
               }
             }
             .width('100%')
-            // 排序切换：整层水平滑入归位（内容替换场景生效；骨架屏/加载态偏移为 0 不受影响）
-            .translate({ x: this.contentShift })
+            // 排序切换过场·新页位移：只作用于列表区（对应首页 switchTab 的"进场页"：自对侧整屏进入、归位）。
+            // 位移挂在这一层而不是 Scroll 上 —— Scroll 里还装着吧头与兜底排序栏，挂在 Scroll 上会让它们一起滑
+            // （首页切 Tab 时标题栏与底栏是静止的，故必须把作用域收窄到列表内容）。只做水平位移，垂直位置不变。
+            .translate({ x: `${this.inOffset}%` })
             .transition(this.searchSwap(0, -16))
           }
         }
         .width('100%')
-        .padding({ bottom: 150 })
+        .padding({ bottom: this.contentBottomSpace() })
         .onAreaChange((oldValue: Area, newValue: Area) => this.onContentAreaChange(oldValue, newValue))
       }
+      // 旧页快照锚点（`componentSnapshot.getSync` 取 Scroll 矩形，再按 region 裁掉吧头，见 captureExitSnapshot）；
+      // 新页位移已下移到「列表区」那一层，故这里不再挂 translate —— 吧头/兜底排序栏由此保持静止
+      .id(THREAD_SCROLL_SNAPSHOT_ID)
       .scrollBar(BarState.Off)
       .layoutWeight(1)
       .clip(false)
@@ -1945,35 +2237,12 @@ struct ThreadList {
     .backgroundColor(Theme.bg(this.isDark))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
-    // 悬浮 FAB（刷新 / 发主题）两条路径：官方槽位壳（FabSlotShell）/ 改造前页面主体自绘玻璃
+    // 悬浮 FAB（**只剩「发主题」加号一枚**）两条路径：官方槽位壳（FabSlotShell）/
+    // 改造前页面主体自绘玻璃（刷新钮已于 2026-09-12 按用户要求移除，刷新入口改由排序栏
+    // 「重复点击当前排序」承担，见 refreshByRetap）
     if (THREAD_LIST_OFFICIAL_TITLE_BAR && this.materialSupported) {
       this.FabSlotShell()
     } else {
-    // 刷新按钮 - 沉浸光感圆形（与加号按钮同尺寸，上下对齐）
-    Stack() {
-      SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-        .fontSize(fs(26, this.fontScale))
-        .fontColor([Theme.textPrimary(this.isDark)])
-        .rotate({ angle: this.refreshSpin })
-        .animation({ duration: 120, curve: Curve.Linear })
-    }
-    .width(56)
-    .height(56)
-    .borderRadius(28)
-    .backgroundColor(Theme.segGlass(this.isDark, false))
-    .border({ width: 0.5, color: Theme.manualGlassBorder() })
-    .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
-    .shadow(Theme.segGlassShadow(this.isDark, false))
-    .margin({ right: 28, bottom: 104 })
-    .zIndex(20)
-    // 搜索态隐去：淡出 + 缩小 + 下沉，隐藏时彻底不接收触摸
-    .opacity(this.fabReveal())
-    .scale({ x: this.fabReveal(), y: this.fabReveal() })
-    .translate({ y: (1 - this.fabReveal()) * 20 })
-    .hitTestBehavior(this.searchMode ? HitTestMode.None : HitTestMode.Default)
-    .animation({ duration: 220, curve: Curve.FastOutSlowIn })
-    .onClick(() => this.handleRefresh())
-
     // 发主题 FAB - 沉浸光感圆形加号
     Stack() {
       SymbolGlyph($r('sys.symbol.plus'))
@@ -1989,7 +2258,7 @@ struct ThreadList {
     .shadow(Theme.segGlassShadow(this.isDark, false))
     .margin({ right: 28, bottom: 36 })
     .zIndex(20)
-    // 与刷新按钮同步隐去（略微延后一档，形成自上而下的收拢顺序感）
+    // 搜索态隐去：淡出 + 缩小 + 下沉，隐藏时彻底不接收触摸
     .opacity(this.fabReveal())
     .scale({ x: this.fabReveal(), y: this.fabReveal() })
     .translate({ y: (1 - this.fabReveal()) * 20 })
@@ -1998,17 +2267,25 @@ struct ThreadList {
     .onClick(() => this.openCompose())
     }
 
+    // 底部排序底栏（官方槽位壳，§6.10 同机制）：热门 / 最新 / 精选 三枚等分钮，整条背板走
+    // 官方沉浸光感（与首页 / 搜索页底栏同源）。搜索态不渲染（页内搜索不切排序，且需腾出底部空间）。
+    if (THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported && !this.searchMode) {
+      this.SortSlotShell()
+    }
+
     // 吧主页右上角「更多」操作面板已改为系统 CustomDialog（systemMaterial 沉浸光感），
     // 由 moreSheetController + @Watch 驱动，页面 body 内不再自绘浮层
     }
     .width('100%')
     .height('100%')
+    // 根容器实宽 → currentWidth：排序栏槽位壳的 barWidth 只接受数值（Dimension 不收 calc 字符串）
+    .onAreaChange((_old: Area, n: Area) => { this.currentWidth = n.width as number; })
   }
 
   build() {
     if (THREAD_LIST_OFFICIAL_TITLE_BAR && this.materialSupported) {
       // 官方槽位路径（§6.10）：顶栏整行（返回 / 搜索框 / 搜索 / 更多）搬进 Navigation title 槽位吃真材质；
-      // 底部两枚 FAB 由 ThreadListContent 内的 FabSlotShell 送进「空 tabBar 壳」槽位
+      // 底部 FAB（加号）由 ThreadListContent 内的 FabSlotShell 送进「空 tabBar 壳」槽位
       Navigation() {
         this.ThreadListContent()
       }
@@ -2128,20 +2405,26 @@ struct ThreadList {
   }
 
   /**
-   * 悬浮 FAB 官方槽位壳（官方壳路径专用）：搭一个「只有 tabBar 的真实 Tabs」把刷新 / 加号两钮送进官方槽位
-   * （机制与 ThreadDetail `SortPillShell` 相同）。依据：`Button` 属 B 档，仅在 Navigation 标题栏与
+   * 悬浮 FAB 官方槽位壳（官方壳路径专用）：搭一个「只有 tabBar 的真实 Tabs」把**加号一枚**送进官方槽位
+   * （机制与 ThreadDetail `SortPillShell` 相同；刷新钮已于 2026-09-12 按用户要求移除）。
+   * 依据：`Button` 属 B 档，仅在 Navigation 标题栏与
    * `Tabs(barPosition: End)` 底部 TabBar 内生效，挂在页面主体必判 Material inactive: out of scope。
-   * 四点关键：
-   * ① `TabContent` 留空（内容区高度 = 壳高 124 - barHeight 124 = 0），壳里实际只有 tabBar 一列；
+   * 五点关键：
+   * ① `TabContent` 留空（内容区高度 = 壳高 56 - barHeight 56 = 0），壳里实际只有 tabBar 一列；
    * ② 不传 `.barFloatingStyle(...)`：官方悬浮背板整体不生成，不会凭空多出一条玻璃底；
    * ③ 不挂 `barOverlap(true)`（坑 26：空壳挂它会触发底栏默认浓模糊背板），且显式
    *    `.barBackgroundBlurStyle(BlurStyle.NONE)` 关掉底栏默认 `COMPONENT_REGULAR` 磨砂板；
-   * ④ `hitTestBehavior(None)`：壳自身全宽 124 高，绝不能让它的空区挡住兄弟节点（列表滚动）——
-   *    `None` = 自身不参与触摸测试、子节点与兄弟节点照常，故滚动与两钮点击都不受影响。
-   * 几何：壳高 124 = 56 + 12 + 56，底距 36（= 改造前加号钮 margin-bottom）；
-   * 故刷新钮底距 36 + 56 + 12 = 104、加号钮底距 36、右缘 28 —— 与改造前逐项一致。
-   * 显隐动效（fabReveal 淡出 + 缩小 + 下沉，220ms FastOutSlowIn）整体作用在壳上，观感与原两钮各自
-   * 动画一致；搜索态隐藏时两钮各自 `hitTestBehavior(None)`（见 FabSlotColumn），与改造前「不可见即不拦截」同效。
+   * ④ `hitTestBehavior(None)`：壳自身不参与触摸测试，子节点（加号）与兄弟节点照常；
+   * ⑤ **壳宽 80 而非全宽**：TabBar 页签节点的命中区恒等于自身矩形，全宽时该节点横跨整行，
+   *    空区照样吞掉竖向滑动，列表在该行拖不动（该节点是系统内部节点，`hitTestBehavior`
+   *    挂不到它身上，实测无效）。收窄成「右缘 24 + 钮宽 56」后死区与加号钮重合，列表其余
+   *    区域畅通；外层 Stack 为 BottomEnd，故壳自动靠右停靠；右缘由 28 收到 24，与排序栏左缘对称。
+   * 几何：壳高 **56**（原 124 = 56 + 12 + 56，随刷新钮一并回收），底距 30
+   * （= 排序底栏底距，见 THREAD_LIST_FAB_SHELL_BOTTOM）—— 加号钮底距 30 与底部排序栏**同排**
+   * （底边一条线、高 56 与栏高 56 顶边也一条线），占 30~86；右缘 24。
+   * 显隐动效（fabReveal 淡出 + 缩小 + 下沉，220ms FastOutSlowIn）整体作用在壳上；壳收窄后
+   * 缩放原点随之落到加号自身中心，比原先「以屏宽中点缩放」更贴形。搜索态隐藏时加号
+   * `hitTestBehavior(None)`（见 FabSlotColumn），与改造前「不可见即不拦截」同效。
    */
   @Builder
   FabSlotShell() {
@@ -2149,7 +2432,7 @@ struct ThreadList {
       TabContent()
         .tabBar(this.FabSlotColumn())
     }
-    .width('100%')
+    .width(THREAD_LIST_FAB_SHELL_WIDTH)
     .height(THREAD_LIST_FAB_SHELL_HEIGHT)
     .vertical(false)
     .scrollable(false)
@@ -2167,45 +2450,180 @@ struct ThreadList {
     .animation({ duration: 220, curve: Curve.FastOutSlowIn })
   }
 
-  /** FAB 槽内列（官方槽位版）：右对齐 + 右缘 28，上=刷新、下=加号（间距 12 = 改造前 104-(36+56)）。
-   *  几何与改造前两钮逐项一致（56 圆钮 / Radius 28 / 图标 fontSize 26 / 刷新自转），
-   *  玻璃删掉 `segGlass` / `manualGlassBorder` / `backgroundBlurStyle` / `segGlassShadow` 四项换 `ImmMaterial.seg(false)`。 */
+  /** FAB 槽内列（官方槽位版）：右对齐 + 右缘 24（与排序栏左缘对称），**只剩加号一枚**
+   *  （刷新钮已移除，原「上刷新 / 下加号、间距 12」随之取消，`Column` 的 `space` 也不再需要）。
+   *  几何与改造前加号逐项一致（56 圆钮 / Radius 28 / 图标 fontSize 26）。
+   *  玻璃走 `ImmMaterial.fabFlat()`（THIN 中性档 + `applyShadow: false` + **`colorInvert: true`**）：
+   *  ① 无阴影 —— 钮直接浮在列表内容上，带阴影版的材质投影会在钮下方拖出一圈淡影
+   *     （真机反馈要求消除，2026-09-11，处理方式与 ThreadDetail 底部排序胶囊同款）；
+   *  ② 带 `colorInvert` —— 与同排底栏（`floatingBarFlat`）同档，材质随背景明暗自动翻转
+   *     （用户反馈「底栏和底栏内文字会随背景变色、加号不会」，2026-09-12）。
+   *  图标色因此必须用**系统语义色** `$r('sys.color.font_primary')`（与底栏三钮文字同源）：
+   *  自绘 hex 不受 colorInvert 影响，改回 `Theme.textPrimary` 会立刻退回「加号不翻色」。 */
   @Builder
   FabSlotColumn() {
-    Column({ space: 12 }) {
-      // 刷新按钮 - 沉浸光感圆形（与加号按钮同尺寸，上下对齐）
-      Stack() {
-        SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-          .fontSize(fs(26, this.fontScale))
-          .fontColor([Theme.textPrimary(this.isDark)])
-          .rotate({ angle: this.refreshSpin })
-          .animation({ duration: 120, curve: Curve.Linear })
-      }
-      .width(56)
-      .height(56)
-      .borderRadius(28)
-      .systemMaterial(ImmMaterial.seg(false))
-      // 搜索态隐去时彻底不接收触摸（与改造前逐字一致）
-      .hitTestBehavior(this.searchMode ? HitTestMode.None : HitTestMode.Default)
-      .onClick(() => this.handleRefresh())
-
-      // 发主题 FAB - 沉浸光感圆形加号
+    Column() {
+      // 发主题 FAB - 沉浸光感圆形加号（图标取系统语义色，才能随材质一起反色）
       Stack() {
         SymbolGlyph($r('sys.symbol.plus'))
           .fontSize(fs(26, this.fontScale))
-          .fontColor([Theme.textPrimary(this.isDark)])
+          .fontColor([$r('sys.color.font_primary')])
       }
       .width(56)
       .height(56)
       .borderRadius(28)
-      .systemMaterial(ImmMaterial.seg(false))
+      .systemMaterial(ImmMaterial.fabFlat())
       .hitTestBehavior(this.searchMode ? HitTestMode.None : HitTestMode.Default)
       .onClick(() => this.openCompose())
     }
     .width('100%')
     .height(THREAD_LIST_FAB_SHELL_HEIGHT)
     .alignItems(HorizontalAlign.End)
-    .padding({ right: 28 })
+    .padding({ right: 24 })
+  }
+
+  /**
+   * 底部排序栏槽位壳（官方沉浸光感，§6.10 / §6.13 同机制）：
+   * 搭一个「只有 tabBar 的真实 Tabs」把三枚排序钮送进官方槽位 —— 页面主体（含 Scroll 内元素）挂
+   * `systemMaterial` 必判 `out of scope`，只有 `Tabs(barPosition: End)` 的 tabBar 才是官方认可范围。
+   *
+   * ★ 材质来源（本次修复「底栏没材质」）：**空壳路径下 `barFloatingStyle.systemMaterial` 不生成官方背板**。
+   *   对照 §6.13 `FabSlotShell` 与 §9.3 #6 `ThreadDetail.SortPillShell`：两处空壳**都不传** `barFloatingStyle`
+   *   （§9.3 原文「本壳不传 floating style，官方悬浮背板整体不生成」），材质一律由**槽内元素自己挂**
+   *   `systemMaterial`（§1.1「自建空 Tabs 壳内的元素」那一行）。故整条背板改由槽内 `SortSegBar()` 的
+   *   Row 承担：`ImmMaterial.floatingBarFlat()` + `Radius.full`（与首页底栏同材质档，仅关掉材质投影）→
+   *   得到「一条官方玻璃栏 + 三枚透明文字钮」，与首页底栏同构。
+   *
+   * 其余四点关键（沿用已验证写法）：
+   * ① TabContent 留空（内容区高度 = 壳高 − barHeight = 0），壳里实际只有 tabBar 一行；
+   * ② `.barBackgroundBlurStyle(BlurStyle.NONE)` 必写（坑 26：否则渲染底栏默认 COMPONENT_REGULAR 磨砂板）；
+   * ③ **不传 `barOverlap(true)`**（坑 26 追加：空壳挂它会触发 COMPONENT_THICK 默认模糊，残留一层背板）；
+   * ④ 槽内元素只留几何 + 文字色，玻璃四项（backgroundColor / border / backgroundBlurStyle / shadow）
+   *    一律不挂（坑 24：与材质叠用会互相覆盖或发脏）。
+   *
+   * ★ 壳宽 = 「目标元素实际占位」= 排序栏宽度（屏宽 − 116 = 左 24 + 栏 + 缝 12 + 加号 56 + 右 24，
+   *   下限 184，见 sortBarWidth），**不是 `'100%'`**（坑 30：空壳开全宽时系统 TabBar 页签节点横跨
+   *   整行、吞掉下层列表的竖向滑动，且 `hitTestBehavior` 挂不到该节点上，只能靠收窄几何把死区限制
+   *   在底栏范围内）。收窄后 `Stack(alignContent: BottomEnd)` 会让壳靠右停靠，故垫一层**全宽 `Row`**；
+   *   栏宽不再左右对称（左 24 / 右 92），若用 `Center` 会被推到左边距 60，故改用
+   *   `justifyContent(Start)` + `padding({ left: 24 })` 钉回左缘
+   *   （同 `ThreadDetail.SortPillShell` 用全宽 Row + padding-left 钉回左缘的思路）。
+   * 几何：栏高 56（= 槽内三钮 height 46 + 上下 padding 5×2，与右下加号钮同高同排；栏内纯文字无
+   * 图标，故比首页 / 搜索页底栏的 74 矮 18，圆角 `Radius.full` 收成 28 与加号同圆）、底距 30。
+   */
+  @Builder
+  SortSlotShell() {
+    Row() {
+      Tabs({ barPosition: BarPosition.End }) {
+        TabContent()
+          .tabBar(this.SortSegBar())
+      }
+      .width(this.sortBarWidth())
+      .height(THREAD_LIST_SORT_BAR_HEIGHT)
+      .vertical(false)
+      .scrollable(false)
+      .barHeight(THREAD_LIST_SORT_BAR_HEIGHT)
+      .barBackgroundColor(Color.Transparent)
+      .barBackgroundBlurStyle(BlurStyle.NONE)
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      .hitTestBehavior(HitTestMode.None)
+    }
+    .width('100%')
+    .height(THREAD_LIST_SORT_BAR_HEIGHT)
+    .justifyContent(FlexAlign.Start)
+    .padding({ left: 24 })
+    .margin({ bottom: THREAD_LIST_SORT_BAR_BOTTOM })
+    .zIndex(19)
+    .hitTestBehavior(HitTestMode.None)
+    // 搜索态不渲染（外层条件）；进出搜索与「列表区换场」同向：自下方浮起 / 向下方收起
+    .transition(this.searchSwap(0, 24))
+  }
+
+  /**
+   * 排序栏槽位内的三枚等分钮（热门 / 最新 / 精选）：纯文字三等分（`layoutWeight(1)`），
+   * 选中态只靠系统强调色 + 加粗表达，钮自身不挂任何背景 / 材质（与首页底栏 BottomItem、
+   * 搜索页 ModuleSegButton 同写法）。
+   *
+   * ★ 整条背板的官方沉浸材质挂在本行（Row）上，不在钮上：
+   *   - 空壳路径没有 `barFloatingStyle` 背板可用（见 SortSlotShell 注释），材质必须由槽内元素承担；
+   *   - 材质 = `ImmMaterial.floatingBarFlat()`（THIN / 无流光 / `applyShadow: false`，与首页底栏同档
+   *     但**去掉了材质自带投影**：本栏悬浮在列表内容之上、下方没有官方背板托底，带阴影版
+   *     `floatingBar()` 会在栏体四周压出一圈突兀暗晕（真机反馈要求去除，2026-09-12），
+   *     处理方式与 `segFlat`（详情页排序胶囊）/ `fabFlat`（右下加号）同款）；
+   *   - `Radius.full` 把栏高（56）收成全圆角（28），与右下加号钮同圆（首页底栏 74 → 37 同族）；
+   *   - 行内不挂 backgroundColor / border / backgroundBlurStyle / shadow（坑 24）。
+   *
+   * ★ 交互（三枚钮共用 `selectSort`，故槽位路径与兜底路径行为一致）：
+   *   点**未选中**的钮 = 切换排序（滑入动画 + 命中快照秒开）；
+   *   点**已选中**的钮 = **回顶 + 刷新该排序**（`refreshByRetap` → `handleRefresh`，用户 2026-09-12 要求）。
+   */
+  @Builder
+  SortSegBar() {
+    Row() {
+      this.SortSegButton('热门', 0)
+      this.SortSegButton('最新', 1)
+      this.SortSegButton('精选', 2)
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 8, right: 8, top: THREAD_LIST_SORT_BAR_PADDING, bottom: THREAD_LIST_SORT_BAR_PADDING })
+    .systemMaterial(ImmMaterial.floatingBarFlat())
+    .borderRadius(Radius.full)
+  }
+
+  @Builder
+  SortSegButton(label: string, index: number) {
+    Column() {
+      Text(label)
+        .fontSize(fs(13, this.fontScale))
+        .fontWeight(this.selectedSort === index ? FontWeight.Bold : FontWeight.Medium)
+        .fontColor(this.selectedSort === index
+          ? $r('sys.color.font_emphasize')
+          : $r('sys.color.font_primary'))
+    }
+    .layoutWeight(1)
+    // 钮高 = 栏高 − 上下留白（56 − 5×2 = 46）：与 SortSegBar 的 padding 同源，改栏高即整体联动
+    .height(THREAD_LIST_SORT_BAR_HEIGHT - THREAD_LIST_SORT_BAR_PADDING * 2)
+    .justifyContent(FlexAlign.Center)
+    // 与内容区自绘胶囊同款按压回弹（pressedTab 由 pulseTab 驱动），保持切换手感一致
+    .scale({ x: this.pressedTab === index ? 0.93 : 1, y: this.pressedTab === index ? 0.93 : 1 })
+    .animation({ duration: 100, curve: Curve.EaseOut })
+    .accessibilityText(label)
+    .onClick(() => {
+      this.pulseTab(index);
+      this.selectSort(index);
+    })
+  }
+
+  /** 排序栏宽度（vp）= 屏宽 − 116（左 24 + 栏 + 缝 12 + 加号 56 + 右 24），下限 184。
+   *  116 的来路：加号与底栏**同排**，底栏右端必须停在加号左侧留 12 缝；加号右缘 24（与底栏左缘
+   *  对称）→ 底栏右缘距屏右 92 = 24 + 56 + 12，故栏宽 = 屏宽 − 24 − 92。
+   *  用 THREAD_LIST_SORT_BAR_GAP 而非写死 12，缝隙调整时与 FAB 壳宽（80 = 24 + 56）自动联动。
+   *  下限 184 = 3 × 56（钮）+ 16（栏内左右 padding 8×2）：保证每枚钮至少 56 宽、与加号同宽；
+   *  屏宽 ≥ 300 时公式自然 ≥ 184（旧下限 240 会把底栏推到加号身上 —— 320 屏即重叠 28vp，故废除）。
+   *  Dimension 不收 calc 字符串，只能按屏宽算数值；同时用作槽位壳宽（坑 30：空壳必须收窄到
+   *  「目标元素实际占位」，不能开 `'100%'`） */
+  private sortBarWidth(): number {
+    const fabColumn: number = THREAD_LIST_FAB_SHELL_WIDTH + THREAD_LIST_SORT_BAR_GAP;
+    const w: number = this.currentWidth > 0 ? this.currentWidth - 24 - fabColumn : 244;
+    return w > 184 ? w : 184;
+  }
+
+  /**
+   * 列表底部让位高度：槽位路径 = 98（加号钮顶 86 = 底距 30 + 56，+ 12 呼吸；刷新钮移除后最高点
+   * 退回加号，比原值 166 少 68）；
+   * 兜底路径 = 104（自绘加号底距 36 → 顶 92，+ 12 呼吸；原 150 是给「贴底 104 的刷新钮 + 加号」
+   * 两钮留的余量，刷新钮移除后同步收小）；
+   * 搜索态保持改造前的 150（搜索态既无底栏也无 FAB，预留的是搜索 UI 空间）。
+   */
+  private contentBottomSpace(): number {
+    if (this.searchMode) {
+      return 150;
+    }
+    return (THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported)
+      ? THREAD_LIST_CONTENT_BOTTOM_SPACE
+      : 104;
   }
 
   @Builder
@@ -2455,6 +2873,9 @@ struct ThreadList {
    * 字重 + 更实的真模糊表达，几何与改动前一致。
    * 注：三枚胶囊均**不挂 .shadow** —— 自绘投影已按要求去掉，只保留半透明底 + backgroundBlurStyle
    * 真模糊 + 0.5 描边（旧写法各挂 Theme.segGlassShadow(isDark, selected)）。
+   * 使用范围：**仅兜底路径**（低版本 / 无材质 / 开关关闭）保留在内容区吧头下方；
+   * 槽位路径下这段已搬到屏幕底部做官方沉浸光感悬浮底栏（见 SortSlotShell / SortSegBar）。
+   * 交互与槽位路径同源（三处 onClick 都调 `selectSort`）：选中项重复点击 = 回顶 + 刷新该排序。
    */
   @Builder
   SortTabsBuilder() {
@@ -2519,7 +2940,6 @@ struct ThreadList {
       return;
     }
     this.refreshing = true;
-    this.startRefreshSpin();
     const t0: number = Date.now();
     console.info(`[REFRESH] start sort=${this.selectedSort}`);
     try {
@@ -2552,31 +2972,13 @@ struct ThreadList {
       console.info(`[REFRESH] fail sort=${this.selectedSort} cost=${Date.now() - t0}ms err=${msg}`);
       this.getUIContext().getPromptAction().showToast({ message: msg });
     } finally {
-      this.stopRefreshSpin();
       this.refreshing = false;
     }
   }
 
-  /** 刷新转圈：定时器驱动角度自增，结束后必然停止（不依赖 iterations:-1 无限动画） */
-  private startRefreshSpin(): void {
-    this.refreshSpin = 0;
-    if (this.refreshTimer >= 0) {
-      clearInterval(this.refreshTimer);
-    }
-    this.refreshTimer = setInterval(() => {
-      this.refreshSpin = (this.refreshSpin + 30) % 360;
-    }, 80);
-  }
-
-  private stopRefreshSpin(): void {
-    if (this.refreshTimer >= 0) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = -1;
-    }
-    this.refreshSpin = 0;
-  }
-
-  /** 刷新总超时兜底：弱网/接口挂起时最多转 8 秒，避免按钮无限转、点击失效 */
+  /** 刷新总超时兜底：弱网/接口挂起时最多等 8 秒。
+   *  刷新钮移除后界面已无转圈图标，兜底的目的变成「别让 busy 门被挂起的请求长期占住、
+   *  导致后续重复点击排序（回顶刷新）持续被短路」。 */
   private withRefreshTimeout<T>(promise: Promise<T>): Promise<T> {
     return new Promise<T>((resolve: (v: T) => void, reject: (e: Error) => void) => {
       const timer: number = setTimeout(() => {
@@ -2590,13 +2992,6 @@ struct ThreadList {
         reject(e);
       });
     });
-  }
-
-  aboutToDisappear(): void {
-    if (this.refreshTimer >= 0) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = -1;
-    }
   }
 
   /**

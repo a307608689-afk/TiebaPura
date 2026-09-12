@@ -80,6 +80,7 @@ let _matBar: uiMaterial.Material | undefined = undefined;
 let _matTab: uiMaterial.Material | undefined = undefined;
 let _matCardAction: uiMaterial.Material | undefined = undefined;
 let _matFab: uiMaterial.Material | undefined = undefined;
+let _matFabFlat: uiMaterial.Material | undefined = undefined;
 let _matRowItem: uiMaterial.Material | undefined = undefined;
 let _matTabActiveDark: uiMaterial.Material | undefined = undefined;
 let _matTabActiveLight: uiMaterial.Material | undefined = undefined;
@@ -90,6 +91,7 @@ let _matDangerLight: uiMaterial.Material | undefined = undefined;
 let _matBottomGlowDark: uiMaterial.Material | undefined = undefined;
 let _matBottomGlowLight: uiMaterial.Material | undefined = undefined;
 let _matFloating: uiMaterial.ImmersiveMaterial | undefined = undefined;
+let _matFloatingFlat: uiMaterial.ImmersiveMaterial | undefined = undefined;
 let _matDialog: uiMaterial.ImmersiveMaterial | undefined = undefined;
 let _matSegActive: uiMaterial.Material | undefined = undefined;
 let _matSegIdle: uiMaterial.Material | undefined = undefined;
@@ -159,6 +161,28 @@ function ensureFloatingBar(): uiMaterial.ImmersiveMaterial | undefined {
     });
   }
   return _matFloating;
+}
+
+/**
+ * 悬浮玻璃胶囊 — 无阴影档：与 ensureFloatingBar 仅 `applyShadow` 之差（其余 THIN / 无流光 /
+ * colorInvert 逐项一致）。
+ * 用于**由页面元素自己挂 `systemMaterial`** 的悬浮栏（空壳槽位路径，如吧主页底部排序栏）：
+ * 这类栏贴在列表内容上方、下方没有「官方背板」托底，材质自带投影会在栏体四周压出一圈
+ * 突兀的暗晕（真机反馈要求去除，2026-09-12）；走 `barFloatingStyle` 的官方悬浮岛仍用带阴影版
+ * （首页 / 搜索页 / 帖子详情页底栏 —— 那里的阴影属于悬浮岛观感的一部分，不在此列）。
+ * 处理方式与 `segFlat`（帖子详情页排序胶囊）/ `fabFlat`（右下加号）同款。
+ */
+function ensureFloatingBarFlat(): uiMaterial.ImmersiveMaterial | undefined {
+  if (!_matFloatingFlat) {
+    _matFloatingFlat = createMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      interactive: false,
+      lightEffect: null,
+      applyShadow: false,
+      colorInvert: true,
+    });
+  }
+  return _matFloatingFlat;
 }
 
 function ensureTab(): uiMaterial.Material | undefined {
@@ -281,6 +305,35 @@ function ensureFab(): uiMaterial.Material | undefined {
     });
   }
   return _matFab;
+}
+
+/**
+ * FAB 悬浮圆钮 — 自适应反色 + 无阴影档（与底栏同排的槽位 FAB 专用，如吧主页右下加号）。
+ *
+ * 与 `ensureFab` 的差别：材质档由 THICK 收到 THIN、关掉材质自带投影（同 ensureFloatingBarFlat，
+ * 钮直接浮在列表内容上，带阴影会在钮下方压出一圈淡影，真机反馈要求去除，2026-09-11），
+ * 并**开启 `colorInvert`**。
+ *
+ * `colorInvert: true` 是「材质随背景明暗自动翻转」的开关（官方语义：材质按其覆盖区域的背景
+ * 明暗，自动反转材质与其中**系统语义色内容**的着色）。此前该钮用 `segFlat(false)`（无 colorInvert），
+ * 与同排底栏（floatingBarFlat，带 colorInvert）并排时只有底栏及其文字随背景变色、加号纹丝不动
+ * （用户反馈，2026-09-12）；换成本档后钮与底栏同档，材质与图标一起翻色。
+ * 保留 `interactive: true`（可点按圆钮，按压弹性形变 + 光感反馈，与 segFlat 一致）。
+ *
+ * ⚠️ 使用约束：图标 / 文字必须用**系统语义色**（如 `$r('sys.color.font_primary')`）才能被反色，
+ * 用自绘 hex（Theme.textPrimary 等）时 colorInvert 对该内容无效。
+ */
+function ensureFabFlat(): uiMaterial.Material | undefined {
+  if (!_matFabFlat) {
+    _matFabFlat = createMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      interactive: true,
+      lightEffect: { color: undefined },
+      applyShadow: false,
+      colorInvert: true,
+    });
+  }
+  return _matFabFlat;
 }
 
 function ensureAccentDark(): uiMaterial.Material | undefined {
@@ -411,6 +464,12 @@ export class ImmMaterial {
   static floatingBar(): uiMaterial.ImmersiveMaterial | undefined {
     return ensureFloatingBar();
   }
+  /** 同 floatingBar，但 applyShadow: false（无材质投影）。用于页面元素自己挂材质的悬浮栏
+   *  （空壳槽位路径，如吧主页底部排序栏 —— 悬浮在列表之上，自带阴影会压出突兀暗晕，
+   *  真机反馈要求去除，详见 ensureFloatingBarFlat 注释）。 */
+  static floatingBarFlat(): uiMaterial.ImmersiveMaterial | undefined {
+    return ensureFloatingBarFlat();
+  }
   /** 胶囊 Tab 按钮。REGULAR + 按压弹性形变 + 光感反馈。 */
   static tab(): uiMaterial.Material | undefined {
     return ensureTab();
@@ -439,6 +498,12 @@ export class ImmMaterial {
   /** FAB 悬浮操作按钮。THICK + 按压弹性形变 + 光感反馈。 */
   static fab(): uiMaterial.Material | undefined {
     return ensureFab();
+  }
+  /** 同 fab，但材质档降到 THIN、去掉材质投影、并开启 `colorInvert`（随背景自动反色）。
+   *  用于与底部悬浮栏**同排**的槽位 FAB（如吧主页右下加号）：与同排底栏同档才能一起随背景变色。
+   *  ⚠️ 钮内图标须用系统语义色（`$r('sys.color.font_primary')`），自绘 hex 不受 colorInvert 影响。 */
+  static fabFlat(): uiMaterial.Material | undefined {
+    return ensureFabFlat();
   }
   /** 品牌主按钮。THIN + 品牌色赋色 + 光感反馈。 */
   static accent(isDark: boolean): uiMaterial.Material | undefined {
