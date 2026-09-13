@@ -234,6 +234,10 @@ struct Index {
     // 从其它页面返回（如 ThreadList/ThreadDetail 浏览后回退）时：自增 forumsRefreshRequest 通知进吧 Tab
     // 静默刷新「我的足迹」（本地缓存直出，不发关注列表网络，避免切换回来足迹空白后闪现）
     AppStorage.setOrCreate<number>('forumsRefreshRequest', (AppStorage.get<number>('forumsRefreshRequest') ?? 0) + 1);
+    // 字号全局变更返回广播（2026-09-13）：从字号设置页返回时，常驻 Tab 页处于挂载态、离屏期间的
+    // @StorageLink('fontScale') 同步不会触发重绘（工程已知"离屏缓存不刷新"问题）→ 自增 fontTick，
+    // 各 Tab @Watch 响应后显式回写 fontScale 触发本页依赖刷新（与 darkTick 深色联动同款模式）
+    AppStorage.setOrCreate<number>('fontTick', (AppStorage.get<number>('fontTick') ?? 0) + 1);
   }
 
   private async loadUserStats(): Promise<void> {

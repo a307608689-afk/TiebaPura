@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { uiMaterial, window } from '@kit.ArkUI';
+import { uiMaterial, window, display } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { common, ConfigurationConstant } from '@kit.AbilityKit';
 
@@ -991,6 +991,32 @@ export const Breakpoint: BreakpointToken = {
   md: 840,
   lg: 1440,
 };
+
+/**
+ * 顶部满宽渐显带的平板收窄比例（2026-09-13，用户反馈平板竖屏下各页渐显覆盖到第一个卡片中部）：
+ * 平板 / 大屏形态下渐显只覆盖顶部按钮与标题（`coverVp` = 该页顶部固定区高度，一般为顶栏 98），
+ * 手机维持原 15% 比例。分母取**屏幕长边**（竖屏视口高的稳定来源，旋转不漂移）；
+ * display 未就绪 / 取值失败时回退手机比例（0.15，安全方向——宁可略深也不可全实遮罩失效）。
+ * 用法：各页 `BottomFadeOverlay` 的中间渐变 stop 写 `tabletTopFadeStop(该页顶部固定区高度)`。
+ */
+export function tabletTopFadeStop(coverVp: number): number {
+  const wide: boolean = deviceInfo.deviceType === 'tablet'
+    || deviceInfo.deviceType === '2in1'
+    || display.isFoldable();
+  if (!wide) {
+    return 0.15;
+  }
+  try {
+    const d: display.Display = display.getDefaultDisplaySync();
+    const longEdge: number = Math.max(d.width, d.height) / d.densityPixels;
+    if (longEdge <= 0) {
+      return 0.15;
+    }
+    return Math.min(0.15, coverVp / longEdge);
+  } catch (e) {
+    return 0.15;
+  }
+}
 
 /** 宿主底部悬浮底栏几何令牌（vp，见 §4.6 H-B / H-C：维持 480 封顶，零改动） */
 export interface DockToken {

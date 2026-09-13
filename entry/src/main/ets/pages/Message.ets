@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { display } from '@kit.ArkUI';
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { Conversation } from '../model/DataModel';
@@ -29,6 +31,16 @@ enum LoadState {
 @Entry
 @Component
 struct Message {
+  /**
+   * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 15% 渐显覆盖到第一个卡片中部，
+   * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98vp，手机维持原比例。
+   */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
+  @State fadeCoverVp: number = 0;
   @State conversations: Conversation[] = [];
   @State loadState: LoadState = LoadState.Loading;
   @State errorMsg: string = '';
@@ -44,6 +56,13 @@ struct Message {
   aboutToAppear(): void {
     MaterialManager.init();
     this.isDark = isDarkMode();
+    // 顶部渐显带覆盖基准（平板收窄用）：取屏幕长边（竖屏视口高），窗口未 attach 时忽略
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+    } catch (e) {
+      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+    }
     if (!AuthManager.getInstance().isLogin()) {
       this.loadState = LoadState.Empty;
       return;
@@ -167,6 +186,14 @@ struct Message {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
+  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（98vp 折算），手机维持 15% */
+  private topFadeStop(): number {
+    if (!this.isWideFormDevice || this.fadeCoverVp <= 0) {
+      return 0.15;
+    }
+    return Math.min(0.15, 98 / this.fadeCoverVp);
+  }
+
   @Builder
   BottomFadeOverlay() {
     Stack()
@@ -174,7 +201,7 @@ struct Message {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

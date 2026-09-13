@@ -17,7 +17,7 @@
  */
 
 import { FontSizeManager } from '../service/FontSizeManager';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, tabletTopFadeStop } from '../common/Theme';
 
 @Entry
 @Component
@@ -64,6 +64,9 @@ struct FontSizePage {
         // 同步设置 AppStorage + 本地字段，触发 build 中相关属性表达式变化，animateTo 让变化平滑
         AppStorage.setOrCreate<number>('fontScale', FontSizeManager.scaleOf(target));
         AppStorage.setOrCreate<number>('fontLevel', target);
+        // fontTick 广播（2026-09-13）：常驻 Tab 页离屏期间 @StorageLink 同步不重绘，
+        // 由各 Tab @Watch 响应后显式回写 fontScale 强制刷新（与 darkTick 同款模式）
+        AppStorage.setOrCreate<number>('fontTick', (AppStorage.get<number>('fontTick') ?? 0) + 1);
         this.fontLevel = target;
       }
     );
@@ -189,6 +192,7 @@ struct FontSizePage {
                   if (clamped !== this.fontLevel) {
                     AppStorage.setOrCreate<number>('fontScale', FontSizeManager.scaleOf(clamped));
                     AppStorage.setOrCreate<number>('fontLevel', clamped);
+                    AppStorage.setOrCreate<number>('fontTick', (AppStorage.get<number>('fontTick') ?? 0) + 1);
                     this.fontLevel = clamped;
                   }
                 }
@@ -257,6 +261,7 @@ struct FontSizePage {
                   if (clamped !== this.fontLevel) {
                     AppStorage.setOrCreate<number>('fontScale', FontSizeManager.scaleOf(clamped));
                     AppStorage.setOrCreate<number>('fontLevel', clamped);
+                    AppStorage.setOrCreate<number>('fontTick', (AppStorage.get<number>('fontTick') ?? 0) + 1);
                     this.fontLevel = clamped;
                   }
                 }
@@ -323,7 +328,7 @@ struct FontSizePage {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', tabletTopFadeStop(98)], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

@@ -17,7 +17,7 @@
  */
 
 import { common, ConfigurationConstant } from '@kit.AbilityKit';
-import { Theme, Spacing, Radius, isDarkMode, setDarkMode as applyAppDarkMode, syncDarkFromConfig, resetConfigurationToFollowSystem, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, setDarkMode as applyAppDarkMode, syncDarkFromConfig, resetConfigurationToFollowSystem, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop } from '../common/Theme';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { BRAND_BLUE } from '../common/Constants';
 
@@ -245,7 +245,7 @@ struct PersonalizedPage {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', tabletTopFadeStop(98)], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

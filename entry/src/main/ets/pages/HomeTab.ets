@@ -221,6 +221,9 @@ export struct HomeTab {
   onOpenFavorite: () => void = () => {
   };
   @StorageLink('fontScale') fontScale: number = 1.0;
+  // 字号全局变更广播（2026-09-13）：从字号设置页返回时宿主自增，@Watch 回写 fontScale
+  // 强制本页依赖刷新（离屏期间 @StorageLink 同步不重绘，工程已知问题）
+  @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @State isDark: boolean = false;
   // 使用习惯：首页推荐仅显示关注吧的帖子（开关变化时自动刷新推荐流）
@@ -348,28 +351,44 @@ export struct HomeTab {
     this.isDark = isDarkMode();
   }
 
+  /** fontTick 递增（字号设置页写入 / 宿主 onPageShow 返回广播）→ 显式回写 fontScale
+   *  触发本页全部 fs(x, fontScale) 依赖刷新（离屏期间 @StorageLink 同步不重绘的兜底） */
+  private onFontTick(): void {
+    this.fontScale = AppStorage.get<number>('fontScale') ?? 1.0;
+  }
+
+  /**
+   * 同步 WaterFlow 数据源（全量替换或尾部追加）。
+   * 判定「尾部追加」必须**逐项比对前缀**：只比长度会把「刷新后列表变长」误判成追加，
+   * 于是 WaterFlow 只重建尾段、前段仍渲染旧内容（真机表现为刷新后列表内容错乱）。
+   */
+  private syncSource(ds: ThreadDataSource, next: ThreadItem[]): void {
+    const old: ThreadItem[] = ds.data;
+    let isAppend: boolean = old.length > 0 && next.length > old.length;
+    if (isAppend) {
+      for (let i: number = 0; i < old.length; i++) {
+        if (next[i].tid !== old[i].tid) {
+          isAppend = false;
+          break;
+        }
+      }
+    }
+    ds.data = next;
+    if (isAppend) {
+      ds.notifyAdd(old.length);
+    } else {
+      ds.reload();
+    }
+  }
+
   /** threads 变化 → 同步到 WaterFlow 数据源（全量替换或尾部追加） */
   private onThreadsChange(): void {
-    const oldLen: number = this.recDataSource.data.length;
-    const newLen: number = this.threads.length;
-    this.recDataSource.data = this.threads;
-    if (newLen > oldLen && oldLen > 0) {
-      this.recDataSource.notifyAdd(oldLen);
-    } else {
-      this.recDataSource.reload();
-    }
+    this.syncSource(this.recDataSource, this.threads);
   }
 
   /** folThreads 变化 → 同步到 WaterFlow 数据源（全量替换或尾部追加） */
   private onFolThreadsChange(): void {
-    const oldLen: number = this.folDataSource.data.length;
-    const newLen: number = this.folThreads.length;
-    this.folDataSource.data = this.folThreads;
-    if (newLen > oldLen && oldLen > 0) {
-      this.folDataSource.notifyAdd(oldLen);
-    } else {
-      this.folDataSource.reload();
-    }
+    this.syncSource(this.folDataSource, this.folThreads);
   }
 
   /** 竖屏 3 列 / 横屏 4 列（§4.2 决策 12）：同步 AppStorage 让 ThreadCard 内部图片封顶/摘要行数跟随 */
@@ -433,12 +452,17 @@ export struct HomeTab {
     this.syncCardColumns();
   }
 
-  /** 渐隐停靠点：视口高 × 0.15 夹取到 [HOME_FADE_MIN, HOME_FADE_MAX] 后折算百分比 */
+  /**
+   * 渐隐停靠点：视口高 × 0.15 夹取到 [HOME_FADE_MIN, HOME_FADE_MAX] 后折算百分比。
+   * 平板收窄（2026-09-13 用户反馈）：平板竖屏下 15% 渐显覆盖到第一个卡片用户名位置，
+   * 要求「只覆盖顶部按钮与标题」→ 平板档 raw 直接取顶栏高度 HOME_TITLE_BAR_HEIGHT(108)；
+   * 手机维持原公式（夹取后 108~180 不变）。
+   */
   private updateFadeStop(viewportHeightVp: number): void {
     if (viewportHeightVp <= 0) {
       return;
     }
-    const raw: number = viewportHeightVp * 0.15;
+    const raw: number = this.isWideFormDevice ? HOME_TITLE_BAR_HEIGHT : viewportHeightVp * 0.15;
     const clamped: number = Math.min(Math.max(raw, HOME_FADE_MIN), HOME_FADE_MAX);
     this.fadeStop = clamped / viewportHeightVp;
   }
@@ -1892,6 +1916,14 @@ export struct HomeTab {
     .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
   }
 
+  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（108vp 折算，实时窗口高），手机维持 15% */
+  private topFadeStop(): number {
+    if (!this.isWideFormDevice || this.pageHeight <= 0) {
+      return 0.15;
+    }
+    return Math.min(0.15, HOME_TITLE_BAR_HEIGHT / this.pageHeight);
+  }
+
   @Builder
   BottomFadeOverlay() {
     Stack()
@@ -1899,7 +1931,7 @@ export struct HomeTab {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { display } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { UserStats, FollowItem } from '../model/DataModel';
 import { Theme, Spacing, Radius, fs, isDarkMode, setDarkMode, ImmBlur, ImmMaterial } from '../common/Theme';
@@ -41,6 +43,16 @@ const MINE_TITLE_BAR_HEIGHT: number = 98;
 
 @Component
 export struct MineTab {
+  /**
+   * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 15% 渐显覆盖到第一个卡片中部，
+   * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98vp，手机维持原比例。
+   */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
+  @State fadeCoverVp: number = 0;
   @Link loggedIn: boolean;
   @Link userName: string;
   @Link userAvatar: string;
@@ -54,15 +66,29 @@ export struct MineTab {
   onLogout: () => void = () => {};
   @State isDark: boolean = isDarkMode();
   @StorageLink('fontScale') fontScale: number = 1.0;
+  // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
+  @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
 
   aboutToAppear(): void {
     this.isDark = isDarkMode();
+    // 顶部渐显带覆盖基准（平板收窄用）：取屏幕长边（竖屏视口高），窗口未 attach 时忽略
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+    } catch (e) {
+      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+    }
   }
 
   /** 深色切换（来自本页或宿主）后重读全局状态 */
   onDarkTick(): void {
     this.isDark = isDarkMode();
+  }
+
+  /** fontTick 递增（字号设置写入 / 宿主返回广播）→ 显式回写 fontScale 强制本页字号依赖刷新 */
+  onFontTick(): void {
+    this.fontScale = AppStorage.get<number>('fontScale') ?? 1.0;
   }
 
   private statText(value: number): string {
@@ -224,6 +250,14 @@ export struct MineTab {
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
   }
 
+  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（98vp 折算），手机维持 15% */
+  private topFadeStop(): number {
+    if (!this.isWideFormDevice || this.fadeCoverVp <= 0) {
+      return 0.15;
+    }
+    return Math.min(0.15, 98 / this.fadeCoverVp);
+  }
+
   @Builder
   BottomFadeOverlay() {
     Stack()
@@ -231,7 +265,7 @@ export struct MineTab {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

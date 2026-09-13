@@ -21,7 +21,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { bundleManager, common, Want } from '@kit.AbilityKit';
-import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
+import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { CacheManager } from '../cache/CacheManager';
@@ -29,7 +29,7 @@ import { CACHE_KEY } from '../common/Constants';
 import { FavoriteStore } from '../service/FavoriteStore';
 import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType } from '../model/DataModel';
 import { ThreadDetailResult } from '../service/TiebaService';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint } from '../common/Theme';
 import { ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadDetailSkeleton } from '../components/Skeleton';
 import { EmojiLoader } from '../network/EmojiLoader';
@@ -81,6 +81,28 @@ const THREAD_DETAIL_SORT_OFFICIAL_SLOT: boolean = true;
  * 与改造前 SortRowOverlay 内 ReplyControls 的实际占高逐项一致，用作 Tabs 壳高与 barHeight。
  */
 const THREAD_DETAIL_SORT_ROW_HEIGHT: number = 46;
+
+/**
+ * 平板适配 §4.9 DT-I：横屏分栏时的**左栏固定宽度**（vp）= 用户说的「帖子本身宽度」。
+ * 420 为推荐值（备选 368 = 宫格自然宽 336 + 卡片内边距 32；480 让正文行长更舒适）。
+ * 只在 splitMode() 为 true（大屏横屏）时生效，手机与平板竖屏不走该分支。
+ */
+const DETAIL_MAIN_WIDTH: number = 420;
+/**
+ * 平板适配 §4.9 DT-J：宫格图宽度上限（vp）= 3 × 108 + 2 × 6，使每格 ≈ 108vp（手机档 94.7vp 的邻近量级）。
+ * 宽屏下 Grid 若继续 width('100%')，三列会被均分到 1000+vp（每格 ≈ 320vp）而格高恒 120 → 图片被横向拉伸。
+ * 手机档宫格可用宽 ≈ 296vp < 上限 → 不生效（逐像素不变，无需形态闸门）。
+ */
+const DETAIL_IMAGE_GRID_MAX_WIDTH: number = 336;
+/**
+ * 底部悬浮栏（评论输入条）平板档宽度（vp）= **现有基础宽一倍**：296 × 2 = **592**（2026-09-14 用户要求
+ * 「底栏在现有基础宽一倍，里面跳转框也一起跟着拉伸」）。
+ * ⚠️ 教训：不可把这个量级的值当成「所有手机的屏宽基线」对手机封顶 —— 393vp 等机型手机档
+ * 「屏宽 − 64」= 329，若误用平板档封顶会把手机底栏实实在在收窄（用户真机已驳回一次）；
+ * 手机档必须保持原「屏宽 − 64」公式（见 `dockPillWidth()` 分档）。
+ * 跳转框（原回复框）在岛内为 `layoutWeight(1)`，随岛宽自动拉伸，无需单独处理。
+ */
+const DETAIL_DOCK_TABLET_WIDTH: number = 592;
 
 // 官方贴吧（鸿蒙版）包名与帖子页 URL 模板：跳转仅携带 tid，不含任何登录态参数
 const TIEBA_OFFICIAL_BUNDLE: string = 'com.baidu.tiebaapp';
@@ -498,11 +520,32 @@ struct ThreadDetail {
   // 骨架屏→内容交叉淡入淡出（方案A）：内容初始透明淡入，骨架屏淡出后由 loadState 切换移除
   @State contentOpacity: number = 0.0;
   @State skeletonOpacity: number = 1.0;
+  /**
+   * 形态切换平滑化（2026-09-13）：缓存 `splitMode()` 的**结果**，只在真正跨形态（横↔竖）时
+   * 写一次 —— 避免旋转过程中 `currentWidth` / `pageHeight` 每帧变化导致布局分支反复求值、
+   * 触发多次全量重建（楼层卡全部重建是「切换卡一下」的主要成本）。
+   * 分支渲染统一读本状态（不再直接调 splitMode()），保证一次旋转只切一次。
+   */
+  @State isSplit: boolean = false;
   // API26+ 真机沉浸光感：materialSupported 为 true 时 build 走官方 Tabs 悬浮条壳（底部 Dock 整体入
   // .tabBar() 槽位，材质由 barFloatingStyle.systemMaterial 悬浮条本体渲染）；其余走原手写叠放路径。
   @State materialSupported: boolean = false;
+  /**
+   * 官方悬浮条首帧重排触发器（2026-09-13）：`aboutToAppear` 后 300ms 置 1，令 `barBottomMargin`
+   * 产生一次 0.5vp 微变 → 触发系统对悬浮条重新布局，**等效于用户手动旋转**（旋转之所以能修好
+   * 首帧不齐，本质就是布局参数变化引发了系统重排）。0.5vp 视觉不可察。
+   */
+  @State dockNudge: number = 0;
   // 壳分支悬浮岛宽度依赖的屏宽（onAreaChange 实时更新）
   @State currentWidth: number = 360;
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.9）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别 */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口高（vp）：与 currentWidth 配对做横竖屏判定；aboutToAppear 取首帧初值，onAreaChange 兜底 */
+  @State pageHeight: number = 800;
   // 从消息页带过来的目标楼层 pid，加载后自动滚动并高亮
   @State targetFloorId: string = '';
   @State highlightFloorId: string = '';
@@ -522,10 +565,33 @@ struct ThreadDetail {
   /** 楼层自动定位到底未命中的提示是否已弹出（只提示一次） */
   private locateNoticeShown: boolean = false;
   private scroller: Scroller = new Scroller();
+  /** 横屏分栏·左栏独立滚动控制器（§4.9 DT-I）：主楼不参与分页与定位，故不挂 onReachEnd / id */
+  private scrollerLeft: Scroller = new Scroller();
 
   aboutToAppear(): void {
     MaterialManager.init();
+    // 首帧形态初值（§4.9 DT-A）：onAreaChange 只在尺寸变化后触发，横屏冷启动若不预置会先按竖屏判定再跳分栏；
+    // 顺带把 currentWidth 从写死的 360 换成真实窗口宽（口径与 §4.8 T-B 同源）。
+    try {
+      const d = display.getDefaultDisplaySync();
+      const ui = this.getUIContext();
+      const w: number = ui.px2vp(d.width);
+      const h: number = ui.px2vp(d.height);
+      if (w > 0 && h > 0) {
+        this.currentWidth = w;
+        this.pageHeight = h;
+      }
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽高会失败，onAreaChange 会兜底
+    }
+    // 形态切换平滑化：首帧就固化分栏结果（横屏冷启动直接走分栏，不会先竖后跳）
+    this.isSplit = this.splitMode();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
+    // 官方悬浮条首帧重排触发：首帧渲染完成后对 barBottomMargin 施加 0.5vp 微变，模拟旋转的
+    // 系统重排（等效用户手动旋转修复首帧不齐）。300ms = 首帧布局已稳定、且早于用户读完内容。
+    setTimeout(() => {
+      this.dockNudge = 1;
+    }, 300);
     const params = this.getUIContext().getRouter().getParams() as Record<string, string>;
     if (params && params.tid) {
       this.tid = `${params.tid}`;
@@ -1045,11 +1111,10 @@ struct ThreadDetail {
       // API26+ 真机沉浸光感：官方 Tabs 悬浮条壳 —— 底部 Dock 整体放入 .tabBar() 槽位，
       // 悬浮条本体挂 barFloatingStyle.systemMaterial 才渲染官方材质（与 Index 首页同一机制）。
       // 其余环境/设备走原手写叠放路径（布局与定稿完全一致），留作稳定兜底。
+      // （2026-09-13 回退记录：「平板横屏岛与帖子卡左对齐」的岛壳解耦方案（内容层移出 Tabs +
+      // FloatingIslandOnly 纯岛壳）已按用户要求回退 —— 底栏保持居中；官方沉浸材质不变。）
       if (this.materialSupported) {
         this.ImmersiveDockShell()
-        // 排序切换钮（正序/只看全部）不进入官方悬浮岛：
-        // 槽位开关打开时放进「空 tabBar 壳」吃官方沉浸材质（位置/大小与旧浮层逐项一致），
-        // 否则沿用改造前的独立玻璃胶囊浮层（页面中部玻璃只能自绘兜底）
         if (this.loadState === LoadState.Success && this.detail) {
           if (THREAD_DETAIL_SORT_OFFICIAL_SLOT) {
             this.SortPillShell()
@@ -1074,8 +1139,18 @@ struct ThreadDetail {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .onAreaChange((_oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
+      const height = newValue.height as number;
       if (width > 0) {
         this.currentWidth = width;
+      }
+      // §4.9 DT-A：同点回填窗口高，供 isLandscape() / splitMode() 判定
+      if (height > 0) {
+        this.pageHeight = height;
+      }
+      // 形态切换平滑化：只在「是否分栏」的结果真正变化时才切（一次旋转只切一次）
+      const nextSplit: boolean = this.splitMode();
+      if (nextSplit !== this.isSplit) {
+        this.applySplitSwitch(nextSplit);
       }
     })
   }
@@ -1105,10 +1180,83 @@ struct ThreadDetail {
     }
   }
 
-  /** 官方悬浮岛 Dock 宽度（vp）：与手写定稿 dock 同宽（屏宽 - 64，下限 240） */
+  // ===== 平板适配判据（§4.9 DT-A）=====
+
+  /** 横竖屏：用宽高比（同 §4.7 S-B / §4.8 T-B），不用宽度阈值 */
+  private isLandscape(): boolean {
+    return this.currentWidth > this.pageHeight;
+  }
+
+  /**
+   * 回复区列数（§4.9 DT-G）：手机（含横屏 / 分屏 / 窄窗）恒 1；大屏恒 3。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
+   */
+  private replyColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.currentWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return 3;
+  }
+
+  /** 是否左右分栏（§4.9 DT-I，仅大屏横屏）：主楼独占左栏、回复独占右栏 */
+  private splitMode(): boolean {
+    return this.isWideFormDevice && this.currentWidth >= Breakpoint.sm && this.isLandscape();
+  }
+
+  /**
+   * 形态切换平滑化（2026-09-13 二次优化 —— 消除「闪一下」）。
+   *
+   * 上一版把 `contentOpacity` **瞬间归零**再淡入，那一帧「内容啪地消失」正是用户看到的闪烁；
+   * 且重建本身是同步的，并不需要提前隐藏。现改为**三段全动画、无瞬间跳变**：
+   *   ① 淡出 100ms（`animateTo`，渐变而非瞬变）；
+   *   ② 在内容不可见时才写 `isSplit` → 结构切换与全量重建发生在透明期，用户看不见；
+   *   ③ 淡入 160ms。
+   * 全程都有过渡，没有「空白帧」，故不闪。未就绪（首屏 / 无数据）时直接切，不参与动画，
+   * 避免与首屏 fadeIn 打架。
+   */
+  private applySplitSwitch(next: boolean): void {
+    if (this.loadState !== LoadState.Success || !this.detail) {
+      this.isSplit = next;
+      return;
+    }
+    animateTo({
+      duration: 100,
+      curve: Curve.EaseIn,
+      onFinish: () => {
+        this.isSplit = next;
+        setTimeout(() => {
+          animateTo({ duration: 160, curve: Curve.EaseOut }, () => {
+            this.contentOpacity = 1;
+          });
+        }, 16);
+      }
+    }, () => {
+      this.contentOpacity = 0;
+    });
+  }
+
+  /**
+   * 官方悬浮岛 Dock 宽度（vp，形态分档）：
+   * - **手机（含横屏 / 分屏 / 窄窗）**：保持原「屏宽 − 64」（下限 240）**逐像素不变** ——
+   *   ⚠️ 不可对手机封顶：手机屏宽并非都是 360（393vp 等主流机型，「屏宽 − 64」= 329），
+   *   任何平板档封顶值作用于手机都会实实在在收窄手机底栏（用户真机已驳回一次）。
+   * - **平板 / 大屏形态**：封顶到 `DETAIL_DOCK_TABLET_WIDTH`(592 = 现有基础 296 宽一倍，
+   *   2026-09-14 用户要求「底栏在现有基础宽一倍，跳转框跟着拉伸」)，防「屏宽 − 64」在
+   *   1024 下拉成 960vp 通栏，同时比 296 观感更舒展。
+   * 消费方（官方岛 barWidth / SortPillShell 定位公式）全部经此单点 → 排序壳左缘
+   * = (currentWidth − 592) / 2 − 16，自动跟随新宽度与岛保持左对齐（-16 为真机微调项，
+   * 宽度变化后如仍偏差只调该值）。
+   */
   private dockPillWidth(): number {
     const w: number = this.currentWidth > 0 ? this.currentWidth - 64 : 296;
-    return w > 240 ? w : 240;
+    if (!this.isWideFormDevice) {
+      return w > 240 ? w : 240;
+    }
+    const capped: number = w > DETAIL_DOCK_TABLET_WIDTH ? DETAIL_DOCK_TABLET_WIDTH : w;
+    return capped > 240 ? capped : 240;
   }
 
   /** 官方悬浮岛底距（vp）：岛底留白 30，与旧评论胶囊 margin bottom 一致 */
@@ -1165,7 +1313,13 @@ struct ThreadDetail {
         mediumBarWidth: this.dockPillWidth(),
         largeBarWidth: this.dockPillWidth()
       },
-      barBottomMargin: this.dockBottomMargin(),
+      // 首帧重排触发（2026-09-13）：官方悬浮条存在首帧时序问题 —— 首次进入时槽内内容不随岛视觉
+      // 居中（点赞/收藏/跳转/发送整体偏上、参差），**旋转一下触发系统重排后才正常**（用户真机复现；
+      // 应用层对槽内容做 justifyContent 兜底无效，问题在官方组件内部布局时序）。
+      // 修复 = 进页后对 `barBottomMargin` 施加一次 0.5vp 微变（视觉不可察），**模拟旋转的
+      // 「布局参数变化 → 系统重排悬浮条」**，让槽内内容在首帧后尽快对齐。手机同样会 nudge 一次，
+      // 0.5vp 无感。若 300ms 不够（数据慢）可再调时机。
+      barBottomMargin: this.dockBottomMargin() + this.dockNudge * 0.5,
       systemMaterial: ImmMaterial.floatingBar()
     })
     .backgroundColor(Color.Transparent)
@@ -1182,6 +1336,12 @@ struct ThreadDetail {
     }
     .width('100%')
     .height('100%')
+    // 首帧垂直居中兜底（2026-09-13）：官方悬浮条槽位的首帧高度可能被系统临时算大（含安全区等），
+    // 而 Column 默认主轴 Start（顶对齐）→ 槽内内容整体顶在槽顶、偏上，且点赞/收藏/发送（42 高）
+    // 与跳转胶囊（46 高）偏移量随高度略异 → 真机表现「首帧各元素不齐，旋转一下重排后才正常」。
+    // 改为 justifyContent(Center)：**无论槽首帧多高，内容 Row(66) 始终居中于槽** —— 与官方岛
+    // 视觉胶囊（同样居中于槽）永远重合，首帧即正确；槽高正常（=66）时与顶对齐等价，手机零变化。
+    .justifyContent(FlexAlign.Center)
     .padding({ left: 8, right: 8 })
   }
 
@@ -1216,11 +1376,12 @@ struct ThreadDetail {
    */
   @Builder
   SortPillShell() {
-    // 外层全宽 Row 只负责「定位」：Stack(alignContent: Bottom) 会把收窄后的壳水平居中，且靠 margin
-    // 拉不回左缘（Stack 居中是按含 margin 的外框算的），故垫一层全宽 Row，用 justifyContent(Start)
-    // + padding-left 32 把壳钉回改造前的左缘。
-    // 32 的来路：改造前 SortRowInSlot 的 Row 宽 = 屏宽 - 64vp、由撑满壳宽的 Column 水平居中
-    // → 左缘 = (屏宽 - (屏宽 - 64)) / 2 = 32，与悬浮岛内评论条左缘（岛左缘 24 + 岛内 padding 8）同一条竖线。
+    // 水平定位（2026-09-13）：公式定位 + 横屏实测左移修正 ——
+    // 基准 = (currentWidth − 底栏宽) / 2（底栏由系统居中，壳左缘对齐底栏左缘）；
+    // 手机档 (393 − 329) / 2 = 32 逐像素不变。
+    // 横屏分栏（splitMode）下真机实测排序壳偏右（官方岛视觉左缘与公式值存在系统级偏差）；
+    // 修正量经真机二轮校准：28（偏左）→ 38（更偏左）→ 定 16（28 偏左说明左移过量，回撤 12）。
+    // 真机微调项：偏差变化时只调这一个值；竖屏 / 手机不修正。
     // Row 与壳都挂 hitTestBehavior(None)：自身不参与触摸测试，子节点（两枚胶囊）与兄弟节点照常
     // （与 ThreadList FabSlotShell 的同名处理一致）。
     Row() {
@@ -1248,10 +1409,16 @@ struct ThreadDetail {
     .width('100%')
     .height(THREAD_DETAIL_SORT_ROW_HEIGHT)
     .justifyContent(FlexAlign.Start)
-    .padding({ left: 32 })
+    // 水平定位（2026-09-13）：基准 = (currentWidth − 底栏宽) / 2（底栏居中、壳左缘对齐底栏左缘）；
+    // 横屏分栏真机微调：底栏加宽到 592 后实测胶囊仍偏右 → 左移量 16 → 28 → 40（2026-09-14 两轮校准，偏差变化时只调这一个值）；
+    // 竖屏 / 手机维持公式（手机 (393 − 329) / 2 = 32 逐像素不变）。
+    .padding({
+      left: Math.max(0, (this.currentWidth - this.dockPillWidth()) / 2 - (this.splitMode() ? 40 : 0))
+    })
     .hitTestBehavior(HitTestMode.None)
-    // 底距沿用原壳上的 margin（岛底余量 30 + 岛高 66），margin 已移交外层 Row，壳自身不再设
-    .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight() })
+    // 底距沿用原壳上的 margin（岛底余量 30 + 岛高 66），margin 已移交外层 Row，壳自身不再设；
+    // 横屏分栏追加 14vp 呼吸（真机反馈横屏下排序行与底栏贴住）
+    .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight() + (this.splitMode() ? 14 : 0) })
   }
 
   /** 排序行（官方槽位版）：外层 Column 撑满壳宽，内层 Row 塞满 Column，几何与 SortRowOverlay 内
@@ -1466,69 +1633,95 @@ struct ThreadDetail {
           // 楼层一旦滚过"正序栏/底栏"那条横线就被当作视口外整层剔除（消失）。
           // 该剔除与懒加载无关：底栏移除、全量 ForEach(仍在 List 内)均复现。
           // 改用 Scroll + Column 全量渲染后不再消失，故固定此方案。
+          if (this.isSplit) {
+            // ===== 横屏分栏（§4.9 DT-I）：左栏固定宽 =「帖子本身宽度」，右栏回复三列瀑布流 =====
+            // 沉浸四项（overlay / blendMode / backgroundColor / opacity）必须**整体**挂在这一层：
+            // 只挂右栏会让顶部渐隐只盖右栏、blendMode 作用域错位（DT-E 红线）。
+            Column() {
+              Column().width('100%').height(98)
+              Row({ space: Spacing.md }) {
+                // 左栏：主楼（独立滚动；不挂 onReachEnd / id —— 主楼不参与分页与楼层定位）
+                // 首项放「幽灵表头占位」（2026-09-13）：右栏第一排卡片上方有「回复 N 条」表头 +
+                // 12 间距，左栏主楼卡若直接顶格会比右栏卡片高出一截（真机反馈错位）。
+                // 占位与 ReplySectionHeader 同几何（随字号缩放同步），Column space 12 与右栏同构
+                // → 主楼卡顶 ≡ 右栏第一排卡片顶。
+                Scroll(this.scrollerLeft) {
+                  Column({ space: Spacing.md }) {
+                    this.ReplyHeaderGhost()
+                    this.PostHeader()
+                  }
+                  .width('100%')
+                  // 主楼短于视口时顶对齐（Scroll 对小内容默认垂直居中）
+                  .constraintSize({ minHeight: '100%' })
+                }
+                .width(DETAIL_MAIN_WIDTH)
+                .scrollBar(BarState.Off)
+                .clip(false)
+                .edgeEffect(EdgeEffect.Spring)
+                .padding({ left: Spacing.lg, right: 8, bottom: 160 })
+
+                // 右栏：回复区（保留 id / onReachEnd / 底部让位 → 楼层定位与分页公式零改动）
+                // 弃用 WaterFlow + sections（错位修复二，同竖屏分支）：回归 Scroll + 列内独立堆叠
+                Scroll(this.scroller) {
+                  Column({ space: Spacing.md }) {
+                    this.ReplySectionHeader()
+                    this.FloorColumnsBlock()
+                    this.FooterSentinel()
+                  }
+                  .width('100%')
+                  // 回复少时顶对齐（Scroll 对小内容默认垂直居中）
+                  .constraintSize({ minHeight: '100%' })
+                }
+                .layoutWeight(1)
+                .width('100%')
+                .padding({ left: 8, right: Spacing.lg, bottom: 160 })
+                .id('thread_scroll_content')
+                .scrollBar(BarState.Off)
+                .clip(false)
+                .edgeEffect(EdgeEffect.Spring)
+                .onReachEnd(() => {
+                  if (!this.loadingMore && this.hasMoreFloors) {
+                    this.loadMoreFloors();
+                  }
+                })
+              }
+              .width('100%')
+              .layoutWeight(1)
+              .alignItems(VerticalAlign.Top)
+            }
+            .width('100%')
+            .height('100%')
+            .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+            .overlay(this.TopFadeBand(), { align: Alignment.Top })
+            .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+            .backgroundColor(Theme.bg(this.isDark))
+            .opacity(this.contentOpacity)
+          } else {
+          // ===== 竖屏 / 手机：Scroll + Column，楼层「列内独立堆叠」多列（2026-09-13 错位修复二）=====
+          // 弃用 WaterFlow + sections：真机两轮复现「FlowItem 内容按全宽测量却被按三列摆放」的
+          // 引擎级段计数竞态（卡片重叠 / 内容跨列溢出），无法可靠修复；改用与 Scroll 兼容的
+          // 「列内独立堆叠」三列 Row（瀑布流观感本质 = 无行内对齐留白），通栏项 / 定位 / 分页 /
+          // 沉浸属性全部回到改造前已验证的 Scroll 挂点。楼层仍全量渲染（规避历史 List 视口剔除 bug）。
           Scroll(this.scroller) {
             Column({ space: Spacing.md }) {
               // 预留顶栏高度作为初始间距
               Column().width('100%').height(98)
               this.PostHeader()
               this.ReplySectionHeader()
-              // 楼层全量渲染：不做任何可视区回收/懒构建（规避 List 视口剔除 bug）
-              ForEach(this.floors, (floor: FloorItem) => {
-                Column() {
-                  this.FloorCard(floor)
-                }
-                .id('floor_' + floor.floorId)
-                .width('100%')
-                .backgroundColor(this.highlightFloorId === floor.floorId ? (this.isDark ? '#1A3173FF' : '#1A3173FF') : Color.Transparent)
-                // 高亮底色层：圆角必须与楼层卡（26）一致，否则高亮时外角会露出直角/小圆角
-                .borderRadius(this.highlightFloorId === floor.floorId ? 26 : 0)
-                .clip(true)
-              }, (floor: FloorItem) => `${floor.floorId}_${floor.floor}`)
-              // 触底哨兵：展示加载状态 / 手动重试（自动加载由 Scroll.onReachEnd 驱动）
-              if (this.hasMoreFloors) {
-                Column() {
-                  if (this.loadingMore) {
-                    Row({ space: 8 }) {
-                      LoadingProgress()
-                        .width(20)
-                        .height(20)
-                        .color(Theme.textSecondary(this.isDark))
-                      Text('正在加载更多回复...')
-                        .fontSize(fs(13, this.fontScale))
-                        .fontColor(Theme.textSecondary(this.isDark))
-                    }
-                    .width('100%')
-                    .justifyContent(FlexAlign.Center)
-                    .padding({ top: 12, bottom: 12 })
-                  } else {
-                    Button('点击加载更多回复')
-                      .fontSize(fs(13, this.fontScale))
-                      .fontColor(Theme.brand())
-                      .backgroundColor(Color.Transparent)
-                      .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-                      .onClick(() => { this.loadMoreFloors(); })
-                  }
-                }
-                .width('100%')
-                .padding({ top: 8, bottom: 16 })
-              } else if (this.floors.length > 0) {
-                Text('— 已经到底啦 —')
-                  .fontSize(fs(12, this.fontScale))
-                  .fontColor(Theme.textTertiary(this.isDark))
-                  .width('100%')
-                  .textAlign(TextAlign.Center)
-                  .padding({ top: 12, bottom: 16 })
-              }
+              this.FloorColumnsBlock()
+              this.FooterSentinel()
             }
             .width('100%')
-            .id('thread_scroll_content')
+            // 内容少时必须顶对齐：Scroll 对「小于视口的内容」默认垂直居中（真机表现为主楼悬在
+            // 页面中部、上方大片空白）。Scroll 无 alignment 属性 → 用 minHeight 让列恒占满视口，
+            // Column 默认主轴 Start → 内容自上而下；内容多时 minHeight 不生效，滚动照常。
+            .constraintSize({ minHeight: '100%' })
           }
           .width('100%')
           .height('100%')
           .scrollBar(BarState.Off)
           // 为底部悬浮回复栏留出滚动空间，最后一项可完整滚入屏幕
           .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: 160 })
-          .align(Alignment.TopStart)
           .edgeEffect(EdgeEffect.Spring)
           // 滚动触底：自动加载下一页楼层（loadingMore/hasMore 双防重）
           .onReachEnd(() => {
@@ -1536,6 +1729,7 @@ struct ThreadDetail {
               this.loadMoreFloors();
             }
           })
+          .id('thread_scroll_content')
           // 沉浸：绘制扩展到状态栏与底部安全区，滚动可视区 = 整屏，无独立裁剪层
           .clip(false)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
@@ -1544,6 +1738,7 @@ struct ThreadDetail {
           .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
           .backgroundColor(Theme.bg(this.isDark))
           .opacity(this.contentOpacity)
+          }
         }
         // 骨架屏覆盖层：Loading 期间盖在内容上方，透明度由 fadeInContent 控制淡出（1→0）
         if (this.loadState === LoadState.Loading) {
@@ -1580,7 +1775,9 @@ struct ThreadDetail {
   }
 
   /** 排序切换行：正序 / 只看全部两枚独立玻璃小胶囊。旧叠放路径贴于评论条上方，
-   *  官方壳路径经 SortRowOverlay 悬浮于评论岛上方。 */
+   *  官方壳路径经 SortRowOverlay 悬浮于评论岛上方。
+   *  宽度与评论条同源（`dockPillWidth()`，手机基线 296）→ 排序行左缘 = 底栏左缘
+   *  （父 `BottomDock` 的 `align(Alignment.Bottom)` 水平居中，两行左缘天然对齐）。 */
   @Builder
   ReplyControls() {
     Row({ space: 8 }) {
@@ -1593,7 +1790,7 @@ struct ThreadDetail {
         this.loadDetail();
       })
     }
-    .width('calc(100% - 64vp)')
+    .width(this.dockPillWidth())
     .padding({ top: 4, bottom: 8 })
     .justifyContent(FlexAlign.Start)
     .backgroundColor(Color.Transparent)
@@ -2204,7 +2401,8 @@ struct ThreadDetail {
       this.RichTextContent(this.detail!.fragments ?? [], this.detail!.contentText || '（楼主未提供正文）', fs(17), Theme.textPrimary(this.isDark), 28)
 
       if (this.detail!.images.length > 0) {
-        this.ImageGrid(this.detail!.images)
+        // 通栏主楼：capMaxWidth=true（336 封顶防拉伸）
+        this.ImageGrid(this.detail!.images, true)
       }
 
     }
@@ -2230,6 +2428,129 @@ struct ThreadDetail {
     }
     .width('100%')
     .padding({ left: 4, right: 4, top: 2, bottom: 2 })
+  }
+
+  /**
+   * 幽灵回复表头（横屏分栏·左栏专用，2026-09-13）：与 `ReplySectionHeader` **同几何**的透明占位行
+   * —— 右栏第一排卡片上方有「回复 N 条」表头 + space 12，左栏主楼卡顶需与之对齐。
+   * 结构 / 字号 / padding 与真表头逐项一致（字号缩放自动同步），仅文字为空格 → 撑高等高、不显示。
+   */
+  @Builder
+  ReplyHeaderGhost() {
+    Row({ space: Spacing.sm }) {
+      Text(' ')
+        .fontSize(fs(16, this.fontScale))
+        .fontWeight(FontWeight.Bold)
+        .width('100%')
+        .padding({ left: 4, right: 4, top: 2, bottom: 2 })
+    }
+    .width('100%')
+  }
+
+  // ===== 平板适配 §4.9（2026-09-13 错位修复二：弃 WaterFlow+sections，改列内独立堆叠）=====
+
+  /**
+   * 楼层区（多列 / 单列统一入口）：
+   * - 多列档：三列「列内独立堆叠」Row（`i % 3` 交替分桶）—— 瀑布流的观感本质（无行内对齐留白），
+   *   但不依赖 `WaterFlowSections`（真机两轮复现段计数与 ForEach 展开的竞态：FlowItem 内容按全宽
+   *   测量却被按三列摆放 → 卡片重叠 / 内容跨列溢出，无法可靠修复，故弃用）。
+   * - 单列档（手机 / 窄窗）：原 `ForEach` 逐像素回归。
+   * `.id('floor_' + floorId)` 与高亮底必须**随卡进列** —— 楼层定位靠它取几何（列内 `width('100%')`
+   * 引用列宽，约束链完整，不存在 WaterFlow 段排放的宽度歧义）。
+   */
+  @Builder
+  FloorColumnsBlock() {
+    if (this.replyColumns() > 1) {
+      Row({ space: Spacing.md }) {
+        ForEach(this.floorColumnsData(), (col: FloorItem[], colIdx: number) => {
+          Column({ space: Spacing.md }) {
+            ForEach(col, (floor: FloorItem) => {
+              this.FloorCardItem(floor)
+            }, (floor: FloorItem) => `${floor.floorId}_${floor.floor}`)
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+        }, (col: FloorItem[], colIdx: number) => `col_${colIdx}_${col.length}_${col[0]?.floorId ?? 'e'}`)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+    } else {
+      ForEach(this.floors, (floor: FloorItem) => {
+        this.FloorCardItem(floor)
+      }, (floor: FloorItem) => `${floor.floorId}_${floor.floor}`)
+    }
+  }
+
+  /** 楼层交替分桶：`i % 列数` 轮流进列（顺序观感与瀑布流一致，零估算） */
+  private floorColumnsData(): FloorItem[][] {
+    const cols: number = this.replyColumns();
+    const buckets: FloorItem[][] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+    }
+    for (let i = 0; i < this.floors.length; i++) {
+      buckets[i % cols].push(this.floors[i]);
+    }
+    return buckets;
+  }
+
+  /** 单张楼层卡（含定位锚点 id 与高亮底，竖屏 / 横屏 / 单列 / 多列共用同一份包装） */
+  @Builder
+  FloorCardItem(floor: FloorItem) {
+    Column() {
+      this.FloorCard(floor)
+    }
+    .id('floor_' + floor.floorId)
+    .width('100%')
+    .backgroundColor(this.highlightFloorId === floor.floorId ? (this.isDark ? '#1A3173FF' : '#1A3173FF') : Color.Transparent)
+    // 高亮底色层：圆角必须与楼层卡（26）一致，否则高亮时外角会露出直角/小圆角
+    .borderRadius(this.highlightFloorId === floor.floorId ? 26 : 0)
+    .clip(true)
+  }
+
+  /**
+   * 触底哨兵（通栏普通节点）：「加载更多 / 正在加载 / 已经到底啦」内部条件渲染。
+   * 已回归 Scroll + Column 结构，无 WaterFlow 段计数约束，可自由条件渲染。
+   */
+  @Builder
+  FooterSentinel() {
+    Column() {
+      if (this.hasMoreFloors) {
+          Column() {
+            if (this.loadingMore) {
+              Row({ space: 8 }) {
+                LoadingProgress()
+                  .width(20)
+                  .height(20)
+                  .color(Theme.textSecondary(this.isDark))
+                Text('正在加载更多回复...')
+                  .fontSize(fs(13, this.fontScale))
+                  .fontColor(Theme.textSecondary(this.isDark))
+              }
+              .width('100%')
+              .justifyContent(FlexAlign.Center)
+              .padding({ top: 12, bottom: 12 })
+            } else {
+              Button('点击加载更多回复')
+                .fontSize(fs(13, this.fontScale))
+                .fontColor(Theme.brand())
+                .backgroundColor(Color.Transparent)
+                .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                .onClick(() => { this.loadMoreFloors(); })
+            }
+          }
+          .width('100%')
+          .padding({ top: 8, bottom: 16 })
+        } else if (this.floors.length > 0) {
+          Text('— 已经到底啦 —')
+            .fontSize(fs(12, this.fontScale))
+            .fontColor(Theme.textTertiary(this.isDark))
+            .width('100%')
+            .textAlign(TextAlign.Center)
+            .padding({ top: 12, bottom: 16 })
+        }
+      }
+      .width('100%')
   }
 
   // 单个楼层卡片：楼层头部 + 正文 + 图片九宫格 + 楼中楼预览
@@ -2322,7 +2643,8 @@ struct ThreadDetail {
       this.RichTextContent(floor.fragments ?? [], floor.contentText, fs(16), Theme.textPrimary(this.isDark), 26)
 
       if (floor.images.length > 0) {
-        this.ImageGrid(floor.images)
+        // 列内楼层卡：capMaxWidth=false（跟随列宽，杜绝交叉轴测量歧义）
+        this.ImageGrid(floor.images, false)
       }
       if ((floor.comments ?? []).length > 0 || (floor.commentsTotal ?? 0) > 0) {
         this.CommentList(floor.comments ?? [], floor.commentsTotal ?? (floor.comments ?? []).length, floor.commentsHasMore === true, floor.floorId, floor.floor)
@@ -2399,7 +2721,7 @@ struct ThreadDetail {
                 // 正文
                 this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
                 if ((comment.images ?? []).length > 0) {
-                  this.ImageGrid(comment.images ?? [])
+                  this.ImageGrid(comment.images ?? [], false)
                 }
               }
               .alignItems(HorizontalAlign.Start)
@@ -2566,8 +2888,17 @@ struct ThreadDetail {
     return idx >= 0 ? idx : 0;
   }
 
+  /**
+   * 图片宫格（真机错位修复 2026-09-13）：`Grid` 是**可滚动容器**，嵌在 `WaterFlow.FlowItem` 内时
+   * 「自测量高度」与「实际渲染高度」可能不一致（格高恒 120 但总高靠 Grid 自算），布局期用错高度
+   * 会把后续 FlowItem 摆错位置 → 卡片重叠（竖屏）/ 列溢出（横屏），真机已复现。
+   * 故**显式给出总高** = 行数 × 120 + (行数 − 1) × 6，测量期即终值，与首页 ThreadCard
+   * 「图片尺寸测量期确定」的成品口径对齐。
+   * `capMaxWidth`：仅**通栏卡**（主楼）传 true（336 封顶防通栏拉伸）；列内卡（楼层 / 楼中楼）传 false
+   * —— 窄列下列宽本就 < 336，写死 336 上限没有意义，跟随列宽（'100%'）杜绝交叉轴测量歧义。
+   */
   @Builder
-  ImageGrid(images: string[]) {
+  ImageGrid(images: string[], capMaxWidth: boolean = true) {
     Grid() {
       ForEach(images, (img: string, idx: number) => {
         GridItem() {
@@ -2595,6 +2926,11 @@ struct ThreadDetail {
     .columnsGap(6)
     .rowsGap(6)
     .width('100%')
+    // 显式总高（错位修复）：行数 × 格高 + 行间隙，消除 FlowItem 内 Grid 自测量的不确定性
+    .height(Math.ceil(images.length / 3) * 120 + (Math.ceil(images.length / 3) - 1) * 6)
+    // §4.9 DT-J：通栏卡限宽 336 防三列被均分到 1000+vp（每格 ≈ 320vp）而格高恒 120 → 图片横向拉伸。
+    // 列内卡（capMaxWidth=false）跟随列宽 '100%'；手机档通栏可用宽 ≈ 296vp < 336 → 封顶不生效（逐像素不变）。
+    .constraintSize({ maxWidth: capMaxWidth ? DETAIL_IMAGE_GRID_MAX_WIDTH : '100%' })
   }
 
   // 提取唯一表情URL集合（给隐藏预取Image跑onComplete/onError用）
@@ -3082,17 +3418,27 @@ struct ThreadDetail {
       Row({ space: 8 }) {
         this.CommentBarBody()
       }
+      // 岛内内容宽度（2026-09-13 回退）：曾改为 `dockPillWidth() − 16` 试图解决平板裁切，但 `dockPillWidth()`
+      // 在手机档 = 296 → 减 16 后手机底栏内容宽从「全屏 100%」变成 280，**破坏了手机零回归**（用户已驳回，回退）。
       .width('100%')
       .height(66)
-      // 垂直居中补偿：官方悬浮胶囊的系统留白上多下少，视觉中心略高于槽盒中心，
-      // 内容整体上移 4vp（top+bottom 保持 8、减小 top 即上移），使控件贴近岛内中心线。
-      // 真机若仍偏下：继续减小 top / 增大 bottom（如 0/10 → 上移 5vp）；过头则回落。
+      // 底栏内部居中（2026-09-13）：点赞 / 收藏 / 发送钮固定宽，「跳转」胶囊 layoutWeight(1)
+      // 撑满剩余 → 内容填满岛宽；显式声明居中对齐作为意图表达。
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      // 垂直居中补偿（2026-09-13 二次确认·两端统一）：官方悬浮岛的系统留白**上多下少**（与形态无关，
+      // 同一系统组件），无补偿时内容整体偏上 —— 平板档曾按「仅平板移除补偿」归零，真机随即复现
+      // 「点赞 / 收藏 / 跳转 / 发送整体偏上、看似不齐」（各元素高 42/46/42，偏移量随高度略异）。
+      // 故补偿恢复**两端统一** bottom 8（内容区上移 4vp 贴合官方岛视觉中心）；手机档本就是 8，零变化。
       .padding({ left: 0, right: 0, top: 0, bottom: 8 })
     } else {
       Row({ space: 8 }) {
         this.CommentBarBody()
       }
-      .width('calc(100% - 64vp)')
+      // 底栏不拉伸（2026-09-13）：原 `calc(100% - 64vp)` 在平板下同样会被拉成通栏，
+      // 改固定宽（手机基线 296，与官方悬浮岛同宽）；父 `BottomDock` 的 Column 是
+      // `align(Alignment.Bottom)` → 固定宽子项天然水平居中。
+      .width(this.dockPillWidth())
       .height(66)
       .padding({ left: 6, right: 6, top: 4, bottom: 4 })
       // 外层整体玻璃胶囊：真磨砂（Regular）+ 极淡底/描边/轻影，点赞/收藏直接放在上面，不再套“框中框”。

@@ -18,9 +18,10 @@
 
 import { SubPostDetail as SubPostDetailModel, FloorItem, CommentItem, ContentFragment, ContentFragmentType } from '../model/DataModel';
 import { common, Want } from '@kit.AbilityKit';
-import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
+import { display } from '@kit.ArkUI';
+import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { TiebaService } from '../service/TiebaService';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, tabletTopFadeStop } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { EmojiLoader } from '../network/EmojiLoader';
 import image from '@ohos.multimedia.image';
@@ -44,6 +45,18 @@ const SUBPOST_OFFICIAL_TITLE_BAR: boolean = true;
  * Scroll 首项占位（98）与之同值，保持原值不变。
  */
 const SUBPOST_TITLE_BAR_HEIGHT: number = 98;
+
+/**
+ * 平板适配 §4.10 SP-I：横屏分栏时的**左栏固定宽度**（vp）=「帖子本身宽度」，
+ * 与 §4.9 DT-I 同口径（420 为推荐值，备选 368 = 宫格自然宽 336 + 卡片内边距 32）。
+ */
+const SUBPOST_MAIN_WIDTH: number = 420;
+/**
+ * 平板适配 §4.10 SP-J：宫格图宽度上限（vp）= 3 × 108 + 2 × 6，与 §4.9 DT-J 同值同口径。
+ * 宽屏下不封顶会让三列被均分到 1000+vp 而格高恒 120 → 图片横向拉伸；
+ * 手机档可用宽 ≈ 296vp < 上限 → 不生效（逐像素不变）。
+ */
+const SUBPOST_IMAGE_GRID_MAX_WIDTH: number = 336;
 
 /**
  * 内容卡片圆角（vp）：父楼层卡与楼中楼回复卡统一 26（2026-09-11 用户指定）。
@@ -89,10 +102,81 @@ struct SubPostDetail {
   /** 定位翻页进行中标记，防重入 */
   private locatingNotify: boolean = false;
   private scroller: Scroller = new Scroller();
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.10）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别 */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口宽 / 高（vp）：aboutToAppear 取首帧初值，根 Stack.onAreaChange 实时兜底 */
+  @State currentWidth: number = 360;
+  @State pageHeight: number = 800;
+  /** 横屏分栏·左栏独立滚动控制器（§4.10 SP-I）：父楼层卡不参与分页与定位 */
+  private scrollerLeft: Scroller = new Scroller();
+  /** 形态切换淡入用透明度（2026-09-13，与 §4.9 同款平滑化） */
+  @State contentOpacity: number = 1.0;
+  /**
+   * 形态切换平滑化（2026-09-13）：缓存 `splitMode()` 的**结果**，只在真正跨形态（横↔竖）时写一次，
+   * 避免旋转过程中宽高每帧变化引发多次全量重建（「切换卡一下」的主要成本）。
+   */
+  @State isSplit: boolean = false;
 
   onPageShow(): void {
     this.fontSizeTick++;
   }
+
+  // ===== 平板适配判据（§4.10 SP-A）=====
+
+  /** 横竖屏：用宽高比（同 §4.7 S-B / §4.9 DT-A），不用宽度阈值 */
+  private isLandscape(): boolean {
+    return this.currentWidth > this.pageHeight;
+  }
+
+  /**
+   * 回复区列数（§4.10 SP-G）：手机（含横屏 / 分屏 / 窄窗）恒 1；大屏恒 3。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
+   */
+  private replyColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.currentWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return 3;
+  }
+
+  /** 是否左右分栏（§4.10 SP-I，仅大屏横屏）：父楼层卡独占左栏、回复独占右栏 */
+  private splitMode(): boolean {
+    return this.isWideFormDevice && this.currentWidth >= Breakpoint.sm && this.isLandscape();
+  }
+
+  /**
+   * 形态切换平滑化（2026-09-13 二次优化 —— 消除「闪一下」，与 §4.9 同款）。
+   * 三段全动画：① 淡出 100ms → ② 内容不可见时才切 `isSplit`（全量重建看不见）→ ③ 淡入 160ms。
+   * 全程无瞬间跳变，故不闪。未就绪时直接切，不参与动画。
+   */
+  private applySplitSwitch(next: boolean): void {
+    if (!this.detail) {
+      this.isSplit = next;
+      return;
+    }
+    animateTo({
+      duration: 100,
+      curve: Curve.EaseIn,
+      onFinish: () => {
+        this.isSplit = next;
+        setTimeout(() => {
+          animateTo({ duration: 160, curve: Curve.EaseOut }, () => {
+            this.contentOpacity = 1;
+          });
+        }, 16);
+      }
+    }, () => {
+      this.contentOpacity = 0;
+    });
+  }
+
   @State readyEmojiUrls: string[] = [];
   @State failedEmojiUrls: string[] = [];
   @State pendingLinkUrl: string = '';
@@ -152,6 +236,21 @@ struct SubPostDetail {
   aboutToAppear(): void {
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
+    // 首帧形态初值（§4.10 SP-A）：onAreaChange 只在尺寸变化后触发，横屏冷启动若不预置会先按竖屏判定再跳分栏
+    try {
+      const d = display.getDefaultDisplaySync();
+      const ui = this.getUIContext();
+      const w: number = ui.px2vp(d.width);
+      const h: number = ui.px2vp(d.height);
+      if (w > 0 && h > 0) {
+        this.currentWidth = w;
+        this.pageHeight = h;
+      }
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽高会失败，onAreaChange 会兜底
+    }
+    // 形态切换平滑化：首帧固化分栏结果（横屏冷启动直接走分栏）
+    this.isSplit = this.splitMode();
     const params = this.getUIContext().getRouter().getParams() as Record<string, Object>;
     if (params) {
       this.tid = `${params.tid ?? ''}`.trim();
@@ -327,8 +426,75 @@ struct SubPostDetail {
       } else if (this.loadState === LoadState.Empty) {
         EmptyView({ message: '当前楼层暂无楼中楼回复', icon: '○' }).layoutWeight(1)
       } else if (this.detail) {
+        if (this.isSplit) {
+          // ===== 横屏分栏（§4.10 SP-I）：左栏固定宽 =「帖子本身宽度」，右栏回复三列瀑布流 =====
+          // 沉浸两项（overlay / blendMode）必须**整体**挂在这一层：只挂右栏会让底部渐隐只盖右栏、
+          // blendMode 作用域错位（SP-K 红线）。本页无 backgroundColor / opacity（底色在根 Stack 上）。
+          Column() {
+            Column().width('100%').height(98)
+            Row({ space: Spacing.sm }) {
+              // 左栏：父楼层卡（独立滚动；不参与定位与翻页）
+              // 首项放「幽灵表头占位」（2026-09-13，与 §4.9 同款）：右栏第一排卡片上方有
+              // 「N 条楼中楼回复」表头 + space 8，左栏父楼层卡若直接顶格会比右栏卡片高出一截。
+              // 占位与本页真表头同几何（随字号缩放同步），Column space 与右栏同构
+              // → 父楼层卡顶 ≡ 右栏第一排卡片顶。
+              Scroll(this.scrollerLeft) {
+                Column({ space: Spacing.sm }) {
+                  this.ReplyHeaderGhost()
+                  this.ParentFloor(this.detail!.parent)
+                }
+                .width('100%')
+                // 父楼层卡短于视口时顶对齐（Scroll 对小内容默认垂直居中）
+                .constraintSize({ minHeight: '100%' })
+              }
+              .width(SUBPOST_MAIN_WIDTH)
+              .scrollBar(BarState.Off)
+              .clip(false)
+              .edgeEffect(EdgeEffect.Spring)
+              // 底部留白维持本页原值 Spacing.xl(20) —— **不是 §4.9 的 160**（本页无底部悬浮层）
+              .padding({ left: Spacing.lg, right: 8, bottom: Spacing.xl })
+
+              // 右栏：回复区（保留 id → 定位公式零改动）
+              // 弃用 WaterFlow + sections（错位修复二，与 §4.9 同款）：回归 Scroll + 列内独立堆叠
+              Scroll(this.scroller) {
+                Column({ space: Spacing.sm }) {
+                  Text(`${this.detail!.total} 条楼中楼回复`)
+                    .fontSize(fs(15, this.fontScale))
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor(Theme.textPrimary(this.isDark))
+                    .width('100%')
+                    .padding({ left: 4, right: 4, top: 4, bottom: 0 })
+                  this.CommentColumnsBlock()
+                }
+                .width('100%')
+                // 回复少时顶对齐（Scroll 对小内容默认垂直居中）
+                .constraintSize({ minHeight: '100%' })
+              }
+              .layoutWeight(1)
+              .width('100%')
+              .padding({ left: 8, right: Spacing.lg, bottom: Spacing.xl })
+              .id('subpost_scroll_content')
+              .scrollBar(BarState.Off)
+              .clip(false)
+              .edgeEffect(EdgeEffect.Spring)
+            }
+            .width('100%')
+            .layoutWeight(1)
+            .alignItems(VerticalAlign.Top)
+          }
+          .width('100%')
+          .height('100%')
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          // 形态切换平滑化：与 opacity 同层（根 Stack 已有底色，淡入不露底）
+          .opacity(this.contentOpacity)
+          .overlay(this.BottomFadeOverlay())
+          .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+        } else {
+        // ===== 竖屏 / 手机：Scroll + Column，回复「列内独立堆叠」多列（2026-09-13 错位修复二）=====
+        // 弃用 WaterFlow + sections（真机竞态见 §4.9 同款记录）；通栏项 / 定位 / 沉浸属性
+        // 全部回到改造前已验证的 Scroll 挂点。本页无触底哨兵。
         Scroll(this.scroller) {
-          Column({ space: Spacing.md }) {
+          Column({ space: Spacing.sm }) {
             // 预留顶栏高度作为初始间距
             Column().width('100%').height(98)
             this.ParentFloor(this.detail!.parent)
@@ -338,18 +504,26 @@ struct SubPostDetail {
               .fontColor(Theme.textPrimary(this.isDark))
               .width('100%')
               .padding({ left: 4, right: 4, top: 4, bottom: 0 })
-            this.CommentItems()
+            this.CommentColumnsBlock()
           }
           .width('100%')
-          .id('subpost_scroll_content')
-          .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
+          // 内容少时必须顶对齐：Scroll 对「小于视口的内容」默认垂直居中（真机表现为父楼层卡
+          // 悬在页面中部）。Scroll 无 alignment 属性 → 用 minHeight 让列恒占满视口，
+          // Column 默认主轴 Start → 内容自上而下；内容多时 minHeight 不生效，滚动照常。
+          .constraintSize({ minHeight: '100%' })
         }
         .layoutWeight(1)
         .scrollBar(BarState.Off)
+        .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
+        .id('subpost_scroll_content')
         .clip(false)
+        .edgeEffect(EdgeEffect.Spring)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        // 形态切换平滑化：与 opacity 同层（根 Stack 已有底色，淡入不露底）
+        .opacity(this.contentOpacity)
         .overlay(this.BottomFadeOverlay())
         .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+        }
       }
 
       // 悬浮顶栏（内容可穿过）；官方 title 槽位路径下两元素已在槽位里（SubPostTitleBar），这里不再叠一层
@@ -366,6 +540,23 @@ struct SubPostDetail {
     .height('100%')
     .backgroundColor(Theme.bg(this.isDark))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    // §4.10 SP-A：形态变化唯一挂点（本页此前完全没有形态判定）——回填窗口宽高供
+    // isLandscape() / splitMode() / replyColumns() 使用
+    .onAreaChange((_oldValue: Area, newValue: Area) => {
+      const width = newValue.width as number;
+      const height = newValue.height as number;
+      if (width > 0) {
+        this.currentWidth = width;
+      }
+      if (height > 0) {
+        this.pageHeight = height;
+      }
+      // 形态切换平滑化：只在「是否分栏」结果真正变化时才切（一次旋转只切一次）
+      const nextSplit: boolean = this.splitMode();
+      if (nextSplit !== this.isSplit) {
+        this.applySplitSwitch(nextSplit);
+      }
+    })
   }
 
   /**
@@ -460,6 +651,21 @@ struct SubPostDetail {
     .backgroundColor(Color.Transparent)
   }
 
+  /**
+   * 幽灵回复表头（横屏分栏·左栏专用，2026-09-13，与 §4.9 同款）：与真表头
+   * 「N 条楼中楼回复」（`:461`，15 号 bold + padding top 4 / bottom 0）**同几何**的透明占位行
+   * —— 右栏第一排卡片上方有表头 + space 8，左栏父楼层卡顶需与之对齐。
+   * 结构 / 字号 / padding 逐项一致（字号缩放自动同步），仅文字为空格 → 撑高等高、不显示。
+   */
+  @Builder
+  ReplyHeaderGhost() {
+    Text(' ')
+      .fontSize(fs(15, this.fontScale))
+      .fontWeight(FontWeight.Bold)
+      .width('100%')
+      .padding({ left: 4, right: 4, top: 4, bottom: 0 })
+  }
+
   @Builder
   ParentFloor(floor: FloorItem) {
     Column({ space: Spacing.sm }) {
@@ -484,7 +690,8 @@ struct SubPostDetail {
       .width('100%')
       this.RichTextContent(floor.fragments ?? [], floor.contentText || '（该楼层无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
       if (floor.images.length > 0) {
-        this.ImageGrid(floor.images)
+        // 父楼层卡：竖屏通栏 / 横屏左栏（420 固定宽）→ capMaxWidth=true（336 封顶防拉伸）
+        this.ImageGrid(floor.images, true)
       }
     }
     .width('100%')
@@ -493,12 +700,57 @@ struct SubPostDetail {
     .borderRadius(SUBPOST_CARD_RADIUS)
   }
 
+  /**
+   * 回复区（多列 / 单列统一入口，2026-09-13 错位修复二）：
+   * - 多列档：三列「列内独立堆叠」Row（`i % 3` 交替分桶）—— 弃用 WaterFlow + sections（真机竞态见 §4.9 同款）。
+   * - 单列档：原 `ForEach` 逐像素回归。
+   * `.id('spc_' + commentId)` 随卡进列，定位公式（`getRectangleById` + `targetY - 120`）零改动。
+   * 列内 / 单列间距均由外层 `Column({ space: Spacing.sm })` + 列内 `space` 提供（8，与卡间距同源）。
+   */
   @Builder
-  CommentItems() {
-    Column({ space: 8 }) {
-      ForEach(this.commentsState, (comment: CommentItem, commentIndex: number) => {
-        Column() {
-          Stack({ alignContent: Alignment.TopEnd }) {
+  CommentColumnsBlock() {
+    if (this.replyColumns() > 1) {
+      Row({ space: Spacing.sm }) {
+        ForEach(this.commentColumnsData(), (col: CommentItem[], colIdx: number) => {
+          Column({ space: Spacing.sm }) {
+            ForEach(col, (comment: CommentItem) => {
+              this.CommentCardItem(comment)
+            }, (comment: CommentItem) => `${comment.commentId}_${comment.isLiked ? 1 : 0}_${comment.likeCount ?? 0}`)
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+        }, (col: CommentItem[], colIdx: number) => `col_${colIdx}_${col.length}_${col[0]?.commentId ?? 'e'}`)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+    } else {
+      Column({ space: Spacing.sm }) {
+        ForEach(this.commentsState, (comment: CommentItem) => {
+          this.CommentCardItem(comment)
+        }, (comment: CommentItem) => `${comment.commentId}_${comment.isLiked ? 1 : 0}_${comment.likeCount ?? 0}`)
+      }
+      .width('100%')
+    }
+  }
+
+  /** 回复交替分桶：`i % 列数` 轮流进列（与 §4.9 同一策略，零估算） */
+  private commentColumnsData(): CommentItem[][] {
+    const cols: number = this.replyColumns();
+    const buckets: CommentItem[][] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+    }
+    for (let i = 0; i < this.commentsState.length; i++) {
+      buckets[i % cols].push(this.commentsState[i]);
+    }
+    return buckets;
+  }
+
+  /** 单张回复卡（含定位锚点 id，竖屏 / 横屏 / 单列 / 多列共用同一份包装） */
+  @Builder
+  CommentCardItem(comment: CommentItem) {
+    Column() {
+      Stack({ alignContent: Alignment.TopEnd }) {
             Row({ space: Spacing.sm }) {
               this.Avatar(comment.authorAvatar ?? '', comment.author, 32, comment.authorId ?? '')
               Column({ space: 4 }) {
@@ -549,7 +801,8 @@ struct SubPostDetail {
                 // 正文
                 this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
                 if ((comment.images ?? []).length > 0) {
-                  this.ImageGrid(comment.images ?? [])
+                  // 列内回复卡：跟随列宽（杜绝窄列交叉轴测量歧义）
+                  this.ImageGrid(comment.images ?? [], false)
                 }
               }
               .layoutWeight(1)
@@ -588,18 +841,11 @@ struct SubPostDetail {
             ? (this.isDark ? '#3C3C3C' : '#E4E4E4')
             : Theme.bgCard(this.isDark))
           .borderRadius(SUBPOST_CARD_RADIUS)
-          // 评论间距：非最后一条时追加 Spacing.sm 视觉区分
-          if ((commentIndex ?? 0) < this.commentsState.length - 1) {
-            Column() { }
-              .width('100%')
-              .height(Spacing.sm)
-          }
-        }
-        .id('spc_' + comment.commentId)
-        .width('100%')
-      }, (comment: CommentItem, commentIndex: number) => `${comment.commentId}_${comment.isLiked ? 1 : 0}_${comment.likeCount ?? 0}_${commentIndex ?? 0}`)
-    }
-    .width('100%')
+          // 卡间距改由 WaterFlow.rowsGap 提供（§4.10 SP-G）——
+          // 原「非最后一条追加 height(Spacing.sm)」用**全局下标**判定，多列后每列末条也会多留 8vp → 列底空洞，故删除。
+      }
+      .id('spc_' + comment.commentId)
+      .width('100%')
   }
 
   @Builder
@@ -667,8 +913,14 @@ struct SubPostDetail {
     return idx >= 0 ? idx : 0;
   }
 
+  /**
+   * 图片宫格（真机错位修复 2026-09-13）：`Grid` 是**可滚动容器**，嵌在 `WaterFlow.FlowItem` 内时
+   * 「自测量高度」与「实际渲染高度」可能不一致，布局期用错高度会把后续 FlowItem 摆错位置 → 卡片重叠。
+   * 故**显式给出总高** = 行数 × 120 + (行数 − 1) × 6，测量期即终值（与 §4.9 同款修复）。
+   * `capMaxWidth`：仅**通栏 / 左栏父楼层卡**传 true（336 封顶）；列内回复卡传 false（跟随列宽）。
+   */
   @Builder
-  ImageGrid(images: string[]) {
+  ImageGrid(images: string[], capMaxWidth: boolean = true) {
     Grid() {
       ForEach(images, (img: string, idx: number) => {
         GridItem() {
@@ -698,6 +950,11 @@ struct SubPostDetail {
     .columnsGap(6)
     .rowsGap(6)
     .width('100%')
+    // 显式总高（错位修复）：行数 × 格高 + 行间隙，消除 FlowItem 内 Grid 自测量的不确定性
+    .height(Math.ceil(images.length / 3) * 120 + (Math.ceil(images.length / 3) - 1) * 6)
+    // §4.10 SP-J：通栏 / 左栏卡限宽 336 防三列被均分拉宽；列内卡跟随列宽 '100%'。
+    // 手机档可用宽 ≈ 296vp < 336 → 封顶不生效（逐像素不变）。
+    .constraintSize({ maxWidth: capMaxWidth ? SUBPOST_IMAGE_GRID_MAX_WIDTH : '100%' })
   }
 
   @Builder
@@ -1051,7 +1308,7 @@ struct SubPostDetail {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', tabletTopFadeStop(98)], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

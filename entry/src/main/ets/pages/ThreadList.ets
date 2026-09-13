@@ -19,13 +19,13 @@
 import { common, Want } from '@kit.AbilityKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
-import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
+import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { display, curves, componentSnapshot } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
 import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { ForumSignStore } from '../service/ForumSignStore';
 import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail } from '../model/DataModel';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { LoadingView, EmptyView, ErrorView, ThreadCard, ThreadItemData, ThreadSharePayload, PinnedThreadItem } from '../components/CommonComponents';
@@ -158,6 +158,12 @@ const THREAD_LIST_SORT_BAR_PADDING: number = 5;
 const THREAD_LIST_SORT_BAR_BOTTOM: number = 30;
 /** 排序栏与加号钮之间的横向缝隙（两框**分离开**、不并成一条）：左 24 | 底栏 | 12 | 加号 | 右 24 */
 const THREAD_LIST_SORT_BAR_GAP: number = 12;
+/** 平板适配 §4.8 T-F：底栏宽度上限（多列档不随屏宽拉伸，锁到手机 360vp 下的取值 244） */
+const THREAD_LIST_SORT_BAR_MAX_WIDTH: number = 244;
+/** 平板适配 §4.8 T-F：吧头经验条宽度上限（多列档不随屏宽拉伸；手机档取大值不生效） */
+const THREAD_LIST_EXP_BAR_MAX_WIDTH: number = 220;
+/** 系统弹窗宽度默认上限（vp）：平板 / 折叠展开下「屏幕宽 - 48」可达 900+vp 把弹窗拉成通栏，故显式封顶 */
+const THREAD_LIST_DIALOG_MAX_WIDTH: number = 400;
 /** 列表底部让位（槽位路径）：加号钮顶 86（底距 30 + 56）+ 12 呼吸 = 98
  *  （刷新钮移除后最高点由刷新钮退回加号，故比原值 166 少 68、比更早的 244 少 146，
  *    列表可视区同步变大）。 */
@@ -318,6 +324,49 @@ struct ForumMoreDialogCard {
   }
 }
 
+/**
+ * 吧内帖子列表 WaterFlow 数据源（§4.8 决策 13）：把「置顶卡 + 普通帖」合并为一个列表，
+ * 通过 `threads` 的 `@Watch('onThreadsChanged')` 自动同步。
+ * `reload()` 全量替换（刷新 / 切排序），`notifyAdd()` 尾部追加（加载更多）。
+ */
+class ThreadListDataSource implements IDataSource {
+  private listeners: DataChangeListener[] = [];
+  public data: ThreadItem[] = [];
+
+  totalCount(): number {
+    return this.data.length;
+  }
+
+  getData(index: number): ThreadItem {
+    return this.data[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const idx: number = this.listeners.indexOf(listener);
+    if (idx >= 0) {
+      this.listeners.splice(idx, 1);
+    }
+  }
+
+  reload(): void {
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataReloaded();
+    });
+  }
+
+  notifyAdd(start: number): void {
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataAdd(start);
+    });
+  }
+}
+
 @Entry
 @Component
 struct ThreadList {
@@ -328,7 +377,7 @@ struct ThreadList {
   private sortSession: Map<number, SortSession> = new Map<number, SortSession>();
   // 排序预热标记：首次成功展示后后台把其它两个排序的冷缓存拉好，使首次切换即命中
   private warmupStarted: boolean = false;
-  @State loadState: LoadState = LoadState.Loading;
+  @State @Watch('onLoadStateChanged') loadState: LoadState = LoadState.Loading;
   @State errorMsg: string = '';
   @State page: number = 1;
   @State hasMore: boolean = true;
@@ -345,6 +394,15 @@ struct ThreadList {
   private lastPrefetchY: number = -10000;
   private loadToken: number = 0;
   @State selectedSort: number = 0;
+  /** WaterFlow 数据源（§4.8 T-G）：置顶卡 + 普通帖合并列表，@Watch('onThreadsChanged') 自动同步 */
+  @State listDataSource: ThreadListDataSource = new ThreadListDataSource();
+  /**
+   * WaterFlow 分段配置（§4.8 T-G 修正）：让**吧头成为跨列的首个格子**、随内容一起滚动
+   * （替代「吧头固定于滚动容器外」的旧结构）。section 0 = 吧头（全宽），section 1 = 主体（多列）。
+   */
+  @State sections: WaterFlowSections = new WaterFlowSections();
+  /** syncSections 去重键（「主体项数_主体列数」）：避免切排序时同一帧重复 splice 触发 WaterFlow 重排 */
+  private lastSectionKey: string = '';
   @State isDark: boolean = isDarkMode();
   @State forumInfo: ForumHeaderInfo | null = null;
   @State failedAvatar: boolean = false;
@@ -399,6 +457,18 @@ struct ThreadList {
   /** 根容器实宽（vp）：底部排序栏槽位壳的 `barWidth` 只接受数值（Dimension 不收 'calc(100% - 48vp)'，
    *  同 Search.ets / 本页 dialogCardWidth 的换算口径），由 ThreadListContent 根 Stack 的 onAreaChange 维护 */
   @State currentWidth: number = 0;
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.8）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别 */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口宽 / 高（vp）：aboutToAppear 同步取首帧初值，onAreaChange 实时兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+  /** 横竖屏判据（pageWidth > pageHeight）：**不能用** viewportW / viewportH 顶替，
+   *  那是 Scroll 视口尺寸（横屏时已被顶部 90 占位与底部让位吃掉），与窗口高不等 */
+  @State isLandscape: boolean = false;
 
   onPageShow(): void {
     this.fontSizeTick++;
@@ -716,10 +786,24 @@ struct ThreadList {
   aboutToAppear(): void {
     // 生命周期阶段UIContext已就绪，安全初始化context缓存
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    // 本页多列改造尚未落地：显式写回单列，避免吃到首页（已多列）留下的 cardColumns 残留，
-    // 让 ThreadCard 在手机上仍是改造前的单列几何（§6.1 D1「跨页共享标记必须在每个使用页都写」）。
-    // 本页落地多列（T-B）后，此处改为按本页列数无条件写入。
-    AppStorage.setOrCreate('cardColumns', 1);
+    // 首帧形态初值（§4.6 H-A / §4.8 T-B 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏若不预置
+    // 会出现「先 1 列再跳 4 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
+    try {
+      const d = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w > 0 && h > 0) {
+        this.pageWidth = w;
+        this.pageHeight = h;
+        this.isLandscape = w > h;
+      }
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败，onAreaChange 会兜底
+    }
+    // 列数标记下发：**无条件写**（单列也写 1），避免跨页残留（§6.1 D1 / D6）
+    this.syncCardColumns();
+    // WaterFlow 分段初值（§4.8 T-G）：吧头跨列格子 + 主体多列格子
+    this.syncSections();
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
     const params = this.getUIContext().getRouter().getParams() as Record<string, string>;
@@ -1300,6 +1384,8 @@ struct ThreadList {
    * 保留最近一份完整数据，使切回该排序可 0 开销直出。
    */
   private onThreadsChanged(): void {
+    // WaterFlow 数据源同步（§4.8 决策 13）：放在空列表短路之前，保证「清空」也能同步到数据源
+    this.syncListDataSource();
     if (this.threads.length === 0) {
       return;
     }
@@ -1309,6 +1395,91 @@ struct ThreadList {
       hasMore: this.hasMore,
       ts: Date.now(),
     });
+  }
+
+  /**
+   * WaterFlow 数据（§4.8 决策 13）：置顶卡排在前面，其余按原顺序。
+   * 「精选」tab（sort=2）不分置顶/普通，直接给全量。
+   * 置顶卡作为瀑布流的**普通格子**渲染（不拉伸，自然高度）。
+   */
+  private waterFlowThreads(): ThreadItem[] {
+    if (this.selectedSort === 2) {
+      return this.threads;
+    }
+    const pinned: ThreadItem[] = this.threads.filter((t: ThreadItem) => t.isTop === true);
+    const normal: ThreadItem[] = this.threads.filter((t: ThreadItem) => t.isTop !== true);
+    return pinned.concat(normal);
+  }
+
+  /** 把合并后的列表同步进 WaterFlow 数据源（全量替换或尾部追加） */
+  private syncListDataSource(): void {
+    const next: ThreadItem[] = this.waterFlowThreads();
+    const old: ThreadItem[] = this.listDataSource.data;
+    const oldLen: number = old.length;
+    // 判定「尾部追加」必须**逐项比对前缀**：只比长度会把「切排序 / 刷新后列表变长」误判成追加，
+    // 于是 WaterFlow 只重建尾段、前段仍渲染旧内容（真机表现为排序切换后列表内容错乱）。
+    let isAppend: boolean = oldLen > 0 && next.length > oldLen;
+    if (isAppend) {
+      for (let i: number = 0; i < oldLen; i++) {
+        if (next[i].tid !== old[i].tid) {
+          isAppend = false;
+          break;
+        }
+      }
+    }
+    this.listDataSource.data = next;
+    if (isAppend) {
+      this.listDataSource.notifyAdd(oldLen);
+    } else {
+      this.listDataSource.reload();
+    }
+    // 数据量变化 → 主体 section 的 itemsCount 必须同步（数量不匹配会让 WaterFlow 无法滚动）
+    this.syncSections();
+  }
+
+  /** 加载态变化 → 主体格子数变化（骨架屏 / 空态 / 错误视图各占 1 格） */
+  private onLoadStateChanged(): void {
+    this.syncSections();
+  }
+
+  /**
+   * 同步 WaterFlow 的分段配置（§4.8 T-G 修正）：吧头作为**跨列的首个格子**参与滚动。
+   * - section 0：吧头，`crossCount: 1` → 独占整行（全宽）
+   * - section 1：主体，`crossCount: 3/4` → 帖子多列；左右各留 12 边距（与单列档视觉一致）
+   *
+   * 官方约束（必须遵守）：各 section 的 `itemsCount` 累计和 **必须等于** `WaterFlow` 的实际子节点数，
+   * 否则组件无法正常滚动 → 数据源 / 列数 / 加载态任一变化后都要重新调用本方法。
+   * `onGetItemMainSizeByIndex` 一律不设置（文档要求不得跨 section 混用），由 `FlowItem` 自适应高度。
+   */
+  private syncSections(): void {
+    const cols: number = this.threadColumns();
+    const isSuccess: boolean = this.loadState === LoadState.Success;
+    // 主体 section：成功态 = 帖子多列（至少 1 项，规避 itemsCount 为 0）；
+    // 其余态 = 1 项、单列（骨架屏 / 空态 / 错误视图需占满整行，不能只占一列）
+    const bodyCount: number = isSuccess ? Math.max(this.listDataSource.data.length, 1) : 1;
+    const bodyCross: number = isSuccess ? cols : 1;
+    // 去重：切排序时本方法会被「数据源同步」「加载态回调」先后调两次，配置未变则直接返回，
+    // 避免同一帧内重复 splice 触发 WaterFlow 重排（真机表现为过场中画面一顿/闪）。
+    const key: string = `${bodyCount}_${bodyCross}`;
+    if (key === this.lastSectionKey) {
+      return;
+    }
+    this.lastSectionKey = key;
+    const next: SectionOptions[] = [
+      { itemsCount: 1, crossCount: 1 },
+      { itemsCount: bodyCount, crossCount: bodyCross, margin: { left: 12, right: 12 } },
+    ];
+    this.sections.splice(0, this.sections.length(), next);
+  }
+
+  /**
+   * 排序过场位移量（vp）：`inOffset` 是百分比语义（±100），换算成「整屏平移」。
+   * 多列档下卡片宽只有 1/3~1/4 屏，`translate` 直接写百分比会位移不足（卡片从半屏处冒出），
+   * 故统一用 vp 数值；宽度取根容器实测值，取不到时退回屏幕宽（分屏 / 折叠态更准）。
+   */
+  private sortShiftX(): number {
+    const w: number = this.currentWidth > 0 ? this.currentWidth : this.pageWidth;
+    return this.inOffset * w / 100;
   }
 
   /**
@@ -1385,7 +1556,9 @@ struct ThreadList {
    * 失败（组件未就绪 / 平台不支持）时静默降级为 null —— 过场退化成"只有新页滑入"，功能不受影响。
    */
   private captureExitSnapshot(): void {
-    // 裁剪边界：吧头块底边在 Scroll 视口里的 y（vp）。吧头高未测到时不裁，避免旧页内容整体错位
+    // 裁剪边界：吧头块底边在滚动视口里的 y（vp）。吧头高未测到时不裁，避免旧页内容整体错位。
+    // 单列 / 多列同款：多列档的吧头由「等量反向位移」抵消（见吧头 FlowItem），转场中同样静止，
+    // 故旧页快照同样要裁掉吧头 —— 否则旧页滑出时吧头会跟着滑，与静止的新页吧头重叠。
     const listTop: number = THREAD_LIST_HEADER_TOP_SPACE + this.headerBlockH
       - this.listScroller.currentOffset().yOffset;
     const clipTop: number = (this.headerBlockH > 0 && this.viewportH > 0)
@@ -1885,8 +2058,10 @@ struct ThreadList {
 
   /**
    * 「更多」操作面板控制器（系统 CustomDialog + API 26 沉浸光感）。
-   * 几何对齐改造前的自绘浮层：宽度 dialogCardWidth()、圆角 32vp、底部锚点（Bottom + dy -30，
-   * 对应原卡片 margin bottom 30 的悬浮基线）、遮罩 #06000000；卡内文案 / 字号 / 按钮尺寸全部原样保留。
+   * 几何与全站其余弹窗**统一口径**（用户 2026-09-13 要求「跟首页置顶弹窗一个高度位置」）：
+   * 宽度 dialogCardWidth()（带上限、不随平板屏宽拉伸）、圆角 32vp、
+   * 底部锚点 Bottom + dy **-110**（原 -30 是改造前自绘浮层的悬浮基线，现与收藏页 / 进吧页
+   * 置顶弹窗对齐；手机档同样生效）、遮罩 #06000000；卡内文案 / 字号 / 按钮尺寸全部原样保留。
    * 玻璃层交给 options.systemMaterial（ImmMaterial.dialog()）—— 材质会接管容器的背景色 /
    * 背景模糊 / 边框 / 阴影，故卡内不再自绘那四项。
    * ⚠️ customStyle 必须为 false —— customStyle=true 时弹窗背景强制透明、圆角归 0 且材质不生效。
@@ -1903,7 +2078,7 @@ struct ThreadList {
     }),
     autoCancel: true,
     alignment: DialogAlignment.Bottom,
-    offset: { dx: 0, dy: -30 },
+    offset: { dx: 0, dy: -110 },
     maskColor: '#06000000',
     cornerRadius: 32,
     // 弹窗宽度：Dimension 不接受 'calc(100% - 48vp)' 字符串，故按屏幕宽换算成数值 vp
@@ -1917,15 +2092,16 @@ struct ThreadList {
   });
 
   /**
-   * 弹窗卡片宽度（vp）= 屏幕宽 - 48vp，等价于改造前自绘浮层的 `calc(100% - 48vp)`。
+   * 弹窗卡片宽度（vp）= min(400, 屏幕宽 - 48)。
    * ArkTS 的 Dimension 只接受数值 / 百分比 / 资源，不接受 calc 字符串，故换算成数值。
-   * 取屏幕宽（display）而非窗口宽：弹窗容器宽度本身还受系统上限（默认 400vp）约束，
-   * 分屏 / 折叠态由该上限兜底。
+   * **上限 400**（系统弹窗默认宽度上限）：平板 / 折叠展开下「屏幕宽 - 48」可达 900+vp、
+   * 弹窗会被拉成通栏（用户真机反馈「弹窗不要拉伸」），故在此显式封顶；
+   * 手机档（360 - 48 = 312 < 400）不受影响，逐像素保持。
    */
   private dialogCardWidth(): number {
     const info: display.Display = display.getDefaultDisplaySync();
     const widthVp: number = info.width / info.densityPixels;
-    return Math.max(200, widthVp - 48);
+    return Math.max(200, Math.min(THREAD_LIST_DIALOG_MAX_WIDTH, widthVp - 48));
   }
 
   /** showMoreSheet 变化即驱动系统弹窗 open/close（既有 `this.showMoreSheet = x` 调用点零改动） */
@@ -1970,6 +2146,130 @@ struct ThreadList {
           .hitTestBehavior(HitTestMode.None)
       }
       // 新页（当前内容）：位移与旧页层对向，见 Scroll 链上的 translate
+      if (this.threadColumns() > 1 && !this.searchMode) {
+        // ===== 多列档（§4.8 T-G）：WaterFlow 整页滚动，吧头作为**跨列的首个格子**随内容滚动 =====
+        // 与首页（§4.2 决策 12）同一套 WaterFlow；差异仅在分段（WaterFlowSections）：
+        //   section 0 = 吧头（crossCount 1 → 独占整行）；section 1 = 主体（crossCount 3/4 → 多列瀑布流）。
+        // 卡片一律取自然高度（不设 onGetItemMainSizeByIndex），置顶卡作为普通格子、不拉伸。
+        WaterFlow({ scroller: this.listScroller, sections: this.sections }) {
+          // 跨列格子（独占整行）：顶栏让位 + 吧头 + 兜底排序栏 —— 与单列档同源，随内容一起滚动
+          FlowItem() {
+            Column() {
+              Column().width('100%').height(THREAD_LIST_HEADER_TOP_SPACE)
+
+              Column() {
+                this.ForumHeaderBuilder()
+
+                // 兜底路径的自绘排序栏（槽位路径下已搬到屏幕底部 SortSlotShell）
+                if (!(THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported)) {
+                  this.SortTabsBuilder()
+                }
+              }
+              .width('100%')
+              .onAreaChange((_old: Area, n: Area) => { this.headerBlockH = n.height as number; })
+            }
+            .width('100%')
+          }
+
+          if (this.loadState === LoadState.Success) {
+            // 成功态但数据为空（状态切换的瞬态）：补 0 高占位，保证「子节点数 == Σ itemsCount」，
+            // 否则 WaterFlow 会因数量不匹配而无法滚动（官方硬约束）
+            if (this.listDataSource.data.length === 0) {
+              FlowItem() {
+                Column().width('100%').height(0)
+              }
+            }
+            LazyForEach(this.listDataSource, (item: ThreadItem) => {
+              FlowItem() {
+                // 排序过场·帖子位移（§4.8 T-G）：位移**只作用于卡片本身**，`WaterFlow` 容器与吧头完全不动
+                // —— 这样吧头不可能被虚拟容器的渲染区裁掉（上一版整页位移 + 吧头反向抵消，真机上吧头会被
+                // 裁掉再出现）。换算成 vp 是因为多列下卡片宽仅 1/3~1/4 屏，百分比基准会导致位移不足。
+                Column() {
+                  if (item.isTop === true && this.selectedSort !== 2) {
+                    // 置顶卡 = 瀑布流的普通格子：自然高度、不拉伸，独立卡面（与普通帖同款圆角/底色）
+                    Column() {
+                      PinnedThreadItem({
+                        item: {
+                          tid: item.tid, title: item.title, forumName: item.forumName,
+                          author: item.author, replyNum: item.replyNum, abstract: item.abstract,
+                          firstImage: item.firstImage ?? '', createTime: item.createTime,
+                          isTop: item.isTop, isGood: item.isGood,
+                        } as ThreadItemData,
+                        onTap: (tid: string) => this.openThread(tid)
+                      })
+                    }
+                    .width('100%')
+                    .backgroundColor(Theme.bgCard(this.isDark))
+                    .borderRadius(26)
+                  } else {
+                    ThreadCard({
+                      item: {
+                        tid: item.tid, postId: item.postId ?? '',
+                        title: item.title, forumName: item.forumName,
+                        forumAvatar: item.forumAvatar ?? '',
+                        author: item.author,
+                        authorAvatar: item.authorAvatar ?? '',
+                        authorId: item.authorId ?? '',
+                        replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                        isLiked: item.isLiked ?? false,
+                        abstract: item.abstract,
+                        firstImage: item.firstImage ?? '', images: item.images ?? [],
+                        createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                      } as ThreadItemData,
+                      onTap: (tid: string) => this.openThread(tid),
+                      onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                      onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                      onComment: (tid: string) => this.openThread(tid),
+                      onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                    })
+                  }
+                }
+                .width('100%')
+                .translate({ x: this.sortShiftX() })
+              }
+            }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+          } else if (this.loadState === LoadState.Loading) {
+            // 骨架屏 / 空态 / 错误视图：该 section 的 crossCount = 1，故独占整行；
+            // 骨架屏沿用单列档的 skeletonOpacity 轻淡入，避免切到未命中缓存的排序时「闪一下」
+            FlowItem() {
+              ThreadListSkeleton({ count: 8, columns: this.threadColumns() })
+                .width('100%')
+                .opacity(this.skeletonOpacity)
+            }
+          } else if (this.loadState === LoadState.Empty) {
+            FlowItem() {
+              EmptyView({ message: '该吧暂无帖子', icon: '📭' })
+                .height(200)
+            }
+          } else {
+            FlowItem() {
+              ErrorView({ message: this.errorMsg, onRetry: () => { this.loadThreads(); } })
+                .height(200)
+            }
+          }
+        }
+        .columnsGap(Spacing.md)
+        .rowsGap(Spacing.md)
+        .padding({ bottom: this.contentBottomSpace() })
+        .layoutWeight(1)
+        // 排序切换过场（§4.8 T-G）：位移**不挂 `WaterFlow` 整页** —— 挂整页会把吧头一起带走，
+        // 而用「吧头反向位移」抵消又会被虚拟容器的渲染区裁掉（真机表现为「吧头被遮挡后再出现」）。
+        // 现改为逐张帖子卡片位移（见上面的 `LazyForEach`），容器与吧头保持静止。
+        .id(THREAD_SCROLL_SNAPSHOT_ID)
+        .scrollBar(BarState.Off)
+        .clip(false)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .overlay(this.BottomFadeOverlay())
+        .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+        .edgeEffect(EdgeEffect.Spring)
+        .onAreaChange((oldValue: Area, newValue: Area) => this.onViewportAreaChange(oldValue, newValue))
+        .onScroll((xOffset: number, yOffset: number) => this.onListScroll(xOffset, yOffset))
+        .onReachEnd(() => {
+          if (this.hasMore && !this.loadingMore) {
+            this.loadMore();
+          }
+        })
+      } else {
       Scroll(this.listScroller) {
         Column() {
           // 预留顶栏高度作为初始间距（与旧页快照的裁剪边界同源，见 THREAD_LIST_HEADER_TOP_SPACE）
@@ -2015,7 +2315,7 @@ struct ThreadList {
               // 置顶/精品帖子区域
               if (this.pinnedThreads().length > 0) {
                 Column({ space: 0 }) {
-                  // 置顶标签
+                  // 置顶标签（通栏，不参与网格）
                   Row() {
                     Text('置顶')
                       .fontSize(fs(13, this.fontScale))
@@ -2025,17 +2325,47 @@ struct ThreadList {
                   .width('100%')
                   .padding({ left: 16, right: 16, top: 14, bottom: 4 })
 
-                  ForEach(this.pinnedThreads(), (item: ThreadItem) => {
-                    PinnedThreadItem({
-                      item: {
-                        tid: item.tid, title: item.title, forumName: item.forumName,
-                        author: item.author, replyNum: item.replyNum, abstract: item.abstract,
-                        firstImage: item.firstImage ?? '', createTime: item.createTime,
-                        isTop: item.isTop, isGood: item.isGood,
-                      } as ThreadItemData,
-                      onTap: (tid: string) => this.openThread(tid)
-                    })
-                  }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+                  if (this.threadColumns() > 1) {
+                    // 多列档（§4.8 T-C）：置顶条目入网格，每张独立 bgCard + 圆角，末行补空位
+                    ForEach(this.threadRows(this.pinnedThreads()), (row: ThreadItem[], rowIdx: number) => {
+                      Row({ space: 6 }) {
+                        ForEach(row, (item: ThreadItem) => {
+                          Column() {
+                            PinnedThreadItem({
+                              item: {
+                                tid: item.tid, title: item.title, forumName: item.forumName,
+                                author: item.author, replyNum: item.replyNum, abstract: item.abstract,
+                                firstImage: item.firstImage ?? '', createTime: item.createTime,
+                                isTop: item.isTop, isGood: item.isGood,
+                              } as ThreadItemData,
+                              onTap: (tid: string) => this.openThread(tid)
+                            })
+                          }
+                          .layoutWeight(1)
+                          .backgroundColor(Theme.bgCard(this.isDark))
+                          .borderRadius(26)
+                        }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+                        ForEach(this.threadBlankSlots(row.length), (slot: number) => {
+                          Column().layoutWeight(1)
+                        }, (slot: number) => `pin_gap_${rowIdx}_${slot}`)
+                      }
+                      .width('100%')
+                      .alignItems(VerticalAlign.Top)
+                    }, (row: ThreadItem[], rowIdx: number) => `pin_row_${rowIdx}_${row[0].tid}`)
+                  } else {
+                    // 单列档：逐像素保持改造前结构
+                    ForEach(this.pinnedThreads(), (item: ThreadItem) => {
+                      PinnedThreadItem({
+                        item: {
+                          tid: item.tid, title: item.title, forumName: item.forumName,
+                          author: item.author, replyNum: item.replyNum, abstract: item.abstract,
+                          firstImage: item.firstImage ?? '', createTime: item.createTime,
+                          isTop: item.isTop, isGood: item.isGood,
+                        } as ThreadItemData,
+                        onTap: (tid: string) => this.openThread(tid)
+                      })
+                    }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+                  }
                 }
                 .width('100%')
                 .backgroundColor(Theme.bgCard(this.isDark))
@@ -2044,28 +2374,66 @@ struct ThreadList {
               }
 
               // 普通帖子区域（ThreadCard自带背景和圆角）
-              ForEach(this.normalThreads(), (item: ThreadItem) => {
-                ThreadCard({
-                  item: {
-                    tid: item.tid, postId: item.postId ?? '',
-                    title: item.title, forumName: item.forumName,
-                    forumAvatar: item.forumAvatar ?? '',
-                    author: item.author,
-                    authorAvatar: item.authorAvatar ?? '',
-                    authorId: item.authorId ?? '',
-                    replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
-                    isLiked: item.isLiked ?? false,
-                    abstract: item.abstract,
-                    firstImage: item.firstImage ?? '', images: item.images ?? [],
-                    createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
-                  } as ThreadItemData,
-                  onTap: (tid: string) => this.openThread(tid),
-                  onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-                  onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                  onComment: (tid: string) => this.openThread(tid),
-                  onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-                })
-              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+              if (this.threadColumns() > 1) {
+                // 多列档（§4.8 T-C）：行分组 + 末行补空位
+                ForEach(this.threadRows(this.normalThreads()), (row: ThreadItem[], rowIdx: number) => {
+                  Row({ space: 6 }) {
+                    ForEach(row, (item: ThreadItem) => {
+                      Column() {
+                        ThreadCard({
+                          item: {
+                            tid: item.tid, postId: item.postId ?? '',
+                            title: item.title, forumName: item.forumName,
+                            forumAvatar: item.forumAvatar ?? '',
+                            author: item.author,
+                            authorAvatar: item.authorAvatar ?? '',
+                            authorId: item.authorId ?? '',
+                            replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                            isLiked: item.isLiked ?? false,
+                            abstract: item.abstract,
+                            firstImage: item.firstImage ?? '', images: item.images ?? [],
+                            createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                          } as ThreadItemData,
+                          onTap: (tid: string) => this.openThread(tid),
+                          onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                          onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                          onComment: (tid: string) => this.openThread(tid),
+                          onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                        })
+                      }
+                      .layoutWeight(1)
+                    }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+                    ForEach(this.threadBlankSlots(row.length), (slot: number) => {
+                      Column().layoutWeight(1)
+                    }, (slot: number) => `row_gap_${rowIdx}_${slot}`)
+                  }
+                  .width('100%')
+                  .alignItems(VerticalAlign.Top)
+                }, (row: ThreadItem[], rowIdx: number) => `row_${rowIdx}_${row[0].tid}`)
+              } else {
+                ForEach(this.normalThreads(), (item: ThreadItem) => {
+                  ThreadCard({
+                    item: {
+                      tid: item.tid, postId: item.postId ?? '',
+                      title: item.title, forumName: item.forumName,
+                      forumAvatar: item.forumAvatar ?? '',
+                      author: item.author,
+                      authorAvatar: item.authorAvatar ?? '',
+                      authorId: item.authorId ?? '',
+                      replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                      isLiked: item.isLiked ?? false,
+                      abstract: item.abstract,
+                      firstImage: item.firstImage ?? '', images: item.images ?? [],
+                      createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                    } as ThreadItemData,
+                    onTap: (tid: string) => this.openThread(tid),
+                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                    onComment: (tid: string) => this.openThread(tid),
+                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                  })
+                }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+              }
 
               if (this.hasMore) {
                 Row() {
@@ -2088,7 +2456,7 @@ struct ThreadList {
               }
               // 骨架屏覆盖层：Loading 期间显示，由 fadeInContent 控制淡出（1→0）
               if (this.loadState === LoadState.Loading) {
-                ThreadListSkeleton({ count: 4 })
+                ThreadListSkeleton({ count: 4, columns: this.threadColumns() })
                   .width('100%')
                   .opacity(this.skeletonOpacity)
               }
@@ -2131,6 +2499,7 @@ struct ThreadList {
           this.loadMore();
         }
       })
+      }
 
       // 悬浮顶栏（内容可穿过）；
       // 官方 title 槽位路径下整行已在槽位里（ThreadTitleBar），这里不再叠一层
@@ -2241,11 +2610,15 @@ struct ThreadList {
     .backgroundColor(Theme.bg(this.isDark))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
-    // 悬浮 FAB（**只剩「发主题」加号一枚**）两条路径：官方槽位壳（FabSlotShell）/
-    // 改造前页面主体自绘玻璃（刷新钮已于 2026-09-12 按用户要求移除，刷新入口改由排序栏
-    // 「重复点击当前排序」承担，见 refreshByRetap）
+    // 悬浮 FAB 与底部排序底栏（§4.8 T-F「选项 B」）：
+    // 槽位路径 + 非搜索态时，底栏与加号合并为 `BottomGroupShell()`（缝 12、锚点分档：手机左对齐 / 平板居中）；
+    // 其余情况保持原两条路径（搜索态仅加号、兜底路径自绘加号）。
     if (THREAD_LIST_OFFICIAL_TITLE_BAR && this.materialSupported) {
-      this.FabSlotShell()
+      if (THREAD_LIST_OFFICIAL_SORT_BAR && !this.searchMode) {
+        this.BottomGroupShell()
+      } else {
+        this.FabSlotShell()
+      }
     } else {
     // 发主题 FAB - 沉浸光感圆形加号
     Stack() {
@@ -2273,7 +2646,9 @@ struct ThreadList {
 
     // 底部排序底栏（官方槽位壳，§6.10 同机制）：热门 / 最新 / 精选 三枚等分钮，整条背板走
     // 官方沉浸光感（与首页 / 搜索页底栏同源）。搜索态不渲染（页内搜索不切排序，且需腾出底部空间）。
-    if (THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported && !this.searchMode) {
+    // §4.8 T-F：槽位路径下底栏已并入 `BottomGroupShell`，此处仅在兜底路径生效（低版本无材质时条件也不成立）。
+    if (!(THREAD_LIST_OFFICIAL_TITLE_BAR && this.materialSupported)
+      && THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported && !this.searchMode) {
       this.SortSlotShell()
     }
 
@@ -2283,7 +2658,11 @@ struct ThreadList {
     .width('100%')
     .height('100%')
     // 根容器实宽 → currentWidth：排序栏槽位壳的 barWidth 只接受数值（Dimension 不收 calc 字符串）
-    .onAreaChange((_old: Area, n: Area) => { this.currentWidth = n.width as number; })
+    // 同点追加形态变化挂点（§4.8 T-B）：窗口尺寸变化时回填宽高 + 横竖屏 + 列数标记
+    .onAreaChange((_old: Area, n: Area) => {
+      this.currentWidth = n.width as number;
+      this.onListFormAreaChange();
+    })
   }
 
   build() {
@@ -2545,6 +2924,70 @@ struct ThreadList {
   }
 
   /**
+   * 底部组合壳（§4.8 T-F「选项 B + 整体居中」）：把**排序底栏 + 缝 12 + FAB** 合成一个整体，
+   * 替代非搜索态下 `FabSlotShell()` + `SortSlotShell()` 两处独立悬浮层。
+   *
+   * 锚点分档（**手机零回归的关键**）：
+   * - 单列（手机）：`justifyContent(Start)` + `padding({ left: 24 })` = 现状「左 24 | 底栏 244 | 缝 12 |
+   *   加号壳 80」恰好占满 360vp，逐像素不变；
+   * - 多列（平板）：`justifyContent(Center)` + 无左 padding，组合净宽 336vp（244 + 12 + 80）整体居中。
+   *   若无条件居中，手机会左移 12vp、右侧空 12 → 破坏零回归。
+   *
+   * 两个空壳仍各自收窄（244 / 80 而非 `'100%'`）+ `hitTestBehavior(None)`，避免系统 TabBar 页签节点
+   * 横跨整行吞掉下层竖向滑动（坑 30）。
+   */
+  @Builder
+  BottomGroupShell() {
+    Row({ space: THREAD_LIST_SORT_BAR_GAP }) {
+      // 排序底栏槽位壳（几何与 SortSlotShell 一致，宽度锁上限 244 = 多列档不拉伸）
+      Tabs({ barPosition: BarPosition.End }) {
+        TabContent()
+          .tabBar(this.SortSegBar())
+      }
+      .width(THREAD_LIST_SORT_BAR_MAX_WIDTH)
+      .height(THREAD_LIST_SORT_BAR_HEIGHT)
+      .vertical(false)
+      .scrollable(false)
+      .barHeight(THREAD_LIST_SORT_BAR_HEIGHT)
+      .barBackgroundColor(Color.Transparent)
+      .barBackgroundBlurStyle(BlurStyle.NONE)
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      .hitTestBehavior(HitTestMode.None)
+
+      // FAB 槽位壳（几何与 FabSlotShell 一致，含显隐动效）
+      Tabs({ barPosition: BarPosition.End }) {
+        TabContent()
+          .tabBar(this.FabSlotColumn())
+      }
+      .width(THREAD_LIST_FAB_SHELL_WIDTH)
+      .height(THREAD_LIST_FAB_SHELL_HEIGHT)
+      .vertical(false)
+      .scrollable(false)
+      .barHeight(THREAD_LIST_FAB_SHELL_HEIGHT)
+      .barBackgroundColor(Color.Transparent)
+      .barBackgroundBlurStyle(BlurStyle.NONE)
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      .opacity(this.fabReveal())
+      .scale({ x: this.fabReveal(), y: this.fabReveal() })
+      .translate({ y: (1 - this.fabReveal()) * 20 })
+      .hitTestBehavior(HitTestMode.None)
+      .animation({ duration: 220, curve: Curve.FastOutSlowIn })
+    }
+    .width('100%')
+    .height(THREAD_LIST_SORT_BAR_HEIGHT)
+    // 锚点分档：手机（单列）左对齐 + 左缘 24 = 现状；平板（多列）整体居中
+    .justifyContent(this.threadColumns() > 1 ? FlexAlign.Center : FlexAlign.Start)
+    .padding({ left: this.threadColumns() > 1 ? 0 : 24 })
+    .margin({ bottom: THREAD_LIST_SORT_BAR_BOTTOM })
+    .zIndex(20)
+    .hitTestBehavior(HitTestMode.None)
+    // 进出搜索与「列表区换场」同向：自下方浮起 / 向下方收起
+    .transition(this.searchSwap(0, 24))
+  }
+
+  /**
    * 排序栏槽位内的三枚等分钮（热门 / 最新 / 精选）：纯文字三等分（`layoutWeight(1)`），
    * 选中态只靠系统强调色 + 加粗表达，钮自身不挂任何背景 / 材质（与首页底栏 BottomItem、
    * 搜索页 ModuleSegButton 同写法）。
@@ -2611,7 +3054,9 @@ struct ThreadList {
   private sortBarWidth(): number {
     const fabColumn: number = THREAD_LIST_FAB_SHELL_WIDTH + THREAD_LIST_SORT_BAR_GAP;
     const w: number = this.currentWidth > 0 ? this.currentWidth - 24 - fabColumn : 244;
-    return w > 184 ? w : 184;
+    // §4.8 T-F：多列档底栏宽度不随屏宽拉伸，锁到手机档取值 244（手机档 w ≈ 244，上限不生效）
+    const capped: number = Math.min(w, THREAD_LIST_SORT_BAR_MAX_WIDTH);
+    return capped > 184 ? capped : 184;
   }
 
   /**
@@ -2693,7 +3138,14 @@ struct ThreadList {
             }
           }
           .layoutWeight(1)
+          // §4.8 T-F：多列档经验条不随屏宽拉伸（手机档取大值 = 不限）
+          .constraintSize({ maxWidth: this.threadColumns() > 1 ? THREAD_LIST_EXP_BAR_MAX_WIDTH : 99999 })
           .alignItems(HorizontalAlign.Start)
+
+          // §4.8 T-F：多列档经验条限宽后补弹性空白，让签到钮仍贴信息列右缘
+          if (this.threadColumns() > 1) {
+            Blank()
+          }
 
           Row() {
             Text(this.signButtonLabel())
@@ -2748,6 +3200,73 @@ struct ThreadList {
       return 0;
     }
     return Math.min(100, Math.round((this.forumInfo.curScore / this.forumInfo.levelupScore) * 100));
+  }
+
+  /** 形态变化唯一挂点：回填窗口宽高 + 横竖屏 + 列数标记（**不包任何过渡动画**，
+   *  列数模板不可补间，§4.6 H-G）。窗口尺寸未变则直接返回，避免 onAreaChange 高频回调重排。 */
+  private onListFormAreaChange(): void {
+    try {
+      const d = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w <= 0 || h <= 0) {
+        return;
+      }
+      if (w === this.pageWidth && h === this.pageHeight) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
+      this.isLandscape = w > h;
+      this.syncCardColumns();
+      // 列数变化 → 主体 section 的 crossCount 必须同步（横竖屏切换：竖 3 / 横 4）
+      this.syncSections();
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败
+    }
+  }
+
+  /**
+   * 列数：大屏竖屏 3 / 横屏 4（与首页 §4.2 决策 12 同口径，§4.8 T-B）。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
+   */
+  private threadColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return this.isLandscape ? 4 : 3;
+  }
+
+  /**
+   * 列数标记下发：**无条件写**（单列也写 1）。
+   * `cardColumns` 是 AppStorage 全局单值、被多页 `ThreadCard` 的 `@StorageProp` 单向订阅，
+   * 只在多列档写会让别的页在单列下按多列几何渲染（§6.1 D1 / D6：折叠屏展开 → 折叠必须回 1）。
+   */
+  private syncCardColumns(): void {
+    AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.threadColumns());
+  }
+
+  /** 把扁平列表按当前列数切成二维行数组（仅列数 > 1 时调用） */
+  private threadRows(items: ThreadItem[]): ThreadItem[][] {
+    const cols: number = this.threadColumns();
+    const rows: ThreadItem[][] = [];
+    for (let i: number = 0; i < items.length; i += cols) {
+      rows.push(items.slice(i, i + cols));
+    }
+    return rows;
+  }
+
+  /** 末行补空位下标：不足 cols 时用等宽空白补齐，避免最后一张卡被拉伸占满整行（§6.1 A2） */
+  private threadBlankSlots(rowLen: number): number[] {
+    const cols: number = this.threadColumns();
+    const slots: number[] = [];
+    for (let i: number = rowLen; i < cols; i++) {
+      slots.push(i);
+    }
+    return slots;
   }
 
   private pinnedThreads(): ThreadItem[] {
@@ -2822,32 +3341,72 @@ struct ThreadList {
         .width('100%')
         .padding({ left: 4, top: 8, bottom: 2 })
 
-        ForEach(this.searchThreads(), (item: ThreadItem) => {
-          ThreadCard({
-            item: {
-              tid: item.tid, postId: item.postId ?? '',
-              title: item.title, forumName: item.forumName,
-              forumAvatar: item.forumAvatar ?? '',
-              author: item.author,
-              authorAvatar: item.authorAvatar ?? '',
-              authorId: item.authorId ?? '',
-              replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
-              isLiked: item.isLiked ?? false,
-              abstract: item.abstract,
-              firstImage: item.firstImage ?? '', images: item.images ?? [],
-              createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
-            } as ThreadItemData,
-            onTap: (tid: string) => this.openThread(tid),
-            onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-            onShare: (d: ThreadSharePayload) => this.shareThread(d),
-            onComment: (tid: string) => this.openThread(tid),
-            onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-          })
-        },
-          // 键必须覆盖后台补数据的字段：ForEach 仅在键变化时重建子组件，
-          // 若只用 tid（固定键），详情补齐回来的 authorId/头像/点赞数会被复用旧组件吞掉，
-          // 表现为"头像仍是字母占位、点赞恒 0、点作者不跳转"。
-          (item: ThreadItem) => `search_${item.tid}_${item.authorId ?? ''}_${item.authorAvatar ?? ''}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}_${item.replyNum}`)
+        if (this.threadColumns() > 1) {
+          // 多列档（§4.8 T-D）：与列表态同款行分组 + 末行补空位
+          ForEach(this.threadRows(this.searchThreads()), (row: ThreadItem[], rowIdx: number) => {
+            Row({ space: 6 }) {
+              ForEach(row, (item: ThreadItem) => {
+                Column() {
+                  ThreadCard({
+                    item: {
+                      tid: item.tid, postId: item.postId ?? '',
+                      title: item.title, forumName: item.forumName,
+                      forumAvatar: item.forumAvatar ?? '',
+                      author: item.author,
+                      authorAvatar: item.authorAvatar ?? '',
+                      authorId: item.authorId ?? '',
+                      replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                      isLiked: item.isLiked ?? false,
+                      abstract: item.abstract,
+                      firstImage: item.firstImage ?? '', images: item.images ?? [],
+                      createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                    } as ThreadItemData,
+                    onTap: (tid: string) => this.openThread(tid),
+                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                    onComment: (tid: string) => this.openThread(tid),
+                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                  })
+                }
+                .layoutWeight(1)
+              },
+                (item: ThreadItem) => `search_${item.tid}_${item.authorId ?? ''}_${item.authorAvatar ?? ''}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}_${item.replyNum}`)
+              ForEach(this.threadBlankSlots(row.length), (slot: number) => {
+                Column().layoutWeight(1)
+              }, (slot: number) => `search_gap_${rowIdx}_${slot}`)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Top)
+          }, (row: ThreadItem[], rowIdx: number) => `search_row_${rowIdx}_${row[0].tid}`)
+        } else {
+          // 单列档：逐像素保持改造前结构
+          ForEach(this.searchThreads(), (item: ThreadItem) => {
+            ThreadCard({
+              item: {
+                tid: item.tid, postId: item.postId ?? '',
+                title: item.title, forumName: item.forumName,
+                forumAvatar: item.forumAvatar ?? '',
+                author: item.author,
+                authorAvatar: item.authorAvatar ?? '',
+                authorId: item.authorId ?? '',
+                replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                isLiked: item.isLiked ?? false,
+                abstract: item.abstract,
+                firstImage: item.firstImage ?? '', images: item.images ?? [],
+                createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+              } as ThreadItemData,
+              onTap: (tid: string) => this.openThread(tid),
+              onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+              onShare: (d: ThreadSharePayload) => this.shareThread(d),
+              onComment: (tid: string) => this.openThread(tid),
+              onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+            })
+          },
+            // 键必须覆盖后台补数据的字段：ForEach 仅在键变化时重建子组件，
+            // 若只用 tid（固定键），详情补齐回来的 authorId/头像/点赞数会被复用旧组件吞掉，
+            // 表现为"头像仍是字母占位、点赞恒 0、点作者不跳转"。
+            (item: ThreadItem) => `search_${item.tid}_${item.authorId ?? ''}_${item.authorAvatar ?? ''}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}_${item.replyNum}`)
+        }
 
         // 结果底部状态：扫描进度 / 继续搜索 / 已扫到底（与列表翻页底部同构）
         Row() {
@@ -3101,6 +3660,14 @@ struct ThreadList {
     }
   }
 
+  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（90vp = 吧头让位折算），手机维持 15% */
+  private topFadeStop(): number {
+    if (!this.isWideFormDevice || this.pageHeight <= 0) {
+      return 0.15;
+    }
+    return Math.min(0.15, THREAD_LIST_HEADER_TOP_SPACE / this.pageHeight);
+  }
+
   @Builder
   BottomFadeOverlay() {
     Stack()
@@ -3108,7 +3675,7 @@ struct ThreadList {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

@@ -17,6 +17,7 @@
  */
 
 import { common } from '@kit.AbilityKit';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { display, LengthMetrics } from '@kit.ArkUI';
 import { picker, fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
@@ -659,6 +660,16 @@ export struct FavoriteTab {
   @State isDark: boolean = isDarkMode();
   @State refreshing: boolean = false;
   @State pinnedFolders: PinRecord[] = [];
+  /**
+   * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 20% 渐显覆盖到第一个卡片中部，
+   * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98 + 分段切换区（至 132），手机维持 20%。
+   */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
+  @State fadeCoverVp: number = 0;
   @State pinnedThreads: PinRecord[] = [];
   @State notLoggedIn: boolean = false;
   @State @Watch('syncBackState') editMode: boolean = false;
@@ -1039,6 +1050,8 @@ export struct FavoriteTab {
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
+  // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
+  @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
 
   onPageShow(): void {
     this.fontSizeTick++;
@@ -1122,6 +1135,13 @@ export struct FavoriteTab {
     MaterialManager.init();
     this.isDark = isDarkMode();
     this.accountId = AuthManager.getInstance().getUser()?.userId ?? '';
+    // 顶部渐显带覆盖基准（平板收窄用）：取屏幕长边（竖屏视口高），窗口未 attach 时忽略
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+    } catch (e) {
+      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+    }
     this.syncBackState();
     this.initSortState();
     this.loadAll();
@@ -2565,6 +2585,11 @@ export struct FavoriteTab {
   /** darkTick 递增（本页或宿主/其它 Tab 切换深色）→ 重读全局深色状态，保证整页背景/文字/按钮/卡片同步翻档 */
   private onDarkTick(): void {
     this.isDark = isDarkMode();
+  }
+
+  /** fontTick 递增（字号设置写入 / 宿主返回广播）→ 显式回写 fontScale 强制本页字号依赖刷新 */
+  private onFontTick(): void {
+    this.fontScale = AppStorage.get<number>('fontScale') ?? 1.0;
   }
 
   /** BUG-03：收藏本地过滤——匹配帖子标题 / 吧名 / 分类名（分类名命中 → 该分类下帖子纳入） */
@@ -4680,17 +4705,26 @@ export struct FavoriteTab {
     .onClick(onTap)
   }
 
+  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮 / 标题 + 分段切换区（132vp 折算），手机维持 20% */
+  private topFadeStop(): number {
+    if (!this.isWideFormDevice || this.fadeCoverVp <= 0) {
+      return 0.20;
+    }
+    return Math.min(0.20, 132 / this.fadeCoverVp);
+  }
+
   @Builder
   BottomFadeOverlay() {
     // 顶部渐显（沉浸式：列表内容滚入透明悬浮顶栏 / 分段切换区下方时渐进显现），与 ThreadList 统一语言；
     // 全屏 DST_IN + 顶部 20% 渐显——800vp 屏 ≈160vp，覆盖 TopBar(0~98) + 分段切换区 CategoryTabs(100~132vp)（BUG-02）；
     // 20% 以下全实色（src_alpha=1）→ 无梯形挖洞、不回归 BUG-09 底部黑 mask；EditBar zIndex 15 在其上不受影响
+    // 平板收窄（2026-09-13）：覆盖比例由 topFadeStop() 分档（平板 = 132vp 折算，只盖顶部按钮 / 标题 + 分段区）
     Stack()
       .width('100%')
       .height('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.20], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)

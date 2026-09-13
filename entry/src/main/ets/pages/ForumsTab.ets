@@ -17,6 +17,7 @@
  */
 
 import { common } from '@kit.AbilityKit';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { display, LengthMetrics } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
@@ -367,6 +368,16 @@ struct ForumMenuDialogCard {
 @Component
 export struct ForumsTab {
   onFollowsSync: (list: FollowItem[]) => void = (list: FollowItem[]) => {};
+  /**
+   * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 15% 渐显覆盖到第一个卡片中部，
+   * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98vp，手机维持原比例。
+   */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
+  @State fadeCoverVp: number = 0;
   @State loggedIn: boolean = false;
   @State forumState: LoadState = LoadState.Loading;
   @State follows: FollowItem[] = [];
@@ -415,6 +426,8 @@ export struct ForumsTab {
   @State isDark: boolean = isDarkMode();
   @State isWideScreen: boolean = false;
   @StorageLink('fontScale') fontScale: number = 1.0;
+  // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
+  @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @StorageLink('tabLoginRefresh') @Watch('onLoginTick') tabLoginRefresh: number = 0;
   @StorageLink('forumsRefreshRequest') @Watch('onForumsRefresh') forumsRefreshRequest: number = 0;
@@ -526,6 +539,13 @@ export struct ForumsTab {
   aboutToAppear(): void {
     this.isDark = isDarkMode();
     this.loggedIn = AuthManager.getInstance().isLogin();
+    // 顶部渐显带覆盖基准（平板收窄用）：取屏幕长边（竖屏视口高），窗口未 attach 时忽略
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+    } catch (e) {
+      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+    }
     // 一键签到开关（慢速模式 / 官方一键签到）恢复：未初始化过才真正读缓存
     AutoSignManager.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
     if (this.loggedIn) {
@@ -541,6 +561,11 @@ export struct ForumsTab {
   /** 深色切换（来自本页或宿主）后重读全局状态 */
   onDarkTick(): void {
     this.isDark = isDarkMode();
+  }
+
+  /** fontTick 递增（字号设置写入 / 宿主返回广播）→ 显式回写 fontScale 强制本页字号依赖刷新 */
+  onFontTick(): void {
+    this.fontScale = AppStorage.get<number>('fontScale') ?? 1.0;
   }
 
   /** 从其它页面返回本页（Index.onPageShow 递增 forumsRefreshRequest）：静默刷新足迹（本地缓存直出，不发网络） */
@@ -1329,6 +1354,14 @@ export struct ForumsTab {
     .backgroundColor(Color.Transparent)
   }
 
+  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（98vp 折算），手机维持 15% */
+  private topFadeStop(): number {
+    if (!this.isWideFormDevice || this.fadeCoverVp <= 0) {
+      return 0.15;
+    }
+    return Math.min(0.15, 98 / this.fadeCoverVp);
+  }
+
   @Builder
   BottomFadeOverlay() {
     Stack()
@@ -1336,7 +1369,7 @@ export struct ForumsTab {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.15], ['#FFFFFFFF', 1.0]]
+        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
       })
       .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
