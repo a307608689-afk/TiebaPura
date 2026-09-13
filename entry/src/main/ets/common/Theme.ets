@@ -971,3 +971,57 @@ export const Radius: RadiusToken = {
   lg: 16,
   full: 999,
 };
+
+/**
+ * 断点令牌（vp）—— 平板适配文档 §4.6 H-B「断点与几何常量收口」的唯一来源。
+ * - sm = 600：窄窗门槛（折叠屏折叠态 / 平板分屏 / 自由多窗拖窄）
+ * - md = 840：大屏形态门槛（宽屏档，宿主底栏与各页共用）
+ * - lg = 1440：预留档
+ * 说明：形态判定还要先过「是否大屏形态设备」闸门（deviceInfo.deviceType / display.isFoldable），
+ *      只靠宽度会把手机横屏（约 780vp ≥ 600）误判为大屏。
+ */
+export interface BreakpointToken {
+  sm: number;
+  md: number;
+  lg: number;
+}
+
+export const Breakpoint: BreakpointToken = {
+  sm: 600,
+  md: 840,
+  lg: 1440,
+};
+
+/** 宿主底部悬浮底栏几何令牌（vp，见 §4.6 H-B / H-C：维持 480 封顶，零改动） */
+export interface DockToken {
+  height: number;
+  radius: number;
+  bottomMargin: number;
+  maxWidthWide: number;
+  tabInset: number;
+}
+
+export const Dock: DockToken = {
+  height: 74,
+  radius: 37,
+  bottomMargin: 30,
+  maxWidthWide: 480,
+  tabInset: 24,
+};
+
+/** 单列页 / 二级页内容限宽令牌（宿主自身不使用，见 §4.7） */
+export interface ContentToken {
+  maxWidth: number;
+}
+
+export const Content: ContentToken = {
+  maxWidth: 1000,
+};
+
+/**
+ * 卡片列数全局标记键（AppStorage / @StorageProp）。
+ * 写入纪律（§6.1 D1 / D6，手机零回归关键）：**必须无条件写**（单列档也写 1），
+ * 不允许「只在多列时写」——该标记是全局单值，被多个页面的 ThreadCard 共享，
+ * 任一页残留 2 / 3 会让别的页在手机上按多列几何渲染（必然触发场景：折叠屏展开 → 折叠）。
+ */
+export const CARD_COLUMNS_KEY: string = 'cardColumns';

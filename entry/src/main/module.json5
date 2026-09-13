@@ -4,8 +4,11 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
+    // 平板适配前置（见 docs/TiebaPura平板适配.md §1.6）：不加 tablet 时真机不会以平板形态运行，
+    // 各页的多列切换看不到效果。
     "deviceTypes": [
-      "phone"
+      "phone",
+      "tablet"
     ],
     "deliveryWithInstall": true,
     "installationFree": false,

@@ -17,15 +17,16 @@
  */
 
 import { common } from '@kit.AbilityKit';
+import { display, LengthMetrics } from '@kit.ArkUI';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
-import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
+import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 
@@ -63,6 +64,48 @@ function shuffle<T>(arr: T[]): T[] {
     arr[j] = tmp;
   }
   return arr;
+}
+
+/**
+ * WaterFlow 数据源（§4.2 决策 12）：包装 @State 数组，通过 @Watch 自动同步。
+ * reload() 用于全量替换（下拉刷新 / 切换 feed），notifyAdd() 用于尾部追加（加载更多）。
+ */
+class ThreadDataSource implements IDataSource {
+  private listeners: DataChangeListener[] = [];
+  public data: ThreadItem[] = [];
+
+  totalCount(): number {
+    return this.data.length;
+  }
+
+  getData(index: number): ThreadItem {
+    return this.data[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const idx: number = this.listeners.indexOf(listener);
+    if (idx >= 0) {
+      this.listeners.splice(idx, 1);
+    }
+  }
+
+  reload(): void {
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataReloaded();
+    });
+  }
+
+  notifyAdd(start: number): void {
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataAdd(start);
+    });
+  }
 }
 
 /**
@@ -156,6 +199,10 @@ const HOME_OFFICIAL_TITLE_BAR: boolean = true;
  * NavigationCustomTitle 设置了 height 时 titleMode 不参与计算。
  */
 const HOME_TITLE_BAR_HEIGHT: number = 108;
+/** 顶部渐隐带夹取下限：顶栏需求 44 + 38 + 20 ≈ 102，向上留 6vp 余量（§4.2 决策 5） */
+const HOME_FADE_MIN: number = 108;
+/** 顶部渐隐带夹取上限：保住竖屏观感（§4.2 决策 5） */
+const HOME_FADE_MAX: number = 180;
 
 /**
  * 首页自含页组件（Index.ets 拆分的最后一个内联页）：
@@ -187,7 +234,7 @@ export struct HomeTab {
   // 宿主底栏重复点击首页 Tab：整页刷新（按当前 feed 重拉第一页）
   @StorageLink('homeRetapRequest') @Watch('onRetapTick') homeRetapRequest: number = 0;
   @State loggedIn: boolean = false;
-  @State threads: ThreadItem[] = [];
+  @State @Watch('onThreadsChange') threads: ThreadItem[] = [];
   @State loadState: LoadState = LoadState.Loading;
   @State homePage: number = 1;
   @State homeHasMore: boolean = true;
@@ -196,8 +243,23 @@ export struct HomeTab {
   @State homeLoadingMore: boolean = false;
   @State homeFeed: HomeFeed = HomeFeed.Recommended;
   // ===== 关注动态独立数据源（v1.17：与推荐流解耦，切换不销毁、不重拉，左右滑动转场时各自渲染）=====
-  @State folThreads: ThreadItem[] = [];
+  @State @Watch('onFolThreadsChange') folThreads: ThreadItem[] = [];
   @State folState: LoadState = LoadState.Loading;
+  // ===== WaterFlow 数据源（§4.2 决策 12）：@Watch 自动同步 @State 数组 =====
+  @State recDataSource: ThreadDataSource = new ThreadDataSource();
+  @State folDataSource: ThreadDataSource = new ThreadDataSource();
+  @State columns: number = 3;
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.2）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别 */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口宽 / 高（vp）：aboutToAppear 同步取首帧初值，onAreaChange 实时兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+  /** 顶部渐隐带渐隐停靠点（视口高 × 0.15 夹取到 [108,180] 后折算的百分比） */
+  @State fadeStop: number = 0.15;
   @State folPage: number = 1;
   @State folHasMore: boolean = true;
   @State folStalledPages: number = 0;
@@ -252,15 +314,133 @@ export struct HomeTab {
   async aboutToAppear(): Promise<void> {
     this.isDark = isDarkMode();
     this.loggedIn = AuthManager.getInstance().isLogin();
+    // 首帧形态初值（§4.6 H-A 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏若不预置
+    // 会出现「先 1 列再跳 3 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
+    try {
+      const d = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w > 0 && h > 0) {
+        this.pageWidth = w;
+        this.pageHeight = h;
+        this.updateFadeStop(h);
+      }
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败，onAreaChange 会兜底
+    }
+    // 无条件写列数标记（单列也写 1），避免跨页残留（§6.1 D1 / D6）
+    this.syncCardColumns();
+    // WaterFlow 竖屏 3 列 / 横屏 4 列（§4.2 决策 12）：首帧初值 + 监听方向变化
+    this.updateColumns();
+    display.on('change', this.displayChangeCallback);
     // 若宿主已完成启动引导（token 已置位），直接开跑；否则等 onBootTick
     if ((AppStorage.get<number>('homeBootRequest') ?? 0) > 0) {
       this.startBoot();
     }
   }
 
+  aboutToDisappear(): void {
+    display.off('change', this.displayChangeCallback);
+  }
+
   /** darkTick 递增（宿主或子 Tab 页切换深色）→ 重读全局深色状态 */
   private onDarkTick(): void {
     this.isDark = isDarkMode();
+  }
+
+  /** threads 变化 → 同步到 WaterFlow 数据源（全量替换或尾部追加） */
+  private onThreadsChange(): void {
+    const oldLen: number = this.recDataSource.data.length;
+    const newLen: number = this.threads.length;
+    this.recDataSource.data = this.threads;
+    if (newLen > oldLen && oldLen > 0) {
+      this.recDataSource.notifyAdd(oldLen);
+    } else {
+      this.recDataSource.reload();
+    }
+  }
+
+  /** folThreads 变化 → 同步到 WaterFlow 数据源（全量替换或尾部追加） */
+  private onFolThreadsChange(): void {
+    const oldLen: number = this.folDataSource.data.length;
+    const newLen: number = this.folThreads.length;
+    this.folDataSource.data = this.folThreads;
+    if (newLen > oldLen && oldLen > 0) {
+      this.folDataSource.notifyAdd(oldLen);
+    } else {
+      this.folDataSource.reload();
+    }
+  }
+
+  /** 竖屏 3 列 / 横屏 4 列（§4.2 决策 12）：同步 AppStorage 让 ThreadCard 内部图片封顶/摘要行数跟随 */
+  private updateColumns(): void {
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      this.columns = w > h ? 4 : 3;
+      AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.columns);
+    } catch (e) {
+      // 窗口未 attach 时取宽高失败，保持默认 3 列
+    }
+  }
+
+  private displayChangeCallback: (displayId: number) => void = () => {
+    this.updateColumns();
+  };
+
+  /**
+   * 列数：大屏竖屏 3 / 大屏横屏 4（§4.2 决策 12）；手机（含横屏 / 分屏 / 自由多窗）与窄窗维持现状单列。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
+   */
+  private homeColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return this.columns;
+  }
+
+  /**
+   * 列数标记下发：**无条件写**（单列也写 1）。
+   * 该标记是 AppStorage 全局单值、被多页 ThreadCard 共享，只在多列档写会让别的页在单列下
+   * 按多列几何渲染（§6.1 D1 / D6：折叠屏展开 → 折叠必须回 1）。
+   */
+  private syncCardColumns(): void {
+    AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.homeColumns());
+  }
+
+  /**
+   * 形态变化唯一挂点：只回填状态与列数标记，**不包任何过渡动画**
+   * （列数模板不可补间，用 animateTo 包赋值只会让同一事务内其它属性出现「卡片已跳完、底栏还在爬」的错位，§4.6 H-G）。
+   */
+  private onHomeFormAreaChange(oldValue: Area, newValue: Area): void {
+    const w: number = Number(newValue.width);
+    const h: number = Number(newValue.height);
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    const widthVp: number = this.getUIContext().px2vp(w);
+    const heightVp: number = this.getUIContext().px2vp(h);
+    if (widthVp === this.pageWidth && heightVp === this.pageHeight) {
+      return;
+    }
+    this.pageWidth = widthVp;
+    this.pageHeight = heightVp;
+    this.updateFadeStop(heightVp);
+    this.syncCardColumns();
+  }
+
+  /** 渐隐停靠点：视口高 × 0.15 夹取到 [HOME_FADE_MIN, HOME_FADE_MAX] 后折算百分比 */
+  private updateFadeStop(viewportHeightVp: number): void {
+    if (viewportHeightVp <= 0) {
+      return;
+    }
+    const raw: number = viewportHeightVp * 0.15;
+    const clamped: number = Math.min(Math.max(raw, HOME_FADE_MIN), HOME_FADE_MAX);
+    this.fadeStop = clamped / viewportHeightVp;
   }
 
   /** 宿主 aboutToAppear 各 Manager init + 登录态就绪后通知：冷启动加载（缓存直出，不做后台刷新） */
@@ -1247,12 +1427,31 @@ export struct HomeTab {
     }
   }
 
-  /** 视口尺寸变化：记录视口高（按当前 feed 分别记录） */
+  /** 视口尺寸变化：记录视口高（按当前 feed 分别记录）+ 形态变化兜底（分屏/自由窗口） */
   private onHomeViewportAreaChange(oldValue: Area, newValue: Area): void {
     if (this.homeFeed === HomeFeed.Following) {
       this.folViewportH = newValue.height as number;
     } else {
       this.homeViewportH = newValue.height as number;
+    }
+    this.checkFormChange();
+  }
+
+  /** 形态变化兜底：真实屏幕宽高变化（分屏 / 自由窗口 / 折叠展开）时刷新列数标记 */
+  private checkFormChange(): void {
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w !== this.pageWidth || h !== this.pageHeight) {
+        this.pageWidth = w;
+        this.pageHeight = h;
+        this.updateFadeStop(h);
+        this.updateColumns();
+        this.syncCardColumns();
+      }
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败
     }
   }
 
@@ -1364,7 +1563,7 @@ export struct HomeTab {
   RecommendedFeed() {
     Column() {
       if (this.loadState === LoadState.Loading) {
-        ThreadListSkeleton()
+        ThreadListSkeleton({ columns: this.homeColumns() })
           .width('100%')
           .layoutWeight(1)
       } else if (this.loadState === LoadState.Error) {
@@ -1382,6 +1581,58 @@ export struct HomeTab {
       } else {
         // 刷新区整体下移到"推荐/关注动态"按钮下方：系统默认指示器从按钮下方出现，跟手、松手刷新
         Refresh({ refreshing: this.homeRefreshing, offset: 48, friction: 62 }) {
+          if (this.homeColumns() > 1) {
+            // ===== WaterFlow 瀑布流（§4.2 决策 12）：LazyForEach 虚拟滚动 + 自然高度卡片 =====
+            WaterFlow({ scroller: this.homeScroller }) {
+              LazyForEach(this.recDataSource, (item: ThreadItem) => {
+                FlowItem() {
+                  ThreadCard({
+                    item: {
+                      tid: item.tid,
+                      postId: item.postId ?? '',
+                      forumId: item.forumId,
+                      title: item.title,
+                      forumName: item.forumName,
+                      forumAvatar: item.forumAvatar ?? '',
+                      author: item.author,
+                      authorId: item.authorId,
+                      authorAvatar: item.authorAvatar ?? '',
+                      replyNum: item.replyNum,
+                      likeCount: item.likeCount ?? 0,
+                      isLiked: item.isLiked ?? false,
+                      abstract: item.abstract,
+                      firstImage: item.firstImage ?? '',
+                      images: item.images ?? [],
+                      createTime: item.createTime,
+                      isTop: item.isTop,
+                      isGood: item.isGood,
+                    } as ThreadItemData,
+                    onTap: (_tid: string) => this.openThread(item),
+                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                    onComment: (_tid: string) => this.openThread(item),
+                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                  })
+                }
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+            }
+            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : '1fr 1fr 1fr')
+            .columnsGap(Spacing.md)
+            .rowsGap(Spacing.md)
+            .padding({ left: Spacing.lg, right: Spacing.lg })
+            .layoutWeight(1)
+            .clip(false)
+            .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+            .scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring)
+            .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeViewportAreaChange(oldValue, newValue))
+            .onScroll((xOffset: number, yOffset: number) => this.onHomeScroll(xOffset, yOffset))
+            .onReachEnd(() => {
+              if (this.loadState === LoadState.Success && !this.homeLoadingMore) {
+                this.loadMoreHomeThreads();
+              }
+            })
+          } else {
           Scroll(this.homeScroller) {
             Column() {
               ForEach(this.threads, (item: ThreadItem) => {
@@ -1453,6 +1704,7 @@ export struct HomeTab {
               this.loadMoreHomeThreads();
             }
           })
+          }
         }
         .width('100%')
         .margin({ top: HOME_TOP_PAD })
@@ -1479,7 +1731,7 @@ export struct HomeTab {
   FollowingFeed() {
     Column() {
       if (this.folState === LoadState.Loading) {
-        ThreadListSkeleton()
+        ThreadListSkeleton({ columns: this.homeColumns() })
           .width('100%')
           .layoutWeight(1)
       } else if (this.folState === LoadState.Error) {
@@ -1496,6 +1748,58 @@ export struct HomeTab {
         }).layoutWeight(1)
       } else {
         Refresh({ refreshing: this.folRefreshing, offset: 48, friction: 62 }) {
+          if (this.homeColumns() > 1) {
+            // ===== WaterFlow 瀑布流（§4.2 决策 12）：与推荐流同款写法 =====
+            WaterFlow({ scroller: this.folScroller }) {
+              LazyForEach(this.folDataSource, (item: ThreadItem) => {
+                FlowItem() {
+                  ThreadCard({
+                    item: {
+                      tid: item.tid,
+                      postId: item.postId ?? '',
+                      forumId: item.forumId,
+                      title: item.title,
+                      forumName: item.forumName,
+                      forumAvatar: item.forumAvatar ?? '',
+                      author: item.author,
+                      authorId: item.authorId,
+                      authorAvatar: item.authorAvatar ?? '',
+                      replyNum: item.replyNum,
+                      likeCount: item.likeCount ?? 0,
+                      isLiked: item.isLiked ?? false,
+                      abstract: item.abstract,
+                      firstImage: item.firstImage ?? '',
+                      images: item.images ?? [],
+                      createTime: item.createTime,
+                      isTop: item.isTop,
+                      isGood: item.isGood,
+                    } as ThreadItemData,
+                    onTap: (_tid: string) => this.openThread(item),
+                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                    onComment: (_tid: string) => this.openThread(item),
+                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                  })
+                }
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+            }
+            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : '1fr 1fr 1fr')
+            .columnsGap(Spacing.md)
+            .rowsGap(Spacing.md)
+            .padding({ left: Spacing.lg, right: Spacing.lg })
+            .layoutWeight(1)
+            .clip(false)
+            .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+            .scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring)
+            .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeViewportAreaChange(oldValue, newValue))
+            .onScroll((xOffset: number, yOffset: number) => this.onHomeScroll(xOffset, yOffset))
+            .onReachEnd(() => {
+              if (this.folState === LoadState.Success && !this.folLoadingMore) {
+                this.loadMoreFollowingThreads();
+              }
+            })
+          } else {
           Scroll(this.folScroller) {
             Column() {
               ForEach(this.folThreads, (item: ThreadItem) => {
@@ -1567,6 +1871,7 @@ export struct HomeTab {
               this.loadMoreFollowingThreads();
             }
           })
+          }
         }
         .width('100%')
         .margin({ top: HOME_TOP_PAD })

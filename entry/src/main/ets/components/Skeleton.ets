@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { LengthMetrics } from '@kit.ArkUI';
 import { Theme, Spacing, Radius, isDarkMode } from '../common/Theme';
 
 /**
@@ -35,6 +36,11 @@ import { Theme, Spacing, Radius, isDarkMode } from '../common/Theme';
 @Component
 export struct ThreadCardSkeleton {
   @Prop index: number = 0;
+  /**
+   * 拉伸模式（平板适配文档 §4.2 决策 11）：多列行分组下由 Flex(Stretch) 拉伸到行高，
+   * 骨架随之等高，避免「骨架有高度差 → 内容等高」的跳变。单列档恒 false（手机零回归）。
+   */
+  @Prop stretch: boolean = false;
   @State pulseOpacity: number = 0;
   @State pulseUp: boolean = true;
   @State cardOpacity: number = 0;
@@ -84,7 +90,7 @@ export struct ThreadCardSkeleton {
       // ===== 未上墨的"纸" =====
       Column()
         .width('100%')
-        .height(this.cardHeight())
+        .height(this.stretch ? '100%' : this.cardHeight())
         .borderRadius(Radius.lg)
         .backgroundColor(Theme.skeletonSheet(isDarkMode()))
         .opacity(this.cardOpacity)
@@ -92,7 +98,7 @@ export struct ThreadCardSkeleton {
       // ===== 呼吸高亮层：极轻的白色叠加，整张纸缓慢起伏 =====
       Column()
         .width('100%')
-        .height(this.cardHeight())
+        .height(this.stretch ? '100%' : this.cardHeight())
         .borderRadius(Radius.lg)
         .backgroundColor(Color.White)
         .opacity(this.pulseOpacity * (isDarkMode() ? 0.10 : 0.35))
@@ -106,20 +112,83 @@ export struct ThreadCardSkeleton {
 
 /**
  * N 张帖子卡占位列表（用于首页/吧内列表首屏 Loading）
+ * - columns 默认 1：单列档（手机 / 单列二级页）与改造前逐像素一致（列 = 1 走原 Column）
+ * - columns > 1：与真实列表**同列数**铺放，避免「单列骨架 → 多列内容」的视觉跳变
+ * 注意（平板适配文档 §6.1 D3）：默认值必须为 1，且单列页禁止传入多列值。
  */
 @Component
 export struct ThreadListSkeleton {
   @Prop count: number = 4;
+  /** 列数（默认 1；多列页按当前列数传入） */
+  @Prop columns: number = 1;
   @StorageLink('fontScale') fontScale: number = 1.0;
 
-  build() {
-    Column({ space: Spacing.md }) {
-      ForEach(Array.from({ length: this.count }, (_: number, i: number) => i), (i: number) => {
-        ThreadCardSkeleton({ index: i })
-      }, (i: number) => `skeleton_paper_${i}`)
+  /** 方案 B 行分组：行下标数组（总行数 = ceil(count / columns)） */
+  private skeletonRows(): number[] {
+    const n: number = Math.ceil(this.count / this.columns);
+    const arr: number[] = [];
+    for (let i: number = 0; i < n; i++) {
+      arr.push(i);
     }
-    .width('100%')
-    .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
+    return arr;
+  }
+
+  /** 第 rowIdx 行的骨架卡下标（不超过总数） */
+  private skeletonRowIdx(rowIdx: number): number[] {
+    const arr: number[] = [];
+    const start: number = rowIdx * this.columns;
+    const end: number = Math.min(start + this.columns, this.count);
+    for (let i: number = start; i < end; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  /** 第 rowIdx 行末尾补空位下标（保证末行卡片宽度与其它行一致，§6.1 A2） */
+  private skeletonBlanks(rowIdx: number): number[] {
+    const arr: number[] = [];
+    const filled: number = Math.min(this.count - rowIdx * this.columns, this.columns);
+    for (let i: number = filled; i < this.columns; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  build() {
+    if (this.columns > 1) {
+      // 多列档（方案 B 行分组）：与真实列表同结构，避免「Loading 单列 → 内容多列」的视觉跳变
+      Column() {
+        ForEach(this.skeletonRows(), (rowIdx: number) => {
+          // 行内等高对齐（§4.2 决策 11）：与真实列表同款容器 + 骨架同步拉伸
+          Flex({
+            alignItems: ItemAlign.Stretch,
+            space: { main: LengthMetrics.vp(Spacing.md) }
+          }) {
+            ForEach(this.skeletonRowIdx(rowIdx), (i: number) => {
+              ThreadCardSkeleton({ index: i, stretch: true })
+                .layoutWeight(1)
+                .height('100%')
+            }, (i: number) => `skeleton_paper_${i}`)
+            ForEach(this.skeletonBlanks(rowIdx), (b: number) => {
+              Blank()
+                .layoutWeight(1)
+            }, (b: number) => `skeleton_blank_${rowIdx}_${b}`)
+          }
+          .width('100%')
+          .margin({ bottom: Spacing.md })
+        }, (rowIdx: number) => `skeleton_row_${rowIdx}`)
+      }
+      .width('100%')
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
+    } else {
+      Column({ space: Spacing.md }) {
+        ForEach(Array.from({ length: this.count }, (_: number, i: number) => i), (i: number) => {
+          ThreadCardSkeleton({ index: i })
+        }, (i: number) => `skeleton_paper_${i}`)
+      }
+      .width('100%')
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
+    }
   }
 }
 

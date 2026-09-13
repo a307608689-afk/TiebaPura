@@ -716,6 +716,10 @@ struct ThreadList {
   aboutToAppear(): void {
     // 生命周期阶段UIContext已就绪，安全初始化context缓存
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    // 本页多列改造尚未落地：显式写回单列，避免吃到首页（已多列）留下的 cardColumns 残留，
+    // 让 ThreadCard 在手机上仍是改造前的单列几何（§6.1 D1「跨页共享标记必须在每个使用页都写」）。
+    // 本页落地多列（T-B）后，此处改为按本页列数无条件写入。
+    AppStorage.setOrCreate('cardColumns', 1);
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
     const params = this.getUIContext().getRouter().getParams() as Record<string, string>;

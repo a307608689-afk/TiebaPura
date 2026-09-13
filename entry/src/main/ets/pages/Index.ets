@@ -641,10 +641,7 @@ struct Index {
       // 首页常驻组件树：避免切走后组件销毁导致滚动位置丢失（滚动偏移/feed 状态在 HomeTab 内部保留）。
       // 非当前页/非动画期间用 visibility 隐藏（Hidden 不绘制、不重建）。
       Stack() {
-        HomeTab({
-          // 首页搜索入口：切到收藏 Tab（搜索在收藏页本地过滤；HomeTab 内部已自增 favOpenSearchRequest 唤醒收藏搜索）
-          onOpenFavorite: (): void => { this.switchTab(TabIndex.Favorite); }
-        })
+        HomeTab()
       }
       .width('100%')
       .height('100%')

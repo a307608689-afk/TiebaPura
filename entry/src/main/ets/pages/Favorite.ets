@@ -1061,8 +1061,6 @@ export struct FavoriteTab {
   // favBackRequest = Index 转发来的返回请求自增计数，FavoriteTab 消费后逐级回退
   @StorageLink('favCanGoBack') @Watch('syncBackState') favCanGoBack: boolean = false;
   @StorageLink('favBackRequest') @Watch('onBackRequest') favBackRequest: number = 0;
-  // BUG-03 收口：首页/全局搜索入口 → 切收藏 Tab + 打开收藏本地搜索（favOpenSearchRequest = Index 自增标记，消费后打开搜索态）
-  @StorageLink('favOpenSearchRequest') @Watch('onOpenSearchRequest') favOpenSearchRequest: number = 0;
   // 收藏页常驻（不随 Tab 切换重建）：登录/登出/换号通知（Index.refreshLoginState 检测到登录态变化时递增）
   @StorageLink('favLoginRefresh') @Watch('onLoginRefresh') favLoginRefresh: number = 0;
   // 深色模式切换通知：本页或宿主切换深色时递增 → 重读 isDarkMode()，保持与 ForumsTab/MineTab/HomeTab 同链路
@@ -1127,8 +1125,6 @@ export struct FavoriteTab {
     this.syncBackState();
     this.initSortState();
     this.loadAll();
-    // 首页搜索入口联动：组件重建时 @Watch 不触发，需在 aboutToAppear 补消费
-    this.onOpenSearchRequest();
   }
 
   /** v1.11 加载排序偏好与本地收藏时间 / 分类内帖子自定义顺序（异步，不阻塞首屏） */
@@ -2553,13 +2549,6 @@ export struct FavoriteTab {
   private exitSearch(): void {
     this.searchMode = false;
     this.searchKeyword = '';
-  }
-
-  /** 消费首页搜索入口请求：打开收藏本地搜索态（searchMode 已挂 syncBackState，可回退标记自动联动） */
-  private onOpenSearchRequest(): void {
-    if (this.favOpenSearchRequest > 0) {
-      this.enterSearch();
-    }
   }
 
   /** 登录状态变化（登录/登出/换号）：重读账号并回到收藏根视图重载数据 */

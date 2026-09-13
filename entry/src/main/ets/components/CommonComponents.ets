@@ -270,6 +270,12 @@ export struct ThreadCard {
    * 图片加载失败标记：任一图加载失败时降级为作者头像缩略 + 失败提示，
    * 避免大图区域显示占位（看起来像"图片没出来"）。
    */
+  /**
+   * 全局只读列数标记（平板适配文档 §4.2 决策 6）：
+   * 仅在多列档（> 1）才比例化卡内几何；单列（手机 / 窄窗）逐像素保持改造前取值。
+   * 由各多列页**无条件**写入（单列也写 1），避免跨页残留（§6.1 D1 / D6）。
+   */
+  @StorageProp('cardColumns') cardColumns: number = 1;
   @State imageFailed: boolean = false;
   /** 正在阶梯重试的图片 URL 集合：防 preload/onError/onComplete 多路径对同一 URL 重复启动重试阶梯 */
   private retryingUrls: Set<string> = new Set<string>();
@@ -512,12 +518,12 @@ export struct ThreadCard {
           .width('100%')
           .padding({ left: 16, right: 16, top: 8 })
 
-        // 正文摘要
+        // 正文摘要：多列档降为 2 行（列窄、一屏要放下更多卡），单列逐像素维持现状 4 行
         if (this.getItem().abstract.length > 0) {
           Text(this.getItem().abstract)
             .fontSize(fs(14, this.fontScale))
             .fontColor(Theme.textSecondary(isDarkMode()))
-            .maxLines(4)
+            .maxLines(this.cardColumns > 1 ? 2 : 4)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
             .padding({ left: 16, right: 16, top: 6 })
@@ -667,6 +673,50 @@ export struct ThreadCard {
     .borderRadius(26)
   }
 
+  /**
+   * 单图加载失败：onError 后重试一次 ImageCache.resolve（带贴吧 UA/Referer/Cookie 的下载），
+   * 多数偶发失败(网络抖动/原 URL 被防盗链)能命中本地缓存自愈，不立即锁死降级。
+   */
+  private handleSingleImageError(): void {
+    const u: string = this.getItem().images![0];
+    hilog.warn(LOG_DOMAIN, TAG, 'onError single url=%{public}s', shortUrl(u));
+    ImageCache.debugLog(`card onError single url=${shortUrl(u)}`);
+    this.retryOrFail(u);
+  }
+
+  /**
+   * 单图加载完成：贴吧 CDN 对非移动端 UA/IP 的图床请求会返回占位图（HTTP 200 + 200/238 方图），
+   * onError 不会触发（因为"加载成功"），必须靠尺寸识别。
+   * v1.22: 识别到占位不立即 imageFailed（避免新帖图"先失败后恢复"的闪烁），改为确保 retryOrFail
+   * 阶梯在跑：命中本地缓存(带 UA 下载成功)后自愈切真图，仅当整条阶梯(0~40s CDN 同步窗口)
+   * 全部失败后才降级。命中本地真实图时走 file:// 不受影响。
+   */
+  private handleSingleImageComplete(loadingStatus: number, w: number, h: number): void {
+    if (loadingStatus === 1 && ((w === 200 && h === 200) || (w === 238 && h === 238))) {
+      ImageCache.debugLog(`card onComplete PLACEHOLDER ${w}x${h} url=${shortUrl(this.getItem().images![0])}`);
+      if (!this.cachedImageMap[this.getItem().images![0]]) {
+        this.retryOrFail(this.getItem().images![0]);
+      }
+    }
+  }
+
+  /** 多图格加载失败：重试沙箱缓存，命中后自愈（与单图同口径，各自重试、不整卡降级） */
+  private handleGridImageError(img: string): void {
+    hilog.warn(LOG_DOMAIN, TAG, 'onError grid url=%{public}s', shortUrl(img));
+    ImageCache.debugLog(`card onError grid url=${shortUrl(img)}`);
+    this.retryOrFail(img);
+  }
+
+  /** 多图格占位图识别：同单图口径，各自走 retryOrFail 等 CDN 同步，命中缓存后自愈 */
+  private handleGridImageComplete(img: string, loadingStatus: number, w: number, h: number): void {
+    if (loadingStatus === 1 && ((w === 200 && h === 200) || (w === 238 && h === 238))) {
+      ImageCache.debugLog(`card onComplete PLACEHOLDER ${w}x${h} grid url=${shortUrl(img)}`);
+      if (!this.cachedImageMap[img]) {
+        this.retryOrFail(img);
+      }
+    }
+  }
+
   @Builder
   ImageGallery() {
     if (this.imageFailed) {
@@ -695,61 +745,76 @@ export struct ThreadCard {
         this.onTap(this.getItem().tid);
       })
     } else if (this.getImageCount() === 1) {
-          Image(this.resolveImgUrl(this.getItem().images![0]))
-            .width('100%')
-            .height(220)
-            .borderRadius(Radius.md)
-            .objectFit(ImageFit.Cover)
-            .onError(() => {
-              const u: string = this.getItem().images![0];
-              hilog.warn(LOG_DOMAIN, TAG, 'onError single url=%{public}s', shortUrl(u));
-              ImageCache.debugLog(`card onError single url=${shortUrl(u)}`);
-              // onError 后重试一次 ImageCache.resolve（带贴吧 UA/Referer/Cookie 的下载），
-              // 多数偶发失败(网络抖动/原 URL 被防盗链)能命中本地缓存自愈,不立即锁死降级
-              this.retryOrFail(u);
-            })
-            .onComplete((event) => {
-              if (!event) return;
-              // 贴吧 CDN 对非移动端 UA/IP 的图床请求会返回占位图（HTTP 200 + 占位图），
-              // onError 不会触发（因为"加载成功"），必须靠尺寸识别。
-              // v1.22: 识别到占位不再立即 imageFailed（避免新帖图"先失败后恢复"的闪烁），
-              // 改为确保 retryOrFail 阶梯在跑：命中本地缓存(带 UA 下载成功)后自愈切真图，
-              // 仅当整条阶梯(0~40s CDN 同步窗口)全部失败后才降级。命中本地真实图时走 file:// 不受影响。
-              if (event.loadingStatus === 1 &&
-                ((event.width === 200 && event.height === 200) || (event.width === 238 && event.height === 238))) {
-                ImageCache.debugLog(`card onComplete PLACEHOLDER ${event.width}x${event.height} url=${shortUrl(this.getItem().images![0])}`);
-                if (!this.cachedImageMap[this.getItem().images![0]]) {
-                  this.retryOrFail(this.getItem().images![0]);
-                }
-              }
-            })
+          // 单图：单列档逐像素保持 height(220)；多列档列宽变窄，改 16:10 比例，
+          // 避免"列宽 240 时接近方形 / 列宽 400 时明显变扁"（§4.2 决策 6）。
+          // 封顶 220：列宽变宽时 aspectRatio(1.6) 会等比放大高度，真机上出现"图比手机还大"，
+          // 锁死手机基线高度后只横向扩展、纵向不再无限放大。
+          if (this.cardColumns > 1) {
+            Image(this.resolveImgUrl(this.getItem().images![0]))
+              .width('100%')
+              .aspectRatio(1.6)
+              .constraintSize({ maxHeight: 220 })
+              .borderRadius(Radius.md)
+              .objectFit(ImageFit.Cover)
+              .onError(() => {
+                this.handleSingleImageError();
+              })
+              .onComplete((event) => {
+                if (!event) return;
+                this.handleSingleImageComplete(event.loadingStatus, event.width, event.height);
+              })
+          } else {
+            Image(this.resolveImgUrl(this.getItem().images![0]))
+              .width('100%')
+              .height(220)
+              .borderRadius(Radius.md)
+              .objectFit(ImageFit.Cover)
+              .onError(() => {
+                this.handleSingleImageError();
+              })
+              .onComplete((event) => {
+                if (!event) return;
+                this.handleSingleImageComplete(event.loadingStatus, event.width, event.height);
+              })
+          }
         } else {
           // 多图网格（2-9张），使用 Grid 实现均匀间距
           Grid() {
             ForEach(this.getItem().images!.slice(0, this.getImageCount()), (img: string, idx: number) => {
               GridItem() {
-                Image(this.resolveImgUrl(img))
-                  .width('100%')
-                  .height((this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100)
-                  .borderRadius(Radius.md)
-                  .objectFit(ImageFit.Cover)
-                  .onError(() => {
-                    hilog.warn(LOG_DOMAIN, TAG, 'onError grid url=%{public}s', shortUrl(img));
-                    ImageCache.debugLog(`card onError grid url=${shortUrl(img)}`);
-                    // 重试沙箱缓存,命中则 @Watch 自动清除 imageFailed,Grid 走本地路径恢复
-                    this.retryOrFail(img);
-                  })
-                  .onComplete((event) => {
-                    if (!event) return;
-                    // v1.22: 同单图——占位不再整卡降级，各自走 retryOrFail 等 CDN 同步，命中缓存后自愈
-                    if (event.loadingStatus === 1 &&
-                      ((event.width === 200 && event.height === 200) || (event.width === 238 && event.height === 238))) {
-                      ImageCache.debugLog(`card onComplete PLACEHOLDER ${event.width}x${event.height} grid url=${shortUrl(img)}`);
-                      if (!this.cachedImageMap[img]) {
-                        this.retryOrFail(img);
-                      }
-                    }
-                  })
+                // 多图格几何：单列档保持现状格高（2/4 张 140、其余 100）；多列档列宽随列数变，
+                // 改 1:1 比例，避免比例失真（§4.2 决策 6）。两种写法互斥（height 与 aspectRatio 同设会冲突）。
+                // 封顶同单列档：防止列宽变宽后多图格也变得比手机大。
+                if (this.cardColumns > 1) {
+                  Image(this.resolveImgUrl(img))
+                    .width('100%')
+                    .aspectRatio(1)
+                    .constraintSize({
+                      maxHeight: (this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100
+                    })
+                    .borderRadius(Radius.md)
+                    .objectFit(ImageFit.Cover)
+                    .onError(() => {
+                      this.handleGridImageError(img);
+                    })
+                    .onComplete((event) => {
+                      if (!event) return;
+                      this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
+                    })
+                } else {
+                  Image(this.resolveImgUrl(img))
+                    .width('100%')
+                    .height((this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100)
+                    .borderRadius(Radius.md)
+                    .objectFit(ImageFit.Cover)
+                    .onError(() => {
+                      this.handleGridImageError(img);
+                    })
+                    .onComplete((event) => {
+                      if (!event) return;
+                      this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
+                    })
+                }
               }
             }, (img: string, idx: number) => `${idx}`)
           }
