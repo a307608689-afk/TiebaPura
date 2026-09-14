@@ -304,6 +304,13 @@ export struct HomeTab {
   private followForumNamesLoaded: boolean = false;
   // 「仅推荐关注的吧」补采游标：已随机采样的吧名，避免连续多轮重复采样同一批吧
   private backfillSampledForums: Set<string> = new Set<string>();
+  // ① 会话级全局去重：本会话已展示过的 tid（仅关注吧模式主用，正常模式也记录无害）。
+  // 用户主动刷新（下拉/retap/换号/开关切换）时清空——刷新后旧帖允许按时间自然回归。
+  private shownTids: Set<string> = new Set<string>();
+  private shownTidsQueue: string[] = [];   // FIFO 淘汰队列，封顶防内存膨胀
+  // ② 补采双槽状态：每吧递进页码游标（深挖槽用，封顶回卷）+ 每吧上次 sort_type（交替轮换）
+  private backfillNextPage: Map<string, number> = new Map<string, number>();
+  private backfillLastSort: Map<string, number> = new Map<string, number>();
   // 首页昵称补校准轮数（仅当仍有占位名作者时最多补 3 轮）
   private homeReEnrichAttempts: number = 0;
   // 首页初始化完成标志：冷启动恢复开关触发的首次 Watch 不强制刷新（由冷启动缓存直出接管）
@@ -494,7 +501,8 @@ export struct HomeTab {
     this.loggedIn = AuthManager.getInstance().isLogin();
     // 登录账号变化：关注吧集合失效（仅推荐关注的吧 需按新账号重新拉取）
     this.followForumNamesLoaded = false;
-    this.backfillSampledForums.clear();
+    // 换号即一次刷新语义：①会话级去重与补采游标一并清空
+    this.clearSessionDedup();
     // 关注动态按账号隔离：换号/登出后失效，下次进入重新拉取，避免展示上一账号的关注帖
     this.folFeedLoaded = false;
     this.folThreads = [];
@@ -656,23 +664,66 @@ export struct HomeTab {
     return this.loggedIn && this.homeOnlyFollow;
   }
 
-  /** 单个吧的一次补采请求：随机 sort_type（0 最近回复 / 1 最新发帖）与页码（1/2），取前 limit 条；失败静默跳过 */
-  private async fetchForumFeedOnce(forumName: string, limit: number): Promise<ThreadItem[]> {
+  /** 单个吧的一次补采请求：显式传 sort_type/页码（双槽采样用）；缺省时随机（0 最近回复 / 1 最新发帖、页码 1/2），失败静默跳过 */
+  private async fetchForumFeedOnce(forumName: string, limit: number, sortType?: number, page?: number): Promise<ThreadItem[]> {
     try {
-      const sortType: number = Math.random() < 0.5 ? 0 : 1;
-      const page: number = Math.random() < 0.5 ? 1 : 2;
-      const r: PagedResult<ThreadItem> = await TiebaService.getInstance().fetchForumThreads(forumName, page, sortType, false);
+      const st: number = sortType !== undefined ? sortType : (Math.random() < 0.5 ? 0 : 1);
+      const pg: number = page !== undefined ? page : (Math.random() < 0.5 ? 1 : 2);
+      const r: PagedResult<ThreadItem> = await TiebaService.getInstance().fetchForumThreads(forumName, pg, st, false);
       return r.list.slice(0, limit);
     } catch (e) {
       return [];
     }
   }
 
+  /** ① 会话级去重登记：把已写入列表的 tid 记入 shownTids（FIFO 封顶 1000） */
+  private rememberShown(list: ThreadItem[]): void {
+    for (const t of list) {
+      if (t.tid.length > 0 && !this.shownTids.has(t.tid)) {
+        this.shownTids.add(t.tid);
+        this.shownTidsQueue.push(t.tid);
+      }
+    }
+    while (this.shownTidsQueue.length > 1000) {
+      const oldest: string | undefined = this.shownTidsQueue.shift();
+      if (oldest !== undefined) {
+        this.shownTids.delete(oldest);
+      }
+    }
+  }
+
+  /** ① 会话级去重清空：用户主动刷新/换号/开关切换时调用（shownTids + 补采游标一并重置） */
+  private clearSessionDedup(): void {
+    this.shownTids.clear();
+    this.shownTidsQueue = [];
+    this.backfillSampledForums.clear();
+    this.backfillNextPage.clear();
+    this.backfillLastSort.clear();
+  }
+
+  /** ⑤ 渲染前兜底去重：同 tid 只保留首个出现（防任何上游路径漏去重，成本 O(n)） */
+  private dedupeByTid(list: ThreadItem[]): ThreadItem[] {
+    const seen: Set<string> = new Set<string>();
+    const out: ThreadItem[] = [];
+    for (const t of list) {
+      if (t.tid.length > 0) {
+        if (seen.has(t.tid)) {
+          continue;
+        }
+        seen.add(t.tid);
+      }
+      out.push(t);
+    }
+    return out;
+  }
+
   /**
-   * 「仅推荐关注的吧」关注吧补采：
-   * 从未采样过的关注吧中随机取 N=8 个，每吧随机 sort_type/页码并发拉取，合并去重后半随机时间排序，
-   * 返回最多 targetCount 条；excludeTids 为已展示帖子，补采时跳过避免重复。
-   * 采样游标本轮用尽后自动重置（此时已展示 tid 仍会被排除，信息流不会无限重复）。
+   * 「仅推荐关注的吧」关注吧补采（方案A双槽采样）：
+   * 从未采样过的关注吧中随机取 N=8 个，拆成两类槽——
+   * - 新鲜槽×4：固定打第 1 页（sort_type 与该吧上次交替），保证新帖最迟下一轮补采即进入信息流；
+   * - 深挖槽×4：走每吧递进页码游标（1→2→…→5 回卷），翻出老库存提高产量、治重复。
+   * 合并去重（排除调用方集合 + 会话级 shownTids）后半随机时间排序，返回最多 targetCount 条。
+   * 采样游标本轮用尽后自动重置；下拉刷新/换号时 shownTids 与游标一并清空。
    */
   private async fetchFollowForumFeed(targetCount: number, excludeTids?: Set<string>): Promise<ThreadItem[]> {
     const sets: FollowSets | null = await this.getFollowSets();
@@ -699,12 +750,28 @@ export struct HomeTab {
       this.backfillSampledForums.add(n);
     }
     const tasks: Promise<ThreadItem[]>[] = [];
-    for (const name of sampled) {
+    for (let i: number = 0; i < sampled.length; i++) {
+      const name: string = sampled[i];
+      // sort_type 与该吧上次交替，避免同一排序反复消费同一段内容池
+      const lastSort: number | undefined = this.backfillLastSort.get(name);
+      const sortType: number = lastSort === undefined ? (Math.random() < 0.5 ? 0 : 1) : (lastSort === 0 ? 1 : 0);
+      this.backfillLastSort.set(name, sortType);
+      let page: number = 1;
+      if (i >= 4) {
+        // 深挖槽：递进游标，封顶 5 页回卷（过深的老页大多为空/极旧，回卷后自然恢复新鲜度）
+        const cursor: number | undefined = this.backfillNextPage.get(name);
+        page = cursor === undefined ? 1 : cursor;
+        this.backfillNextPage.set(name, page >= 5 ? 1 : page + 1);
+      }
       // 单吧请求 4s 超时包装：个别吧接口挂起不拖累整批补采（8 个吧仍并发）
-      tasks.push(this.withFeedTimeout(this.fetchForumFeedOnce(name, 6), 4000));
+      tasks.push(this.withFeedTimeout(this.fetchForumFeedOnce(name, 6, sortType, page), 4000));
     }
     const chunks: ThreadItem[][] = await Promise.all(tasks);
+    // 去重池 = 调用方排除集 + 会话级已展示 tid（③：从"当前屏"扩到"本会话"）
     const seen: Set<string> = new Set<string>();
+    for (const t of this.shownTids) {
+      seen.add(t);
+    }
     if (excludeTids !== undefined) {
       for (const t of excludeTids) {
         seen.add(t);
@@ -859,7 +926,8 @@ export struct HomeTab {
     // 推荐流数据源已变化：切回推荐页时需重新加载（正停留在推荐页时下面立即重载）
     this.recommendLoaded = false;
     this.followForumNamesLoaded = false;
-    this.backfillSampledForums.clear();
+    // 开关切换即一次刷新语义：①会话级去重与补采游标一并清空
+    this.clearSessionDedup();
     if (this.homeFeed === HomeFeed.Recommended) {
       this.homePage = 1;
       this.homeHasMore = true;
@@ -889,8 +957,8 @@ export struct HomeTab {
     this.homePage = 1;
     this.homeHasMore = true;
     this.homeStalledPages = 0;
-    // 「仅推荐关注的吧」补采：刷新时重置采样游标，重新随机采样关注吧
-    this.backfillSampledForums.clear();
+    // 「仅推荐关注的吧」补采：重拉第一页即视为一次刷新——①清会话级去重与补采游标，旧帖允许自然回归
+    this.clearSessionDedup();
     // 仅在当前列表为空时切骨架屏（首次加载/切换 feed）；已有内容刷新时保留列表原地更新，避免闪屏
     if (this.threads.length === 0) {
       this.loadState = LoadState.Loading;
@@ -901,6 +969,8 @@ export struct HomeTab {
         // 仅关注模式同样缓存直出（缓存内容即上次过滤加载的结果），避免冷启动重复网络加载
         const cached = await CacheManager.getInstance().getWithTtlAllowStale<ThreadItem[]>(CACHE_KEY.THREAD_LIST);
         if (cached && cached.data.length > 0) {
+          // 缓存直出的内容同样登记进会话级去重（后续补采/翻页不再重复这些 tid）
+          this.rememberShown(cached.data);
           this.threads = cached.data;
           this.loadState = LoadState.Success;
           this.recommendLoaded = true;
@@ -927,7 +997,9 @@ export struct HomeTab {
           list = sortSemiRandomByTime(list);
         }
       }
-      this.threads = list;
+      // ⑤ 渲染前兜底去重 + ①会话级登记（backfill 已合并进 list，统一在此收口）
+      this.threads = this.dedupeByTid(list);
+      this.rememberShown(this.threads);
       this.recommendLoaded = true;
       this.homePage = result.page;
       this.homeHasMore = list.length > 0;
@@ -961,7 +1033,8 @@ export struct HomeTab {
         return;
       }
       this.homePage = result.page;
-      this.threads = result.list;
+      this.threads = this.dedupeByTid(result.list);
+      this.rememberShown(this.threads);
       this.homeHasMore = result.list.length > 0;
       this.homeStalledPages = 0;
       this.enrichHomeInBackground(result.list);
@@ -1058,13 +1131,17 @@ export struct HomeTab {
     // 记录当前代际：返回时若已刷新/切feed则丢弃结果
     const myToken: number = this.homeLoadToken;
     try {
+      // ③ 排除集从"当前屏"扩到"本会话"：shownTids 全量 + 当前列表兜底（防个别写路径漏登记）
       const exclude: Set<string> = new Set<string>();
+      for (const t of this.shownTids) {
+        exclude.add(t);
+      }
       for (const item of this.threads) {
         exclude.add(item.tid);
       }
       let appended: ThreadItem[] = [];
       if (this.shouldOnlyFollow()) {
-        // 仅关注吧模式：推荐流已翻尽，直接补采一轮关注吧近期帖子（随机采样、跳过已展示）
+        // 仅关注吧模式：推荐流已翻尽，直接补采一轮（双槽采样、会话级跳过已展示）
         const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(15, exclude), 5000);
         if (myToken !== this.homeLoadToken) {
           return;
@@ -1086,6 +1163,7 @@ export struct HomeTab {
         this.homePage = result.page;
       }
       if (appended.length > 0) {
+        this.rememberShown(appended);
         this.threads = this.threads.concat(appended);
         this.homeStalledPages = 0;
         // 新增项的昵称后台校准，不阻塞翻页

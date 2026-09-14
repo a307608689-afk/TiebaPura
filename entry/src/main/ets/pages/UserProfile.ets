@@ -16,7 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { display } from '@kit.ArkUI';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { TiebaService, BlacklistPermOptions } from '../service/TiebaService';
@@ -27,7 +29,7 @@ import { UserProfileModel, UserLikeItem, PersonalContentItem } from '../model/Da
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 import { common } from '@kit.AbilityKit';
-import { window, LengthMetrics } from '@kit.ArkUI';
+import { window, LengthMetrics, curves } from '@kit.ArkUI';
 
 enum ProfileLoadState {
   Loading = 0,
@@ -85,6 +87,18 @@ struct UserProfile {
   @State profileError: string = '';
   @State activeTab: UserTab = UserTab.Posts;
 
+  // ===== Tab 切换动画 / 左右滑动（范式照抄首页 Index.switchTab：双页平移 + springMotion）=====
+  @State prevTab: number = -1;            // 动画期间的退场页（-1 = 无；存 UserTab 数值）
+  @State inOffset: number = 0;            // 进场页横向位移（页宽百分比）
+  @State outOffset: number = 0;           // 退场页横向位移（页宽百分比）
+  @State dragging: boolean = false;       // 手势拖拽中（页面位移走 dragPct 分支）
+  @State dragPct: number = 0;             // 拖拽实时位移（相对页宽百分比）
+  private animLock: boolean = false;      // 点击切换动画锁（动画期间忽略连点/再拖）
+  private panActive: boolean = false;     // 本次手势是否有效（动画期间开始的手势直接忽略）
+  // 关注的吧页首访后才挂载（隐藏保留滚动位置，未访不拉数据）；必须是 @State——
+  // 翻转时依赖它触发 UI 重渲染（if (this.likesMounted) 挂载分支），普通字段不驱动渲染会整页空白
+  @State likesMounted: boolean = false;
+
   // 帖子 Tab
   @State posts: PersonalContentItem[] = [];
   @State postsState: ProfileLoadState = ProfileLoadState.Loading;
@@ -124,6 +138,17 @@ struct UserProfile {
   /** 设备是否支持系统沉浸材质（aboutToAppear 中 MaterialManager.init() 后确定） */
   @State materialSupported: boolean = true;
 
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.11，2026-09-15 用户重定：瀑布流竖 3 / 横 4 + 弹窗不拉伸）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别（§4.8 T-B 同款） */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口宽 / 高（vp）：aboutToAppear 首帧 + onAreaChange 兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+  private isLandscape: boolean = false;
+
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
@@ -143,6 +168,9 @@ struct UserProfile {
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported();
     this.isDark = isDarkMode();
+    // 首帧形态初值（§4.6 H-A / §4.8 T-B 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏
+    // 若不预置会出现「先 1 列再跳 3/4 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
+    this.refreshFormMetrics();
     const params = this.getUIContext().getRouter().getParams() as Record<string, Object>;
     this.userId = `${params?.userId ?? ''}`.trim();
     this.userName = `${params?.userName ?? ''}`.trim();
@@ -492,14 +520,249 @@ struct UserProfile {
     return '';
   }
 
+  /**
+   * 统一 Tab 切换入口（点分段胶囊）：方向感知滑入动画，范式与首页 Index.switchTab 一致。
+   * 目标页在右（index 更大）→ 新页从右滑入、旧页向左滑出；反之镜像。
+   * 动画期间锁定（animLock），快速连点直接忽略。
+   */
   private switchTab(tab: UserTab): void {
-    if (this.activeTab === tab) {
+    if (tab === this.activeTab || this.animLock || this.dragging) {
       return;
     }
+    const dir: number = tab > this.activeTab ? 1 : -1;
+    this.animLock = true;
+    this.prevTab = this.activeTab;
     this.activeTab = tab;
-    if (tab === UserTab.Likes && this.likesState === ProfileLoadState.Loading) {
-      this.loadLikesFirst();
+    if (tab === UserTab.Likes) {
+      this.likesMounted = true;
+      if (this.likesState === ProfileLoadState.Loading) {
+        this.loadLikesFirst();
+      }
     }
+    // 初始位置（无动画赋值）：新页从 dir 方向侧外进入，旧页原位准备退场
+    this.inOffset = dir * 100;
+    this.outOffset = 0;
+    this.getUIContext().animateTo(
+      { duration: 320, curve: curves.springMotion(0.72, 0.86) },
+      () => {
+        this.outOffset = -dir * 100;
+        this.inOffset = 0;
+      }
+    );
+    // SDK 的 animateTo 无 onFinish：定时器在动画结束后卸载退场页并释放切换锁
+    // （时长取动画约 1.3 倍，弹簧曲线可能略有回弹超时）
+    setTimeout(() => {
+      this.prevTab = -1;
+      this.outOffset = 0;
+      this.animLock = false;
+    }, 420);
+  }
+
+  /** 页面横向位移：拖拽中当前页原位跟手、邻页在其行进方向侧外；动画期走 in/outOffset */
+  private tabTranslate(tab: UserTab): string {
+    if (this.dragging) {
+      if (tab === this.activeTab) {
+        return `${this.dragPct}%`;
+      }
+      const dir: number = tab > this.activeTab ? 1 : -1;
+      return `${this.dragPct + dir * 100}%`;
+    }
+    if (tab === this.activeTab) {
+      return `${this.inOffset}%`;
+    }
+    return `${this.outOffset}%`;
+  }
+
+  /** 层级：当前页盖在退场页之上 */
+  private tabLayer(tab: UserTab): number {
+    return tab === this.activeTab ? 1 : 0;
+  }
+
+  /** 页面可见性：当前页/退场页常显；拖拽中仅行进方向侧的邻页随动显示 */
+  private tabPageVisible(tab: UserTab): Visibility {
+    if (tab === this.activeTab || tab === (this.prevTab as UserTab)) {
+      return Visibility.Visible;
+    }
+    if (this.dragging && this.panActive) {
+      const dir: number = tab > this.activeTab ? 1 : -1;
+      if ((this.dragPct < 0 && dir === 1) || (this.dragPct > 0 && dir === -1)) {
+        return Visibility.Visible;
+      }
+    }
+    return Visibility.Hidden;
+  }
+
+  /** 页宽（vp）：拖拽位移百分比换算基准；onAreaChange 未回填前用手机基线 360 */
+  private panPageWidth(): number {
+    return this.currentWidth > 0 ? this.currentWidth : 360;
+  }
+
+  /** 首帧形态初值 + onAreaChange 兜底共用（§4.11/§4.12 同款） */
+  private refreshFormMetrics(): void {
+    try {
+      const d = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w <= 0 || h <= 0) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
+      this.isLandscape = w > h;
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败
+    }
+  }
+
+  /**
+   * 结果列数：大屏竖屏 3 / 横屏 4（2026-09-15 用户拍板，与首页 §4.2 决策 12 同口径）。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
+   */
+  private profileColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return this.isLandscape ? 4 : 3;
+  }
+
+  /** 列索引数组：外层 ForEach 只遍历索引（key 稳定 → 列容器复用，收藏页五轮教训） */
+  private profileColIndexes(): number[] {
+    const n: number = this.profileColumns();
+    const arr: number[] = [];
+    for (let i = 0; i < n; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  /**
+   * 通用分桶（方案 B「带滞回的最短列」，2026-09-15，与 §4.9/§4.10/§4.12 同款）：
+   * 默认轮转（保序），估算高差 > 240vp（≈一张短卡）才投最短列补位；确定性估算、无测量循环；
+   * 前缀稳定贪心：翻页追加从头重算，旧卡落列不变（不跳位）。gap=8 与 List space / 列间 gap 同源。
+   */
+  private bucketColumns<T>(items: T[], estimate: (item: T) => number): T[][] {
+    const cols: number = this.profileColumns();
+    const buckets: T[][] = [];
+    const heights: number[] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+      heights.push(0);
+    }
+    for (let i = 0; i < items.length; i++) {
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > 240) {
+        target = shortest;
+      }
+      buckets[target].push(items[i]);
+      heights[target] += estimate(items[i]) + 8;
+    }
+    return buckets;
+  }
+
+  /** 帖子卡估算高（padding lg×2=32 + 信息行 ~16；标题/摘要 ≤2 行） */
+  private estimateProfilePostCard(item: PersonalContentItem): number {
+    let h: number = 62;
+    const title: string = item.title ?? '';
+    if (title.length > 0) {
+      h += Math.min(Math.ceil(title.length / 18), 2) * 22 + 6;
+    }
+    const abs: string = item.abstract ?? '';
+    if (abs.length > 0) {
+      h += Math.min(Math.ceil(abs.length / 20), 2) * 18 + 6;
+    }
+    return h;
+  }
+
+  /** 关注吧卡估算高（Row 小卡，等高近似值；滞回 240 下本就恒为纯轮转） */
+  private estimateProfileLikeCard(item: UserLikeItem): number {
+    return 76;
+  }
+
+  /** 弹窗 / 浮层面板宽度（vp）：T-H 同款封顶 `max(200, min(400, 屏宽−48))`——手机档 312 < 400 逐像素不变，平板不拉伸 */
+  private panelWidth(): number {
+    const w: number = this.currentWidth - 48;
+    const capped: number = w > 400 ? 400 : w;
+    return capped > 200 ? capped : 200;
+  }
+
+  private onTabPanStart(): void {
+    if (this.animLock || this.dragging) {
+      this.panActive = false;
+      return;
+    }
+    this.panActive = true;
+    this.dragging = true;
+    this.dragPct = 0;
+    // 拖拽可能进入关注的吧：提前挂载邻页（首次同时触发懒加载，拖到位时数据已在路上）
+    if (!this.likesMounted) {
+      this.likesMounted = true;
+      if (this.likesState === ProfileLoadState.Loading) {
+        this.loadLikesFirst();
+      }
+    }
+  }
+
+  private onTabPanUpdate(offsetX: number): void {
+    if (!this.panActive) {
+      return;
+    }
+    let pct: number = offsetX / this.panPageWidth() * 100;
+    // 边缘阻尼：已在最外侧 Tab 仍向同方向拖 → 只跟 35% 行程（橡皮筋观感），松手必然回弹
+    if ((this.activeTab === UserTab.Posts && offsetX > 0) || (this.activeTab === UserTab.Likes && offsetX < 0)) {
+      pct = pct * 0.35;
+    }
+    this.dragPct = Math.max(-100, Math.min(100, pct));
+  }
+
+  private onTabPanEnd(offsetX: number, velocityX: number): void {
+    if (!this.panActive) {
+      return;
+    }
+    this.panActive = false;
+    const pct: number = this.dragPct;
+    // 提交判定：位移过 1/4 页宽，或快速甩动（速度优先于位移）
+    let dir: number = 0;
+    if (pct <= -25 || velocityX < -700) {
+      dir = 1;
+    } else if (pct >= 25 || velocityX > 700) {
+      dir = -1;
+    }
+    // 方向越界（最外侧 Tab 再向外拖）或未达阈值 → 回弹归位
+    if (dir === 0 || (this.activeTab === UserTab.Posts && dir === -1) || (this.activeTab === UserTab.Likes && dir === 1)) {
+      this.getUIContext().animateTo({ duration: 220, curve: curves.springMotion(0.72, 0.86) }, () => {
+        this.dragPct = 0;
+      });
+      setTimeout(() => {
+        this.dragging = false;
+        this.dragPct = 0;
+      }, 280);
+      return;
+    }
+    // 提交切换：两页从拖拽实时位置接续完成进出场（与点击切换同一 springMotion，无跳变）
+    this.animLock = true;
+    this.prevTab = this.activeTab;
+    this.activeTab = dir === 1 ? UserTab.Likes : UserTab.Posts;
+    this.dragging = false;
+    this.outOffset = pct;
+    this.inOffset = pct + dir * 100;
+    this.getUIContext().animateTo({ duration: 320, curve: curves.springMotion(0.72, 0.86) }, () => {
+      this.outOffset = -dir * 100;
+      this.inOffset = 0;
+    });
+    setTimeout(() => {
+      this.prevTab = -1;
+      this.outOffset = 0;
+      this.animLock = false;
+    }, 420);
   }
 
   // ===== 页面结构 =====
@@ -541,6 +804,8 @@ struct UserProfile {
       const width = newValue.width as number;
       this.currentWidth = width;
       this.isWideScreen = width >= 840;
+      // 形态变化兜底（横竖屏 / 分屏拖宽：§4.11，列数模板不可补间）
+      this.refreshFormMetrics();
     })
   }
 
@@ -576,22 +841,61 @@ struct UserProfile {
         } else if (this.profileState === ProfileLoadState.Error) {
           ErrorView({ message: this.profileError, onRetry: () => { this.loadProfile(); } }).layoutWeight(1)
         } else {
-          Column() {
-            // 不用 Swiper（其手势会抢占 List 的垂直滚动），直接条件渲染切换 Tab
-            if (this.activeTab === UserTab.Posts) {
+          // 双页平移栈：不用 Swiper（其手势会抢占 List 的垂直滚动），改用首页同款
+          // translate 百分比平移 + 水平 PanGesture 跟手拖拽；方向竞争天然让位给列表垂直滚动
+          Stack({ alignContent: Alignment.TopStart }) {
+            // 帖子页常驻（隐藏时保留滚动位置）
+            Column() {
               this.PostTabContent()
-            } else {
-              this.LikeTabContent()
+            }
+            .width('100%')
+            .height('100%')
+            .translate({ x: this.tabTranslate(UserTab.Posts) })
+            .zIndex(this.tabLayer(UserTab.Posts))
+            .visibility(this.tabPageVisible(UserTab.Posts))
+
+            if (this.likesMounted) {
+              Column() {
+                this.LikeTabContent()
+              }
+              .width('100%')
+              .height('100%')
+              .translate({ x: this.tabTranslate(UserTab.Likes) })
+              .zIndex(this.tabLayer(UserTab.Likes))
+              .visibility(this.tabPageVisible(UserTab.Likes))
             }
           }
           .width('100%')
           .layoutWeight(1)
+          .clip(true)
+          .gesture(
+            PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 12 })
+              .onActionStart(() => {
+                this.onTabPanStart();
+              })
+              .onActionUpdate((event: GestureEvent) => {
+                this.onTabPanUpdate(event.offsetX);
+              })
+              .onActionEnd((event: GestureEvent) => {
+                this.onTabPanEnd(event.offsetX, event.velocityX);
+              })
+              .onActionCancel(() => {
+                this.onTabPanEnd(0, 0);
+              })
+          )
         }
       }
       .width('100%')
       .height('100%')
       .backgroundColor(Theme.bg(this.isDark))
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+
+      // 顶部满宽渐显带（参考收藏页 Favorite.TopFadeBand 真机终版方案）：
+      // Stack 顶层背景色渐变条（bg 不透明→透明线性），内容从顶栏下渐现、上滑时渐隐；
+      // 不用 overlay+blendMode（收藏页踩坑：离屏层宽度手机端解析异常）；
+      // zIndex 8 盖住列表内容，低于兜底 TopBar(10) / 底部分段胶囊(20) / 弹窗(100)；
+      // hitTestBehavior(None) 不挡交互。高度沿用收藏页拍板口径 132（顶栏 98 + 渐现尾段 34）。
+      this.TopFadeBand()
 
       // 悬浮沉浸顶栏（透明底，内容可穿过；复用 ThreadDetail 范式）；
       // 官方 title 槽位路径下整行已在槽位里（TopTitleBar），这里不再叠一层
@@ -844,11 +1148,33 @@ struct UserProfile {
           }
           .width('100%')
 
-          ForEach(this.sortedPosts(), (item: PersonalContentItem) => {
+          if (this.profileColumns() > 1) {
+            // 多列档（§4.11，2026-09-15 用户拍板瀑布流竖 3 / 横 4）：列内独立堆叠（与首页 / §4.12 同款观感）。
+            // ⚠️ 列外必须有横排 Row（§4.12 首版漏 Row 的坑）；外层 ForEach 只遍历列索引（key 稳定复用），
+            // 内层**直读状态源** `bucketColumns(...)[colIdx]`（不用外层传入 col，否则复用断链不更新）。
             ListItem() {
-              this.PostCard(item)
+              Row({ space: 8 }) {
+                ForEach(this.profileColIndexes(), (colIdx: number) => {
+                  Column({ space: 8 }) {
+                    ForEach(this.bucketColumns(this.sortedPosts(), (it: PersonalContentItem) => this.estimateProfilePostCard(it))[colIdx],
+                      (item: PersonalContentItem) => {
+                        this.PostCard(item)
+                      }, (item: PersonalContentItem) => `${item.tid}_${item.id}`)
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+                }, (colIdx: number) => `pcol_${colIdx}`)
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Top)
             }
-          }, (item: PersonalContentItem) => `${item.tid}_${item.id}`)
+          } else {
+            ForEach(this.sortedPosts(), (item: PersonalContentItem) => {
+              ListItem() {
+                this.PostCard(item)
+              }
+            }, (item: PersonalContentItem) => `${item.tid}_${item.id}`)
+          }
           // 底部占位：把最后一条内容顶上 Tab 上方，占位区滚到底后被 Tab/手势条遮住
           ListItem() {
             Column().width('100%').height(160)
@@ -925,17 +1251,46 @@ struct UserProfile {
       ThreadListSkeleton({ count: 5 })
         .width('100%')
         .layoutWeight(1)
+        .padding({ top: 98 })
     } else if (this.likesState === ProfileLoadState.Error) {
-      ErrorView({ message: this.likesError, onRetry: () => { this.loadLikesFirst(); } }).layoutWeight(1)
+      ErrorView({ message: this.likesError, onRetry: () => { this.loadLikesFirst(); } })
+        .layoutWeight(1)
+        .padding({ top: 98 })
     } else if (this.likesState === ProfileLoadState.Empty) {
-      EmptyView({ message: '对方隐藏了关注的吧信息', icon: '🫥' }).layoutWeight(1)
+      EmptyView({ message: '对方隐藏了关注的吧信息', icon: '🫥' })
+        .layoutWeight(1)
+        .padding({ top: 98 })
     } else {
       List({ space: Spacing.sm, scroller: this.likesScroller }) {
-        ForEach(this.likes, (item: UserLikeItem) => {
+        // 顶部占位：顶栏让位 98 整（与 Header 同源；真机两轮反馈呼吸 md→sm→0 收紧到位）
+        ListItem() {
+          Column().width('100%').height(98)
+        }
+        if (this.profileColumns() > 1) {
+          // 多列档（§4.11）：关注的吧 3 / 4 列（列内独立堆叠，结构同帖子列表；LikeCard 等高小卡 → 滞回下恒为纯轮转）
           ListItem() {
-            this.LikeCard(item)
+            Row({ space: 8 }) {
+              ForEach(this.profileColIndexes(), (colIdx: number) => {
+                Column({ space: 8 }) {
+                  ForEach(this.bucketColumns(this.likes, (it: UserLikeItem) => this.estimateProfileLikeCard(it))[colIdx],
+                    (item: UserLikeItem) => {
+                      this.LikeCard(item)
+                    }, (item: UserLikeItem) => item.forumId.length > 0 ? item.forumId : item.forumName)
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+              }, (colIdx: number) => `lcol_${colIdx}`)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Top)
           }
-        }, (item: UserLikeItem) => item.forumId.length > 0 ? item.forumId : item.forumName)
+        } else {
+          ForEach(this.likes, (item: UserLikeItem) => {
+            ListItem() {
+              this.LikeCard(item)
+            }
+          }, (item: UserLikeItem) => item.forumId.length > 0 ? item.forumId : item.forumName)
+        }
         // 底部占位：把最后一条内容顶上 Tab 上方，占位区滚到底后被 Tab/手势条遮住
         ListItem() {
           Column().width('100%').height(160)
@@ -1018,6 +1373,32 @@ struct UserProfile {
   }
 
   // ===== 悬浮沉浸顶栏（兜底路径专用：开关关闭 / 低版本才挂载；官方槽位版本见 TopTitleBar）=====
+
+  /**
+   * 顶部满宽渐显带（参考收藏页 Favorite.TopFadeBand 真机三次修复终版，2026-09-14）：
+   * Stack 顶层满宽背景色渐变条——下层是纯页面背景色，背景色渐变条叠加 = 视觉等价渐隐，
+   * 宽度跟随 ProfileStack 全宽，不依赖列表宿主宽度（overlay+blendMode OFFSCREEN 方案在
+   * 手机端离屏层宽度解析异常，收藏页已弃用，勿回退）。
+   * 高 132 = 顶栏 98 + 渐现尾段 34（收藏页用户拍板口径）；hitTestBehavior(None) 不挡交互；
+   * zIndex 8：盖住双页内容，低于兜底 TopBar(10) / 底部分段胶囊(20) / 弹窗(100)，
+   * 官方 title 槽位在 Navigation title 层更高。
+   * 渐变从顶部即线性渐变、无全实段（[bg,0]→[透明bg,1]）：内容一进条顶就渐显，无硬切感。
+   */
+  @Builder
+  TopFadeBand() {
+    Column()
+      .width('100%')
+      .height(132)
+      .linearGradient({
+        direction: GradientDirection.Bottom,
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
+        ]
+      })
+      .hitTestBehavior(HitTestMode.None)
+      .zIndex(8)
+  }
 
   @Builder
   TopBar() {
@@ -1287,7 +1668,8 @@ struct UserProfile {
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       }
-      .width('calc(100% - 48vp)')
+      // 弹窗不拉伸（2026-09-15 拍板）：T-H 同款 max(200, min(400, 屏宽−48))，手机档 312 逐像素不变
+      .width(this.panelWidth())
       .margin({ bottom: 110 })
       .padding({ top: Spacing.md })
       .backgroundColor(Theme.sheetBg(this.isDark))
@@ -1399,7 +1781,8 @@ struct UserProfile {
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       }
-      .width('calc(100% - 48vp)')
+      // 弹窗不拉伸（2026-09-15 拍板）：T-H 同款 max(200, min(400, 屏宽−48))，手机档 312 逐像素不变
+      .width(this.panelWidth())
       .margin({ bottom: 110 })
       .padding({ top: Spacing.md })
       .backgroundColor(Theme.sheetBg(this.isDark))

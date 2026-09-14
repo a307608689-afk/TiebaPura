@@ -64,12 +64,12 @@ struct PersonalizedPage {
           Row({ space: Spacing.md }) {
             Stack() {
               Text('A')
-                .fontSize(fs(26, this.fontScale))
+                .fontSize(fs(15, this.fontScale))
                 .fontWeight(FontWeight.Bold)
                 .fontColor(Theme.textPrimary(this.isDark))
             }
-            .width(36)
-            .height(36)
+            .width(24)
+            .height(24)
             .border({ width: 2, color: Theme.textPrimary(this.isDark), radius: 4 })
             .alignContent(Alignment.Center)
 

@@ -668,6 +668,41 @@ export struct FavoriteTab {
     deviceInfo.deviceType === 'tablet'
       || deviceInfo.deviceType === '2in1'
       || display.isFoldable();
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.3 改动四）=====
+  /** 窗口宽 / 高（vp）：aboutToAppear 取首帧初值（fadeCoverVp 同源），根 Stack.onAreaChange 实时兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+
+  /** 横竖屏：宽高比（与 §4.1 / §4.2 同口径） */
+  private isLandscape(): boolean {
+    return this.pageWidth > this.pageHeight;
+  }
+
+  /**
+   * 列数（§4.3 改动四，2026-09-14 拍板）：大屏横 4 / 竖 3；窄窗与手机维持 1 列。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
+   */
+  private favColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < 600) {
+      return 1; // 折叠态 / 分屏 / 自由多窗窄窗
+    }
+    return this.isLandscape() ? 4 : 3;
+  }
+
+  /** 帖子列表列模板（改动三 / 五共用）：收藏夹点开列表与搜索态同口径 */
+  private forumColumnsTemplate(): string {
+    const n: number = this.favColumns();
+    if (n >= 4) {
+      return '1fr 1fr 1fr 1fr';
+    }
+    if (n === 3) {
+      return '1fr 1fr 1fr';
+    }
+    return '1fr';
+  }
   /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
   @State fadeCoverVp: number = 0;
   @State pinnedThreads: PinRecord[] = [];
@@ -681,6 +716,8 @@ export struct FavoriteTab {
   @State categoryEditingId: string = '';
   @State categoryInputValue: string = '';
   @State @Watch('syncBackState') showMovePanel: boolean = false;
+  /** §4.3 改动六·方案四：平板「自定义排序」半屏面板开关（bindSheet，与 showMovePanel 同机制） */
+  @State showSortPanel: boolean = false;
   @State moveChecked: string[] = [];
   /**
    * 导出授权弹窗显隐（v1.15.11 起为系统 CustomDialog + API 26 沉浸光感，见顶层 struct ExportDialogCard）。
@@ -956,7 +993,9 @@ export struct FavoriteTab {
   private dialogCardWidth(): number {
     const info: display.Display = display.getDefaultDisplaySync();
     const widthVp: number = info.width / info.densityPixels;
-    return Math.max(200, widthVp - 48);
+    // §4.3 改动七（2026-09-14 拍板「弹窗不拉伸」）：平板封顶 400（系统弹窗默认宽度上限），
+    // 与 ThreadList §4.8 T-H 同款；手机档 312 < 400 逐像素不变。
+    return Math.max(200, Math.min(400, widthVp - 48));
   }
 
   /** showPinConfirm 变化即驱动系统弹窗 open/close（保留既有 `this.showPinConfirm = x` 调用点） */
@@ -1082,6 +1121,10 @@ export struct FavoriteTab {
   private accountId: string = '';
   // v1.15 拖拽分类列表：Scroller 用于拖拽中手动 scrollBy 跟随手指；lastAutoScrollTime 节流
   private categoryScroller: Scroller = new Scroller();
+  /** §4.3 改动六·方案四：半屏排序面板内单列 List 的独立 Scroller（面板 / 主列表各自滚动，互不干扰） */
+  private panelCategoryScroller: Scroller = new Scroller();
+  /** §4.3 改动六 B 二次更正：分类内帖子排序面板独立 Scroller（WaterFlow 不支持 List 拖拽 → 帖子排序同收面板） */
+  private panelThreadScroller: Scroller = new Scroller();
   private lastAutoScrollTime: number = 0;
   // v1.13 加载冷却：内容不足一屏时 onReachEnd 会连续触发，加冷却避免"不断加载中"刷屏
   private lastLoadMoreAt: number = 0;
@@ -1119,6 +1162,8 @@ export struct FavoriteTab {
   // v1.15 拖拽体验：分类卡固定高度（封面48 + 上下padding 16*2）与手动避让步长（卡高 + List间距12）
   private static readonly CATEGORY_CARD_HEIGHT: number = 80;
   private static readonly CATEGORY_CARD_STEP: number = 92;
+  /** §4.3 帖子多列「列均衡」阈值（vp，方案 B 滞回，与 §4.9 同款）：轮转列与最短列估算高差超此值才补位 */
+  private static readonly FAV_COL_BALANCE_THRESHOLD: number = 240;
   // BUG-04 自绘简约线条图标（Feather 风格 path，24x24 视口）
   private static readonly ICON_PIN: string = 'M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z M12 10a3 3 0 1 0 0-6 3 3 0 0 0 0 6z';
 
@@ -1139,8 +1184,11 @@ export struct FavoriteTab {
     try {
       const d: display.Display = display.getDefaultDisplaySync();
       this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+      // §4.3 改动四：pageWidth / pageHeight 首帧初值（§6.2 第 6 步：形态判定须首帧就位，防多列闪变）
+      this.pageWidth = d.width / d.densityPixels;
+      this.pageHeight = d.height / d.densityPixels;
     } catch (e) {
-      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例；pageWidth=0 → favColumns()=1 安全方向
     }
     this.syncBackState();
     this.initSortState();
@@ -2051,10 +2099,30 @@ export struct FavoriteTab {
     return this.categoryTab === FavCategoryTab.Custom;
   }
 
+  /**
+   * §4.3 改动六·方案四：打开半屏排序面板（排序菜单「自定义排序」与长按分类卡两个入口共用）。
+   * 打开即切 Custom（与手机点该项语义一致）：① 面板内 PostCard 长按让位于拖拽（sortMode !== Custom 守卫）；
+   * ② 主列表多列立即按自定义顺序显示。
+   */
+  private openCategorySortPanel(): void {
+    this.showSortMenu = false;
+    this.sortMode = SortMode.Custom;
+    FavoriteStore.getInstance().saveSortMode(this.accountId, SortMode.Custom as number).catch(() => {});
+    this.rebuildFolders();
+    Haptic.light();
+    this.showSortPanel = true;
+  }
+
   /** v1.11 应用排序模式（置灰项 Toast 提示不切换；持久化 + Toast） */
   private applySortMode(mode: SortMode, disabled: boolean): void {
     if (disabled) {
       this.toast('自定义排序仅支持自定义分类');
+      return;
+    }
+    // §4.3 改动六·方案四（2026-09-14 拍板）：平板档「自定义排序」改为打开半屏排序面板
+    // （面板内单列长按拖拽，确认后落盘 Custom 顺序）；入口 / 按钮数量不变，仅平板档行为分叉。
+    if (mode === SortMode.Custom && this.favColumns() > 1) {
+      this.openCategorySortPanel();
       return;
     }
     if (this.sortMode === mode) {
@@ -2861,6 +2929,9 @@ export struct FavoriteTab {
       if (!this.searchMode && this.editMode && (this.selectedForum.length > 0 || this.selectedCategoryId.length > 0)) {
         this.EditBar()
       }
+      // §4.3 真机三次修复（2026-09-14）：顶部满宽渐显带改 Stack 顶层背景色渐变条（zIndex 8）——
+      // 盖住各列表内容顶部（视觉渐隐），低于 EditBar(15) / 兜底胶囊行(13)，槽位顶栏在 Navigation title 层更高
+      this.TopFadeBand()
       // 移入分类面板已改为系统半模态 bindSheet（§6.8），由根 Stack 的 .bindSheet 驱动，无需在此挂载
       // 备份 / 导出授权 / 置顶确认 / 批量删除确认 / 分类管理 已全部换成系统 CustomDialog（由 controller 驱动，无需在此挂载）
       /**
@@ -2880,10 +2951,30 @@ export struct FavoriteTab {
           systemMaterial: ImmMaterial.menu(),
           onDisappear: () => { this.showSortMenu = false; }
         })
+        // §4.3 改动六·方案四：平板「自定义排序」半屏面板（state 驱动，BOTTOM 弹出与锚点位置无关；
+        // 与「移入分类面板」同机制同材质档 ImmMaterial.sheet()）
+        .bindSheet($$this.showSortPanel, this.CategorySortPanelContent(), {
+          height: '62%',
+          preferType: SheetType.BOTTOM,
+          showClose: false,
+          dragBar: false,
+          maskColor: '#66000000',
+          radius: { topLeft: 24, topRight: 24 },
+          systemMaterial: ImmMaterial.sheet(),
+          onDisappear: () => {
+            this.showSortPanel = false;
+            this.resetCatDragState();
+          }
+        })
     }
     .width('100%')
     .height('100%')
     .backgroundColor(Theme.bg(this.isDark))
+    // §4.3 改动四：根容器实宽 / 实高 → 形态判定与列数（首帧由 aboutToAppear 的 fadeCoverVp 同源取值兜底）
+    .onAreaChange((_old: Area, n: Area) => {
+      this.pageWidth = n.width as number;
+      this.pageHeight = n.height as number;
+    })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     /**
      * 移入分类面板（§6.8：自绘浮层 → 系统半模态 bindSheet）。
@@ -2932,10 +3023,22 @@ export struct FavoriteTab {
             Row({ space: Spacing.md }) {
               Stack() {
                 if (this.isMoveChecked(t.id)) {
-                  Text('✓')
-                    .fontSize(fs(12, this.fontScale))
-                    .fontColor(Color.White)
-                    .textAlign(TextAlign.Center)
+                  // 自绘对勾（与编辑态勾选圆同源），20 圆内按比例缩收
+                  Path()
+                    // 同上：commands 单位为 px，vp2px 换算（20 圆内等比缩收坐标）
+                    .commands(`M${vp2px(5.4)} ${vp2px(10.4)} L${vp2px(8.9)} ${vp2px(13.9)} L${vp2px(14.8)} ${vp2px(6.6)}`)
+                    .width(20)
+                    .height(20)
+                    .stroke(Color.White)
+                    .strokeWidth(2.2)
+                    .fillOpacity(0)
+                    .strokeLineCap(LineCapStyle.Round)
+                    .strokeLineJoin(LineJoinStyle.Round)
+                    .transition(
+                      TransitionEffect.OPACITY
+                        .combine(TransitionEffect.scale({ x: 0.6, y: 0.6 }))
+                        .animation({ duration: 220, curve: Curve.Friction })
+                    )
                 }
               }
               .width(20)
@@ -3182,42 +3285,58 @@ export struct FavoriteTab {
     setTimeout(() => { this.catTabSwitching = false; }, 400);
   }
 
+  /** §4.3 改动二：收藏夹列表通栏头（顶部让位 + 同步提示）—— ListItemGroup.header 恒占满整行；
+   *  真机修复（2026-09-14）：header 与首卡间距（lanes 组内项不吃 List space → header 底部 margin 补偿） */
+  @Builder
+  FolderListHeader() {
+    Column() {
+      Column().width('100%').height(this.placeholderHeight())
+      if (this.syncing) {
+        this.SyncHintRow()
+      }
+    }
+    .width('100%')
+    .margin({ bottom: Spacing.md })
+  }
+
+  /** §4.3 改动二：收藏夹列表通栏尾（底部 90 让位） */
+  @Builder
+  FolderListFooter() {
+    Column().width('100%').height(90)
+  }
+
   @Builder
   FolderListView() {
     Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
       List({ space: Spacing.md, scroller: this.folderScroller }) {
-        ListItem() {
-          Column().width('100%').height(this.placeholderHeight())
+        // §4.3 改动二（2026-09-14 拍板 lanes）：通栏项（顶部让位 / 同步提示 / 底部占位）收进
+        // ListItemGroup 的 header / footer —— lanes 下组内 ListItem 分列、header / footer 恒占满整行；
+        // 收藏夹卡等高（80）→ lanes 等分无留白，不需要瀑布流。lanes(1) = 手机原布局逐像素同款。
+        ListItemGroup({ header: this.FolderListHeader(), footer: this.FolderListFooter() }) {
+          ForEach(this.folders, (folder: FolderItem) => {
+            ListItem() {
+              this.FolderCard(folder)
+            }
+            // 真机修复（2026-09-14）：`List({ space })` 不作用于 ListItemGroup 组内项 → lanes 行距全丢；
+            // 用 margin 补回等值行距（手机档同步生效，与原 space 观感一致）
+            .margin({ bottom: Spacing.md })
+          }, (folder: FolderItem) => `folder_${folder.forumName}_${folder.pinned}`)
         }
-        .backgroundColor(Color.Transparent)
-        if (this.syncing) {
-          ListItem() {
-            this.SyncHintRow()
-          }
-        }
-        ForEach(this.folders, (folder: FolderItem) => {
-          ListItem() {
-            this.FolderCard(folder)
-          }
-        }, (folder: FolderItem) => `folder_${folder.forumName}_${folder.pinned}`)
-        // 底部占位：给 74vp 底部 Tab 栏让位 + 缓冲
-        ListItem() {
-          Column().width('100%').height(90)
-        }
-        .backgroundColor(Color.Transparent)
       }
+      .lanes(Math.max(1, this.favColumns()), Spacing.md)
       .layoutWeight(1)
       .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       .scrollBar(BarState.Off)
       .clip(false)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .overlay(this.BottomFadeOverlay())
-      .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
       .onReachEnd(() => { this.loadMore(); })
       .onAppear(() => { this.restoreListScroll(this.folderScroller, this.folderScrollOffset); })
       .onAreaChange((oldValue: Area, newValue: Area) => { this.restoreListScroll(this.folderScroller, this.folderScrollOffset); })
     }
     .layoutWeight(1)
+    // §4.3 真机修复（2026-09-14）：Refresh 显式全宽——未挂 width 时遮罩（width('100%') 相对 Refresh 测量）
+    // 解析为内容固有宽 → 渐显带右边缺一条竖带（四界面同源，用户截图实证）
+    .width('100%')
     .onRefreshing(() => { this.handleRefresh(); })
   }
 
@@ -3298,55 +3417,67 @@ export struct FavoriteTab {
       .onAction(() => { this.requestPinFolder(folder); }))
   }
 
+  /**
+   * §4.3 改动三（2026-09-14 三次更正）：PostCard 高度随文本行数可变 → 多列不能 lanes（行内留白）；
+   * 首改 `WaterFlow` 后真机复现 **floor-vanish**（虚拟滚动容器视口剔除，docs/floor-vanish-viewport-fix.md）
+   * → 终版 = **Scroll + Column 全量渲染 + 「列内独立堆叠」分桶**（PostColumnsBlock，方案 B 带滞回最短列），
+   * 多列观感与瀑布流一致且彻底绕开视口剔除 bug；等高卡的收藏夹列表维持 lanes 分叉不变。
+   * 手机档（favColumns()=1）走原 List 单列，逐像素不变。
+   */
   @Builder
   ForumThreadsView() {
     Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
-      List({ space: Spacing.md }) {
-        ListItem() {
-          Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
-        }
-        .backgroundColor(Color.Transparent)
-        ForEach(this.forumThreads(), (card: PostCardItem) => {
-          ListItem() {
-            this.PostCard(card, false)
-          }
-        }, (card: PostCardItem) => `thread_${card.tid}`)
-        // 空态：该吧还没有收藏时提示（占位 + 空态 + 底部占位超一屏，onReachEnd 不再空转）
+      Column() {
         if (this.forumThreads().length === 0 && !this.loading) {
-          ListItem() {
-            Column({ space: 10 }) {
-              Text('⭐')
-                .fontSize(fs(44, this.fontScale))
-              Text('这个吧还没有收藏的帖子')
-                .fontSize(fs(15, this.fontScale))
-                .fontWeight(FontWeight.Medium)
-                .fontColor(Theme.textSecondary(this.isDark))
-              Text('去帖子详情页点「收藏」试试')
-                .fontSize(fs(12, this.fontScale))
-                .fontColor(Theme.textTertiary(this.isDark))
+          // 空态：该吧还没有收藏时提示
+          Column({ space: 10 }) {
+            Text('⭐')
+              .fontSize(fs(44, this.fontScale))
+            Text('这个吧还没有收藏的帖子')
+              .fontSize(fs(15, this.fontScale))
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Theme.textSecondary(this.isDark))
+            Text('去帖子详情页点「收藏」试试')
+              .fontSize(fs(12, this.fontScale))
+              .fontColor(Theme.textTertiary(this.isDark))
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+        } else {
+          // 真机修复（2026-09-14，floor-vanish 同源）：`WaterFlow` 与 `List` 同属虚拟滚动容器，
+          // 在「clip(false) + expandSafeArea 沉浸 + 底部悬浮 Tab」场景下视口剔除错位 → 卡片整层消失
+          // （docs/floor-vanish-viewport-fix.md）。按其结论换 **Scroll + Column 全量渲染** 绕过；
+          // 多列观感由「列内独立堆叠 + 方案 B 带滞回最短列分桶」承担（与 §4.9 ThreadDetail 同款成熟结构）。
+          Scroll() {
+            Column({ space: Spacing.md }) {
+              Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
+              this.PostColumnsBlock(this.forumThreads(), false)
+              // 底部占位：给 74vp 底部 Tab 栏让位 + 缓冲（全量渲染下随内容滚动）
+              Column().width('100%').height(90)
             }
             .width('100%')
-            .height('68%')
-            .justifyContent(FlexAlign.Center)
-            .alignItems(HorizontalAlign.Center)
           }
-          .backgroundColor(Color.Transparent)
+          .width('100%')
+          .layoutWeight(1)
+          // 真机修复（2026-09-14）：padding / 渐显遮罩 / 沉浸**恢复挂滚动层本身**（与原 List 逐项同口径）——
+          // 挂带 padding 的包裹 Column 上时遮罩宽不满屏（漏一边）且渐隐区下移盖到首卡（用户真机驳回）；
+          // scrollBar 必须显式 Off（默认 Auto 的滚动条绘制在遮罩之上 → 右缘竖条 + 渐显带「缺一块」观感）
+          .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .align(Alignment.TopStart)
+          .edgeEffect(EdgeEffect.Spring)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         }
-        // 底部占位：给 74vp 底部 Tab 栏让位 + 缓冲
-        ListItem() {
-          Column().width('100%').height(90)
-        }
-        .backgroundColor(Color.Transparent)
       }
+      .width('100%')
       .layoutWeight(1)
-      .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
-      .scrollBar(BarState.Off)
-      .clip(false)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .overlay(this.BottomFadeOverlay())
-      .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
     }
-    .layoutWeight(1)
+    // §4.3 真机修复（2026-09-14）：Refresh 显式全宽——未挂 width 时遮罩（width('100%') 相对 Refresh 测量）
+    // 解析为内容固有宽 → 渐显带右边缺一条竖带（四界面同源，用户截图实证）
+    .width('100%')
     .onRefreshing(() => { this.handleRefresh(); })
   }
 
@@ -3389,10 +3520,22 @@ export struct FavoriteTab {
         if (this.editMode) {
           Stack() {
             if (this.isSelected(card.tid)) {
-              Text('✓')
-                .fontSize(fs(12, this.fontScale))
-                .fontColor(Color.White)
-                .textAlign(TextAlign.Center)
+              // 自绘对勾：圆头描边路径（起点-拐点-终点），替代细弱字符 ✓，笔画与圆圈视觉重量协调
+              Path()
+                // ⚠️ Path.commands 坐标单位是 px（非 vp），须用 vp2px 换算，否则低密度下缩小且锚定左上角
+                .commands(`M${vp2px(6)} ${vp2px(11.6)} L${vp2px(9.8)} ${vp2px(15.3)} L${vp2px(16.2)} ${vp2px(7.4)}`)
+                .width(22)
+                .height(22)
+                .stroke(Color.White)
+                .strokeWidth(2.4)
+                .fillOpacity(0)
+                .strokeLineCap(LineCapStyle.Round)
+                .strokeLineJoin(LineJoinStyle.Round)
+                .transition(
+                  TransitionEffect.OPACITY
+                    .combine(TransitionEffect.scale({ x: 0.6, y: 0.6 }))
+                    .animation({ duration: 220, curve: Curve.Friction })
+                )
             }
           }
           .width(22)
@@ -3541,6 +3684,49 @@ export struct FavoriteTab {
   @Builder
   CategoryListView() {
     Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
+      if (this.favColumns() > 1) {
+        // §4.3 改动六·方案四（2026-09-14 拍板）：平板多列浏览态——lanes 分列、**无拖拽**（排序收进半屏面板，
+        // 长按回归管理语义）；通栏项（占位 / 同步提示 / 新建卡 / 未分类卡）收进 ListItemGroup.header 恒占满整行
+        List({ space: Spacing.md, scroller: this.categoryScroller }) {
+          ListItemGroup({ header: this.CategoryListHeader() }) {
+            // 真机修复（2026-09-14）：新建卡 / 未分类卡从通栏 header 移进组体参与分列（否则 0 自定义分类时
+            // 整页只见两张整行卡，观感像没适配）；行距同收藏夹列表用 margin 补（List space 不作用于组内项）
+            ListItem() {
+              this.NewCategoryCard()
+            }
+            .margin({ bottom: Spacing.md })
+            ListItem() {
+              this.CategoryCard(
+                { id: CATEGORY_DEFAULT_ID, name: '未分类', icon: '📂', sortOrder: 0, createdAt: 0, cover: '' },
+                this.categoryCountOf(CATEGORY_DEFAULT_ID),
+                false,
+                false)
+            }
+            .margin({ bottom: Spacing.md })
+            ForEach(this.sortedCategories(), (c: FavCategory) => {
+              ListItem() {
+                this.CategoryCard(c, this.categoryCountOf(c.id), true, false)
+              }
+              .margin({ bottom: Spacing.md })
+              // §4.3 改动六·方案四补充（2026-09-14）：平板多列浏览态长按分类卡 → 唤起半屏排序面板
+              // （与排序菜单「自定义排序」同一入口；该分支仅平板多列挂载，与手机拖拽 / 面板内拖拽零冲突）
+              .gesture(LongPressGesture({ fingers: 1, repeat: false, duration: 350 })
+                .onAction(() => {
+                  if (!this.showSortPanel) {
+                    this.openCategorySortPanel();
+                  }
+                }))
+            }, (c: FavCategory) => `catm_${c.id}_${c.name}`)
+          }
+        }
+        .lanes(this.favColumns(), Spacing.md)
+        .layoutWeight(1)
+        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.xl })
+        .scrollBar(BarState.Off)
+        .clip(false)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .onReachEnd(() => { this.loadMore(); })
+      } else {
       List({ space: Spacing.md, scroller: this.categoryScroller }) {
         ListItem() {
           Column().width('100%').height(this.placeholderHeight())
@@ -3589,8 +3775,6 @@ export struct FavoriteTab {
       .scrollBar(BarState.Off)
       .clip(false)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .overlay(this.BottomFadeOverlay())
-      .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
       .onReachEnd(() => { this.loadMore(); })
       .onAppear(() => { this.restoreListScroll(this.categoryScroller, this.categoryScrollOffset); })
       .onAreaChange((oldValue: Area, newValue: Area) => { this.restoreListScroll(this.categoryScroller, this.categoryScrollOffset); })
@@ -3599,93 +3783,44 @@ export struct FavoriteTab {
         // v1.19 防闪退：拖拽激活帧内**不要**改被拖源 ListItem 自身高度、**不要** animateTo List padding。
         // 仅记录索引 + 触觉 + 返回 preview；draggingCatId / dragListBottomPad 延后到 onItemDragMove 首帧守卫
         // （手指真动起来、框架拖拽会话已稳定）再赋值，避免在系统正在生成拖拽会话的同帧对被拖源做几何突变。
-        if (itemIndex < FavoriteTab.CAT_LIST_PREPEND) {
+        // （§4.3 改动六·方案四：回调本体抽为 catDragBegin / catDragMove / catDrop 共享方法，见下方）
+        this.catDragBegin(itemIndex, FavoriteTab.CAT_LIST_PREPEND);
+        if (this.draggingCatIndex < 0) {
           return;
         }
-        // v1.19 索引语义修正：始终以 sortedCategories() 为单一真理源，避免非 Custom 排序下 categories/sorted 顺序错位
-        const sorted: FavCategory[] = this.sortedCategories();
-        const catIndex: number = itemIndex - FavoriteTab.CAT_LIST_PREPEND;
-        if (catIndex >= sorted.length) {
-          return;
-        }
-        this.draggingCatIndex = catIndex;
-        this.dragTargetIndex = -1;
-        Haptic.light();
         // v1.15.4 必须返回自定义预览 builder：不返回时系统不生成预览 → 拖动卡原位又塌陷，视觉上"拖动卡消失"。
         // 中间卡避让由 displaceOffsetOf 手动让位
-        return this.CategoryDragPreview(sorted[catIndex]);
+        const sorted: FavCategory[] = this.sortedCategories();
+        return this.CategoryDragPreview(sorted[this.draggingCatIndex]);
       })
       // v1.12 拖动过程实时记录目标插入位，用于高亮提示（返回自定义预览时系统不再自动让位，需自行反馈）
       .onItemDragMove((event: ItemDragInfo, itemIndex: number, insertIndex: number) => {
-        // v1.19 防闪退：拖拽激活帧内不要动被拖源几何；首帧手指真动起来、框架拖拽会话已稳定时，
-        // 再补"原位塌陷（draggingCatId 赋值让 ListItem 高度 0）+ 底部 padding 让位"（均直接赋值，不用 animateTo）
-        if (this.draggingCatId.length === 0 && this.draggingCatIndex >= 0) {
-          const sorted: FavCategory[] = this.sortedCategories();
-          if (this.draggingCatIndex < sorted.length) {
-            this.draggingCatId = sorted[this.draggingCatIndex].id;
-          }
-          this.dragListBottomPad = FavoriteTab.CATEGORY_CARD_STEP;
-        }
-        const max: number = FavoriteTab.CAT_LIST_PREPEND + this.categories.length;
-        const target: number = Math.max(FavoriteTab.CAT_LIST_PREPEND, Math.min(insertIndex, max));
-        // v1.15 目标位变化时：更新高亮 + 触发避让。v1.19 防闪退：取消 animateTo 改为直接赋值（让位不带平滑动画，先求稳定）
-        if (target !== this.dragTargetIndex) {
-          this.dragTargetIndex = target;
-          // v1.19 防闪退：滚动跟随只在首帧守卫完成（draggingCatId 已赋值、拖拽会话已稳定）之后才执行
-          if (this.draggingCatId.length > 0) {
-            const now: number = Date.now();
-            if (now - this.lastAutoScrollTime > 120) {
-              const dragAbs: number = FavoriteTab.CAT_LIST_PREPEND + this.draggingCatIndex;
-              const step: number = 40;
-              if (target > dragAbs) {
-                this.categoryScroller.scrollBy(0, step);
-              } else if (target < dragAbs) {
-                this.categoryScroller.scrollBy(0, -step);
-              }
-              this.lastAutoScrollTime = now;
-            }
-          }
-        }
+        this.catDragMove(itemIndex, insertIndex, FavoriteTab.CAT_LIST_PREPEND, this.categoryScroller);
       })
       .onItemDrop((event: ItemDragInfo, itemIndex: number, insertIndex: number, isSuccess: boolean) => {
-        if (!isSuccess || this.draggingCatIndex < 0) {
-          // v1.15 拖拽取消/失败：占位恢复 + 避让复位 + 底部 padding 还原（平滑回弹）
-          animateTo({ duration: 180, curve: Curve.EaseOut }, () => {
-            this.draggingCatIndex = -1;
-            this.draggingCatId = '';
-            this.dragTargetIndex = -1;
-            this.dragListBottomPad = 0;
-          });
-          return;
-        }
-        const from: number = this.draggingCatIndex;
-        const list: FavCategory[] = this.sortedCategories().slice();
-        const moved: FavCategory = list.splice(from, 1)[0];
-        let to: number = insertIndex - FavoriteTab.CAT_LIST_PREPEND;
-        if (to < 0) {
-          to = 0;
-        }
-        if (to > list.length) {
-          to = list.length;
-        }
-        list.splice(to, 0, moved);
-        // v1.15.4 成功放下：瞬时落位——不做归位动画（归位动画会与下方 categories 重排形成双布局竞争导致抽搐），
-        // 状态瞬时清零 + 数据重排一步到位；失败/取消才走上方 animateTo 平滑回弹
-        this.draggingCatIndex = -1;
-        this.draggingCatId = '';
-        this.dragTargetIndex = -1;
-        this.dragListBottomPad = 0;
-        // v1.12 非自定义排序下拖拽 → 自动切换为自定义排序，保证拖出的新顺序立即可见
-        const switchedToCustom: boolean = this.sortMode !== SortMode.Custom;
-        if (switchedToCustom) {
-          this.sortMode = SortMode.Custom;
-          FavoriteStore.getInstance().saveSortMode(this.accountId, SortMode.Custom as number).catch(() => {});
-        }
-        this.persistCategoryOrder(list, switchedToCustom);
+        this.catDrop(insertIndex, isSuccess, FavoriteTab.CAT_LIST_PREPEND);
       })
     }
+    }
     .layoutWeight(1)
+    // §4.3 真机修复（2026-09-14）：Refresh 显式全宽——未挂 width 时遮罩（width('100%') 相对 Refresh 测量）
+    // 解析为内容固有宽 → 渐显带右边缺一条竖带（四界面同源，用户截图实证）
+    .width('100%')
     .onRefreshing(() => { this.handleRefresh(); })
+  }
+
+  /** §4.3 改动六：自定义分类多列浏览态通栏头（顶部让位 + 同步提示）——恒占满整行；新建 / 未分类卡已移进组体分列；
+   *  真机修复（2026-09-14）：header 底部 margin 补偿组内间距（同 FolderListHeader） */
+  @Builder
+  CategoryListHeader() {
+    Column() {
+      Column().width('100%').height(this.placeholderHeight())
+      if (this.syncing) {
+        this.SyncHintRow()
+      }
+    }
+    .width('100%')
+    .margin({ bottom: Spacing.md })
   }
 
   /** v1.15 补位避让：拖动卡原位留空（渲染占位），原位与插入位之间的卡向原位方向平移一个卡位补上，插入位腾出空位给拖动卡；按 id 定位索引 */
@@ -3693,20 +3828,161 @@ export struct FavoriteTab {
     return this.sortedCategories().findIndex((cat: FavCategory): boolean => cat.id === id);
   }
 
+  /**
+   * §4.3 改动六·方案四（2026-09-14 拍板）：平板「自定义排序」半屏面板。
+   * 壳 = bindSheet 半模态 + `ImmMaterial.sheet()`（与「移入分类面板」同机制同材质档；本页 §6.8 已实证
+   * 半模态为官方沉浸光感 A 档槽位——更正方案讨论时「bindSheet 无光感」的误判）。
+   * 面板内**单列 List 完整复用现有拖拽状态机**（长按拖动 / 塌陷让位 / 跟随滚动 / 落位持久化），
+   * 与主列表仅两处不同：① prepend = 1（面板只有一枚小占位）；② 跟随滚动用面板独立 Scroller。
+   * 主列表多列浏览态无拖拽（editMode 默认 false）→ 两套 List 回调互不干扰；面板打开时排序语义 = Custom。
+   */
+  @Builder
+  CategorySortPanelContent() {
+    Column() {
+      Row() {
+        Column({ space: 2 }) {
+          Text('自定义排序')
+            .fontSize(fs(17, this.fontScale))
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'))
+          Text(this.selectedCategoryId.length > 0 ? '长按拖动帖子调整顺序' : '长按拖动分类卡调整顺序')
+            .fontSize(fs(12, this.fontScale))
+            .fontColor(Theme.textTertiary(this.isDark))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Text('完成')
+          .fontSize(fs(15, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_emphasize'))
+          .padding({ left: 16, right: 4, top: 8, bottom: 8 })
+          .accessibilityText('完成排序')
+          .onClick(() => { this.showSortPanel = false; })
+      }
+      .width('100%')
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: 16, bottom: 8 })
+
+      if (this.selectedCategoryId.length > 0) {
+        // §4.3 改动六 B 二次更正：分类内帖子改 WaterFlow 后（多列）拖拽收进面板——面板内是 List，拖拽保留
+        List({ space: Spacing.md, scroller: this.panelThreadScroller }) {
+          ListItem() {
+            Column().width('100%').height(4)
+          }
+
+          ForEach(this.categoryThreads(), (card: PostCardItem) => {
+            ListItem() {
+              this.PostCard(card, true)
+            }
+          }, (card: PostCardItem) => `spanel_th_${card.tid}`)
+        }
+        .editMode(true)
+        .layoutWeight(1)
+        .width('100%')
+        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.xl })
+        .scrollBar(BarState.Off)
+        .clip(false)
+        .onItemDragStart((event: ItemDragInfo, itemIndex: number) => {
+          // 面板前置仅 1 枚小占位 → threadIndex = itemIndex - 1（与主列表单列同基准）
+          if (itemIndex < 1) {
+            return;
+          }
+          const cards: PostCardItem[] = this.categoryThreads();
+          const threadIndex: number = itemIndex - 1;
+          if (threadIndex >= cards.length) {
+            return;
+          }
+          this.draggingThreadIndex = threadIndex;
+          Haptic.light();
+          return this.ThreadDragPreview(cards[threadIndex]);
+        })
+        .onItemDrop((event: ItemDragInfo, itemIndex: number, insertIndex: number, isSuccess: boolean) => {
+          if (!isSuccess || this.draggingThreadIndex < 0) {
+            this.draggingThreadIndex = -1;
+            return;
+          }
+          const from: number = this.draggingThreadIndex;
+          const list: PostCardItem[] = this.categoryThreads().slice();
+          const moved: PostCardItem = list.splice(from, 1)[0];
+          let to: number = insertIndex - 1;
+          if (to < 0) {
+            to = 0;
+          }
+          if (to > list.length) {
+            to = list.length;
+          }
+          list.splice(to, 0, moved);
+          this.draggingThreadIndex = -1;
+          this.persistThreadOrder(list);
+        })
+      } else {
+        List({ space: Spacing.md, scroller: this.panelCategoryScroller }) {
+          ListItem() {
+            Column().width('100%').height(4)
+          }
+
+          ForEach(this.sortedCategories(), (c: FavCategory) => {
+            ListItem() {
+              if (this.draggingCatId === c.id) {
+                Column().width('100%').height('100%')
+              } else {
+                this.CategoryCard(c, this.categoryCountOf(c.id), true,
+                  this.dragTargetIndex === 1 + this.catIndexById(c.id))
+              }
+            }
+            .height(this.draggingCatId === c.id ? 0 : FavoriteTab.CATEGORY_CARD_HEIGHT)
+            .translate({ y: this.displaceOffsetOf(this.catIndexById(c.id), 1) })
+          }, (c: FavCategory) => `spanel_${c.id}_${c.name}`)
+        }
+        .editMode(true)
+        .layoutWeight(1)
+        .width('100%')
+        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.xl + this.dragListBottomPad })
+        .scrollBar(BarState.Off)
+        .clip(false)
+        .onItemDragStart((event: ItemDragInfo, itemIndex: number) => {
+          this.catDragBegin(itemIndex, 1);
+          if (this.draggingCatIndex < 0) {
+            return;
+          }
+          const sorted: FavCategory[] = this.sortedCategories();
+          return this.CategoryDragPreview(sorted[this.draggingCatIndex]);
+        })
+        .onItemDragMove((event: ItemDragInfo, itemIndex: number, insertIndex: number) => {
+          this.catDragMove(itemIndex, insertIndex, 1, this.panelCategoryScroller);
+        })
+        .onItemDrop((event: ItemDragInfo, itemIndex: number, insertIndex: number, isSuccess: boolean) => {
+          this.catDrop(insertIndex, isSuccess, 1);
+        })
+      }
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 面板关闭（含下滑手势）时复位拖拽状态，防中途退出残留塌陷 / 让位 */
+  private resetCatDragState(): void {
+    this.draggingCatIndex = -1;
+    this.draggingCatId = '';
+    this.dragTargetIndex = -1;
+    this.dragListBottomPad = 0;
+  }
+
   /** v1.15.4 智能让位：拖动卡原位 ListItem 塌陷（高度 0）让列表自然靠拢，
    *  再用 ListItem.translate 按拖动方向让其它卡平移，腾出目标位空间给拖动卡预览：
    *  - 向上拖（origin > target）：目标位到原位之间的卡向下平移 STEP 让出目标位；原位之后的卡平移 HEIGHT 抵消"塌陷顺势上移"
    *  - 向下拖（origin < target）：目标位之后的卡平移 HEIGHT（抵消顺势上移 + 让出目标位）；中间卡靠塌陷顺势上移自然补位
    *  用 ListItem.translate 而非 Column.translate：ListItem 整体平移不触发 v1.15 的"clip 变透明"问题 */
-  private displaceOffsetOf(catIndex: number): number {
+  /** prepend 参数化（§4.3 改动六·方案四）：主列表前置 3 项 / 半屏面板仅 1 枚小占位，同一套让位算术复用 */
+  private displaceOffsetOf(catIndex: number, prepend: number = FavoriteTab.CAT_LIST_PREPEND): number {
     if (this.draggingCatIndex < 0 || this.dragTargetIndex < 0 || catIndex < 0) {
       return 0;
     }
     const STEP: number = FavoriteTab.CATEGORY_CARD_STEP;
     const HEIGHT: number = FavoriteTab.CATEGORY_CARD_HEIGHT;
-    const origin: number = this.draggingCatIndex + FavoriteTab.CAT_LIST_PREPEND;
+    const origin: number = this.draggingCatIndex + prepend;
     const target: number = this.dragTargetIndex;
-    const cur: number = FavoriteTab.CAT_LIST_PREPEND + catIndex;
+    const cur: number = prepend + catIndex;
     if (cur === origin) {
       return 0; // 拖动卡原位（高度已塌陷 0）
     }
@@ -3722,6 +3998,87 @@ export struct FavoriteTab {
       return HEIGHT;
     }
     return 0;
+  }
+
+  // ===== §4.3 改动六·方案四：拖拽回调抽方法（主列表 / 半屏面板共用，仅 prepend 与跟随 Scroller 不同）=====
+
+  /** 拖拽开始：记录源索引（无效则保持 -1，调用方据此跳过 preview） */
+  private catDragBegin(itemIndex: number, prepend: number): void {
+    this.draggingCatIndex = -1;
+    if (itemIndex < prepend) {
+      return;
+    }
+    const sorted: FavCategory[] = this.sortedCategories();
+    const catIndex: number = itemIndex - prepend;
+    if (catIndex >= sorted.length) {
+      return;
+    }
+    this.draggingCatIndex = catIndex;
+    this.dragTargetIndex = -1;
+    Haptic.light();
+  }
+
+  /** 拖拽移动：首帧守卫（塌陷 + 底部让位垫高）+ 目标位高亮 + 跟随滚动（scroller 由调用方按所在列表传入） */
+  private catDragMove(itemIndex: number, insertIndex: number, prepend: number, scroller: Scroller): void {
+    if (this.draggingCatId.length === 0 && this.draggingCatIndex >= 0) {
+      const sorted: FavCategory[] = this.sortedCategories();
+      if (this.draggingCatIndex < sorted.length) {
+        this.draggingCatId = sorted[this.draggingCatIndex].id;
+      }
+      this.dragListBottomPad = FavoriteTab.CATEGORY_CARD_STEP;
+    }
+    const max: number = prepend + this.categories.length;
+    const target: number = Math.max(prepend, Math.min(insertIndex, max));
+    if (target !== this.dragTargetIndex) {
+      this.dragTargetIndex = target;
+      if (this.draggingCatId.length > 0) {
+        const now: number = Date.now();
+        if (now - this.lastAutoScrollTime > 120) {
+          const dragAbs: number = prepend + this.draggingCatIndex;
+          const step: number = 40;
+          if (target > dragAbs) {
+            scroller.scrollBy(0, step);
+          } else if (target < dragAbs) {
+            scroller.scrollBy(0, -step);
+          }
+          this.lastAutoScrollTime = now;
+        }
+      }
+    }
+  }
+
+  /** 拖拽落位 / 取消：成功 → 数据重排 + 持久化（含自动切 Custom）；失败 → 平滑回弹复位 */
+  private catDrop(insertIndex: number, isSuccess: boolean, prepend: number): void {
+    if (!isSuccess || this.draggingCatIndex < 0) {
+      animateTo({ duration: 180, curve: Curve.EaseOut }, () => {
+        this.draggingCatIndex = -1;
+        this.draggingCatId = '';
+        this.dragTargetIndex = -1;
+        this.dragListBottomPad = 0;
+      });
+      return;
+    }
+    const from: number = this.draggingCatIndex;
+    const list: FavCategory[] = this.sortedCategories().slice();
+    const moved: FavCategory = list.splice(from, 1)[0];
+    let to: number = insertIndex - prepend;
+    if (to < 0) {
+      to = 0;
+    }
+    if (to > list.length) {
+      to = list.length;
+    }
+    list.splice(to, 0, moved);
+    this.draggingCatIndex = -1;
+    this.draggingCatId = '';
+    this.dragTargetIndex = -1;
+    this.dragListBottomPad = 0;
+    const switchedToCustom: boolean = this.sortMode !== SortMode.Custom;
+    if (switchedToCustom) {
+      this.sortMode = SortMode.Custom;
+      FavoriteStore.getInstance().saveSortMode(this.accountId, SortMode.Custom as number).catch(() => {});
+    }
+    this.persistCategoryOrder(list, switchedToCustom);
   }
 
   /** v1.8 拖拽松手持久化顺序（sortOrder 重写 1..n）
@@ -3847,6 +4204,10 @@ export struct FavoriteTab {
     }
   }
 
+  /**
+   * 分类卡。长按唤起排序面板的手势**不挂在本卡**：挂主列表多列分支的 ListItem（见 ForEach 处）——
+   * 手机单列主列表 editMode 长按拖拽会与卡片自身 LongPressGesture 抢事件，面板内长按也必须留给拖拽。
+   */
   @Builder
   CategoryCard(cat: FavCategory, count: number, editable: boolean, highlighted: boolean) {
     Row({ space: Spacing.md }) {
@@ -3981,6 +4342,61 @@ export struct FavoriteTab {
   @Builder
   CategoryThreadsView() {
     Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
+      if (this.favColumns() > 1) {
+        // §4.3 改动六 B 二次更正（2026-09-14）：PostCard 高度可变（与收藏夹点开列表同因）→ lanes 改 **WaterFlow**；
+        // `editMode / onItemDragStart` 拖拽 API 为 List 专有、WaterFlow 不支持 → 帖子自定义排序按方案四同款
+        // **收进半屏排序面板**（面板内单列 List 长按拖拽，见 CategorySortPanelContent）
+        if (this.categoryThreads().length === 0 && !this.loadingMore && !this.loading) {
+          Column({ space: 10 }) {
+            Text('📂')
+              .fontSize(fs(44, this.fontScale))
+            Text('这个收藏夹还没有帖子')
+              .fontSize(fs(15, this.fontScale))
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Theme.textSecondary(this.isDark))
+            Text('在帖子编辑态点「移入」\n即可把帖子收藏到这个夹子里')
+              .fontSize(fs(12, this.fontScale))
+              .fontColor(Theme.textTertiary(this.isDark))
+              .textAlign(TextAlign.Center)
+              .lineHeight(fs(18, this.fontScale))
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+        } else {
+          // 真机修复（2026-09-14，floor-vanish 同源）：WaterFlow → Scroll + Column 全量渲染（同 ForumThreadsView）；
+          // 分页改 Scroll.onReachEnd 驱动（文档 §5：全量渲染下懒回收哨兵失效，必须用滚动容器自身触底回调）；
+          // padding / 渐显遮罩 / 沉浸挂 Scroll 本身（与原 List 同口径，包裹 Column 方案真机驳回：遮罩漏边 + 盖内容）
+          Scroll() {
+            Column({ space: Spacing.md }) {
+              Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
+              this.PostColumnsBlock(this.categoryThreads(), true)
+              if (this.loadingMore) {
+                LoadingView({ message: '加载中...' })
+                  .width('100%')
+                  .height(72)
+              }
+              Column().width('100%').height(90)
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .align(Alignment.TopStart)
+          .edgeEffect(EdgeEffect.Spring)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .onReachEnd(() => {
+            if (this.categoryThreads().length === 0) {
+              return;
+            }
+            this.loadMore();
+          })
+        }
+      } else {
       List({ space: Spacing.md }) {
         ListItem() {
           Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
@@ -4033,8 +4449,6 @@ export struct FavoriteTab {
       .scrollBar(BarState.Off)
       .clip(false)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .overlay(this.BottomFadeOverlay())
-      .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
       .onReachEnd(() => {
         if (this.categoryThreads().length === 0) {
           return;
@@ -4076,8 +4490,79 @@ export struct FavoriteTab {
         this.persistThreadOrder(list);
       })
     }
+    }
     .layoutWeight(1)
+    // §4.3 真机修复（2026-09-14）：Refresh 显式全宽——未挂 width 时遮罩（width('100%') 相对 Refresh 测量）
+    // 解析为内容固有宽 → 渐显带右边缺一条竖带（四界面同源，用户截图实证）
+    .width('100%')
     .onRefreshing(() => { this.handleRefresh(); })
+  }
+
+  /**
+   * §4.3 帖子多列内容块（floor-vanish 修复配套，2026-09-14）：多列 = 「列内独立堆叠」Row
+   * （`i % 列数` 轮转 + 滞回最短列补位，方案 B，与 §4.9 ThreadDetail 同款）——观感与瀑布流一致
+   * （无行内对齐留白），但不依赖任何虚拟滚动容器视口（Scroll 全量渲染，绕开 floor-vanish 剔除 bug）。
+   * 分桶为前缀稳定贪心：翻页追加从头重算、旧卡落列不变（不跳位）。
+   */
+  @Builder
+  PostColumnsBlock(cards: PostCardItem[], inSearch: boolean) {
+    Row({ space: Spacing.md }) {
+      ForEach(this.postColumnsData(cards), (col: PostCardItem[], colIdx: number) => {
+        Column({ space: Spacing.md }) {
+          ForEach(col, (card: PostCardItem) => {
+            this.PostCard(card, inSearch)
+          }, (card: PostCardItem) => `pc_${inSearch ? 1 : 0}_${card.tid}`)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+      }, (col: PostCardItem[], colIdx: number) => `pcol_${inSearch ? 1 : 0}_${colIdx}_${col.length}_${col[0]?.tid ?? 'e'}`)
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Top)
+  }
+
+  /** 帖子分桶（方案 B 带滞回最短列）：默认轮转保序，高差 > FAV_COL_BALANCE_THRESHOLD 才补位 */
+  private postColumnsData(cards: PostCardItem[]): PostCardItem[][] {
+    const cols: number = this.favColumns();
+    const buckets: PostCardItem[][] = [];
+    const heights: number[] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+      heights.push(0);
+    }
+    // 列宽（估算换行用）：窗口宽 − 横向 padding(lg×2) − 列间 gap(md×(cols−1))
+    const colWidth: number = (this.pageWidth - Spacing.lg * 2 - Spacing.md * (cols - 1)) / cols;
+    for (let i = 0; i < cards.length; i++) {
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > FavoriteTab.FAV_COL_BALANCE_THRESHOLD) {
+        target = shortest;
+      }
+      buckets[target].push(cards[i]);
+      heights[target] += this.estimatePostCardHeight(cards[i], colWidth) + Spacing.md;
+    }
+    return buckets;
+  }
+
+  /** PostCard 估算高（vp，仅供列均衡，不求像素准只求相对准）：基线 + 标题 ≤2 行 + 摘要 ≤3 行 */
+  private estimatePostCardHeight(card: PostCardItem, colWidth: number): number {
+    let h: number = 108;
+    const title: string = card.title ?? '';
+    if (title.length > 0) {
+      const cpl: number = Math.max(6, Math.floor(colWidth / 17));
+      h += Math.min(Math.ceil(title.length / cpl), 2) * 24;
+    }
+    const abs: string = card.abstract ?? '';
+    if (abs.length > 0) {
+      const cpl2: number = Math.max(8, Math.floor(colWidth / 14));
+      h += Math.min(Math.ceil(abs.length / cpl2), 3) * 22 + 6;
+    }
+    return h;
   }
 
   /** BUG-03：收藏本地搜索结果视图（列表复用 PostCard；空关键词 / 无结果显示提示态） */
@@ -4109,30 +4594,50 @@ export struct FavoriteTab {
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
       } else {
-        List({ space: Spacing.md }) {
-          ListItem() {
-            Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
-          }
-          .backgroundColor(Color.Transparent)
-          ForEach(this.searchResults(), (card: PostCardItem) => {
-            ListItem() {
-              this.PostCard(card, true)
+        // §4.3 改动五（2026-09-14 三次更正）：多列 = Scroll 全量渲染 + 列内独立堆叠（floor-vanish 修复 +
+        // 遮罩挂滚动层与原 List 同口径）；**手机单列恢复原 List**（WaterFlow 单列属虚拟滚动容器，同有
+        // floor-vanish 风险，且原手机行为零回归红线）
+        if (this.favColumns() > 1) {
+          Scroll() {
+            Column({ space: Spacing.md }) {
+              Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
+              this.PostColumnsBlock(this.searchResults(), true)
+              Column().width('100%').height(90)
             }
-          }, (card: PostCardItem) => `search_${card.tid}`)
-          // 底部占位：给 74vp 底部 Tab 栏让位 + 缓冲
-          ListItem() {
-            Column().width('100%').height(90)
+            .width('100%')
           }
-          .backgroundColor(Color.Transparent)
+          .width('100%')
+          .layoutWeight(1)
+          .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .align(Alignment.TopStart)
+          .edgeEffect(EdgeEffect.Spring)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        } else {
+          List({ space: Spacing.md }) {
+            ListItem() {
+              Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
+            }
+            .backgroundColor(Color.Transparent)
+            ForEach(this.searchResults(), (card: PostCardItem) => {
+              ListItem() {
+                this.PostCard(card, true)
+              }
+            }, (card: PostCardItem) => `search_${card.tid}`)
+            // 底部占位：给 74vp 底部 Tab 栏让位 + 缓冲
+            ListItem() {
+              Column().width('100%').height(90)
+            }
+            .backgroundColor(Color.Transparent)
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         }
-        .width('100%')
-        .layoutWeight(1)
-        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
-        .scrollBar(BarState.Off)
-        .clip(false)
-        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .overlay(this.BottomFadeOverlay())
-        .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
       }
     }
     .width('100%')
@@ -4143,33 +4648,29 @@ export struct FavoriteTab {
   TopBar() {
     Row() {
       if (this.searchMode) {
-        Button() {
+        // §4.3 改动五结论二（已定稿）：返回圆钮内嵌进搜索框内部左侧（与槽位路径同步）
+        Stack({ alignContent: Alignment.Start }) {
+          TextInput({ placeholder: '搜索收藏帖子、吧或分类', text: this.searchKeyword })
+            .width('100%')
+            .height(40)
+            .fontSize(fs(15, this.fontScale))
+            .backgroundColor(Color.Transparent)
+            .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.control())
+            .systemMaterial(ImmMaterial.control())
+            .borderRadius(Radius.full)
+            .padding({ left: 46, right: 14 })
+            .defaultFocus(true)
+            .onChange((v: string) => { this.searchKeyword = v; })
           SymbolGlyph($r('sys.symbol.chevron_left'))
             .fontColor([$r('sys.color.icon_primary')])
             .fontSize(fs(22, this.fontScale))
+            .margin({ left: 12 })
+            .hitTestBehavior(HitTestMode.Block)
+            .accessibilityText('退出搜索')
+            .onClick((): void => { this.exitSearch(); })
         }
-        .width(44)
+        .width('100%')
         .height(44)
-        .backgroundColor(Theme.segGlass(this.isDark, false))
-        .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, false))
-        .borderRadius(Radius.full)
-        .margin({ right: Spacing.sm })
-        .accessibilityText('退出搜索')
-        .onClick(() => { this.exitSearch(); })
-
-        TextInput({ placeholder: '搜索收藏帖子、吧或分类', text: this.searchKeyword })
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(fs(15, this.fontScale))
-          .backgroundColor(Color.Transparent)
-          .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.control())
-          .systemMaterial(ImmMaterial.control())
-          .borderRadius(Radius.full)
-          .padding({ left: 14, right: 14 })
-          .defaultFocus(true)
-          .onChange((v: string) => { this.searchKeyword = v; })
       } else if (this.editMode) {
         Button() {
           SymbolGlyph($r('sys.symbol.chevron_left'))
@@ -4234,7 +4735,6 @@ export struct FavoriteTab {
         .backgroundColor(Theme.segGlass(this.isDark, false))
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
         .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, false))
         .borderRadius(Radius.full)
         .margin({ left: Spacing.sm })
         .accessibilityText('排序')
@@ -4297,7 +4797,6 @@ export struct FavoriteTab {
         .backgroundColor(Theme.segGlass(this.isDark, false))
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
         .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, false))
         .borderRadius(Radius.full)
         .accessibilityText('排序')
         .accessibilityDescription(this.sortModeLabel(this.sortMode))
@@ -4341,7 +4840,6 @@ export struct FavoriteTab {
           .backgroundColor(Theme.segGlass(this.isDark, false))
           .border({ width: 0.5, color: Theme.manualGlassBorder() })
           .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
-          .shadow(Theme.segGlassShadow(this.isDark, false))
           .borderRadius(Radius.full)
           .margin({ left: Spacing.sm })
           .accessibilityText('备份')
@@ -4360,7 +4858,6 @@ export struct FavoriteTab {
         .backgroundColor(Theme.segGlass(this.isDark, false))
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
         .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, false))
         .borderRadius(Radius.full)
         .margin({ left: 12 })
         .accessibilityText('排序')
@@ -4377,7 +4874,6 @@ export struct FavoriteTab {
         .backgroundColor(Theme.segGlass(this.isDark, false))
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
         .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, false))
         .borderRadius(Radius.full)
         .margin({ left: 12 })
         .accessibilityText('搜索')
@@ -4460,18 +4956,28 @@ export struct FavoriteTab {
   FavTitleBarRow() {
     Row() {
       if (this.searchMode) {
-        this.FavSlotCircleBtn($r('sys.symbol.chevron_left'), 22, '退出搜索', { right: Spacing.sm }, (): void => { this.exitSearch(); })
-
-        TextInput({ placeholder: '搜索收藏帖子、吧或分类', text: this.searchKeyword })
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(fs(15, this.fontScale))
-          .backgroundColor(Color.Transparent)
-          .systemMaterial(ImmMaterial.control())
-          .borderRadius(Radius.full)
-          .padding({ left: 14, right: 14 })
-          .defaultFocus(true)
-          .onChange((v: string) => { this.searchKeyword = v; })
+        // §4.3 改动五结论二（已定稿）：返回圆钮内嵌进搜索框内部左侧 → 搜索框左右边缘与卡片网格严格对齐
+        Stack({ alignContent: Alignment.Start }) {
+          TextInput({ placeholder: '搜索收藏帖子、吧或分类', text: this.searchKeyword })
+            .width('100%')
+            .height(40)
+            .fontSize(fs(15, this.fontScale))
+            .backgroundColor(Color.Transparent)
+            .systemMaterial(ImmMaterial.control())
+            .borderRadius(Radius.full)
+            .padding({ left: 46, right: 14 })
+            .defaultFocus(true)
+            .onChange((v: string) => { this.searchKeyword = v; })
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontColor([$r('sys.color.icon_primary')])
+            .fontSize(fs(22, this.fontScale))
+            .margin({ left: 12 })
+            .hitTestBehavior(HitTestMode.Block)
+            .accessibilityText('退出搜索')
+            .onClick((): void => { this.exitSearch(); })
+        }
+        .width('100%')
+        .height(44) // 与旧 44 圆钮同高 → 槽位高度 98 不变
       } else if (this.editMode) {
         this.FavSlotCircleBtn($r('sys.symbol.chevron_left'), 22, '退出编辑', { right: Spacing.sm }, (): void => { this.exitEditMode(); })
 
@@ -4565,7 +5071,9 @@ export struct FavoriteTab {
             .systemMaterial(ImmMaterial.seg(this.categoryTab === FavCategoryTab.Forums))
             .borderRadius(Radius.full)
             .height(40)
-            .layoutWeight(1)
+            // §4.3 改动一：平板（多列档）胶囊按内容自适应宽 + 整行靠左；手机保持等分铺满
+            .layoutWeight(this.favColumns() > 1 ? 0 : 1)
+            .padding({ left: 22, right: 22 })
             .accessibilityText('吧分类')
             .onClick(() => { this.switchCategoryTab(FavCategoryTab.Forums); })
           Button('自定义分类')
@@ -4577,9 +5085,14 @@ export struct FavoriteTab {
             .systemMaterial(ImmMaterial.seg(this.categoryTab === FavCategoryTab.Custom))
             .borderRadius(Radius.full)
             .height(40)
-            .layoutWeight(1)
+            .layoutWeight(this.favColumns() > 1 ? 0 : 1)
+            .padding({ left: 22, right: 22 })
             .accessibilityText('自定义分类')
             .onClick(() => { this.switchCategoryTab(FavCategoryTab.Custom); })
+          if (this.favColumns() > 1) {
+            // 平板：剩余宽度全部吸到右侧，两胶囊自然贴左（§4.3 改动一）
+            Blank()
+          }
         }
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, top: 2, bottom: Spacing.sm })
@@ -4655,10 +5168,11 @@ export struct FavoriteTab {
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
         .backgroundBlurStyle(this.categoryTab === FavCategoryTab.Forums ? BlurStyle.Regular : BlurStyle.Thin,
           { scale: this.categoryTab === FavCategoryTab.Forums ? 0.8 : 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, this.categoryTab === FavCategoryTab.Forums))
         .borderRadius(Radius.full)
         .height(40)
-        .layoutWeight(1)
+        // §4.3 改动一：平板（多列档）胶囊按内容自适应宽 + 整行靠左；手机保持等分铺满（与槽位路径同步）
+        .layoutWeight(this.favColumns() > 1 ? 0 : 1)
+        .padding({ left: 22, right: 22 })
         .accessibilityText('吧分类')
         .onClick(() => { this.switchCategoryTab(FavCategoryTab.Forums); })
       Button('自定义分类')
@@ -4669,12 +5183,15 @@ export struct FavoriteTab {
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
         .backgroundBlurStyle(this.categoryTab === FavCategoryTab.Custom ? BlurStyle.Regular : BlurStyle.Thin,
           { scale: this.categoryTab === FavCategoryTab.Custom ? 0.8 : 0.85 })
-        .shadow(Theme.segGlassShadow(this.isDark, this.categoryTab === FavCategoryTab.Custom))
         .borderRadius(Radius.full)
         .height(40)
-        .layoutWeight(1)
+        .layoutWeight(this.favColumns() > 1 ? 0 : 1)
+        .padding({ left: 22, right: 22 })
         .accessibilityText('自定义分类')
         .onClick(() => { this.switchCategoryTab(FavCategoryTab.Custom); })
+      if (this.favColumns() > 1) {
+        Blank()
+      }
     }
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 100, bottom: Spacing.sm })
@@ -4705,28 +5222,30 @@ export struct FavoriteTab {
     .onClick(onTap)
   }
 
-  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮 / 标题 + 分段切换区（132vp 折算），手机维持 20% */
-  private topFadeStop(): number {
-    if (!this.isWideFormDevice || this.fadeCoverVp <= 0) {
-      return 0.20;
-    }
-    return Math.min(0.20, 132 / this.fadeCoverVp);
-  }
-
+  /**
+   * 顶部满宽渐显带（真机三次修复终版，2026-09-14）：原「整页 DST_IN 遮罩 + blendMode OFFSCREEN」方案的
+   * 离屏层宽度在手机上解析异常——四个界面渐显带右缘同缺一条竖带、平板正常（Refresh 全宽 / 挂点回迁均无效）
+   * → 改为 **Stack 顶层满宽背景色渐变条**（ThreadList TopFadeBand 成品同款思路）：
+   * 下层是纯背景色，背景色渐变条叠加 = 视觉等价渐隐，宽度跟随 FavContent Stack（全宽已被页面背景实证），
+   * 彻底不依赖列表宿主宽度解析。
+   * 高 132 = TopBar 98 + 分段切换区 ~34（只盖按钮与标题区，用户拍板口径）；hitTestBehavior(None) 不挡交互；
+   * zIndex 8：盖住列表内容，低于 EditBar(15) / 兜底 CategoryTabs(13)，槽位顶栏在 Navigation title 层更高。
+   * 渐变**从顶部即线性渐变、无全实段**（真机四修，2026-09-14）：首版 [bg,0]→[bg,0.5]→[透明,1] 的前半段
+   * 全实背景色会让内容一进条顶就被盖死（硬切感，用户真机驳回）——改 [bg,0]→[transparent,1] 线性后与
+   * 首页挖洞式「内容从顶栏下渐现」观感一致。
+   */
   @Builder
-  BottomFadeOverlay() {
-    // 顶部渐显（沉浸式：列表内容滚入透明悬浮顶栏 / 分段切换区下方时渐进显现），与 ThreadList 统一语言；
-    // 全屏 DST_IN + 顶部 20% 渐显——800vp 屏 ≈160vp，覆盖 TopBar(0~98) + 分段切换区 CategoryTabs(100~132vp)（BUG-02）；
-    // 20% 以下全实色（src_alpha=1）→ 无梯形挖洞、不回归 BUG-09 底部黑 mask；EditBar zIndex 15 在其上不受影响
-    // 平板收窄（2026-09-13）：覆盖比例由 topFadeStop() 分档（平板 = 132vp 折算，只盖顶部按钮 / 标题 + 分段区）
-    Stack()
+  TopFadeBand() {
+    Column()
       .width('100%')
-      .height('100%')
+      .height(132)
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
 }

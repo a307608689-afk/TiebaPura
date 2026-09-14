@@ -43,7 +43,6 @@ export interface ApiEndpoints {
   BLACKLIST_DEL: string;
   BLACKLIST_SET_USER: string;
   BLACKLIST_PAGE: string;
-  USER_LIKE: string;
   FOLLOW_ADD: string;
   FOLLOW_DEL: string;
   FOLLOW_USER_LIST: string;
@@ -83,7 +82,6 @@ export const API: ApiEndpoints = {
   BLACKLIST_PAGE: 'https://tiebac.baidu.com/c/u/user/userBlackPage',
   // 已抓包确认（批A，2026-08-31 模拟器 + hilog 探测）：关注相关接口均位于 tiebac.baidu.com，
   // 需携带 BDUSS + _client_version + sign（MD5 小写，salt=tiebaclient!!!），见 TiebaService.signTiebaForm
-  USER_LIKE: 'https://c.tieba.baidu.com/c/u/feed/userlike?cmd=303004',
   FOLLOW_ADD: 'https://tiebac.baidu.com/c/c/user/follow',
   FOLLOW_DEL: 'https://tiebac.baidu.com/c/c/user/unfollow',
   FOLLOW_USER_LIST: 'https://tiebac.baidu.com/c/u/follow/followList',

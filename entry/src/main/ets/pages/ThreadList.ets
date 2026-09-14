@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { common, Want } from '@kit.AbilityKit';
+import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
@@ -67,6 +67,11 @@ const SEARCH_ENRICH_CONCURRENCY: number = 3;
 const SEARCH_SCAN_MAX_PAGES: number = 80;
 /** 自动续载延迟：给 UI 一帧渲染机会再取下一批 */
 const SEARCH_AUTO_CONTINUE_MS: number = 120;
+
+// 官方贴吧（鸿蒙版）包名与市场页：吧主页跳转仅携带吧名 kw，不含任何登录态参数
+// （与 ThreadDetail 同源；帖子里用的是 wapp 域直达，官方声明的 skills 不匹配 tieba.baidu.com）
+const TIEBA_OFFICIAL_BUNDLE: string = 'com.baidu.tiebaapp';
+const TIEBA_MARKET_URL: string = 'https://appgallery.huawei.com/app/detail?id=com.baidu.tiebaapp';
 
 /**
  * 排序 tab 切换（热门 / 最新 / 精选）——**照搬首页 `Index.switchTab` 的「两页连着」过场**：
@@ -158,6 +163,12 @@ const THREAD_LIST_SORT_BAR_PADDING: number = 5;
 const THREAD_LIST_SORT_BAR_BOTTOM: number = 30;
 /** 排序栏与加号钮之间的横向缝隙（两框**分离开**、不并成一条）：左 24 | 底栏 | 12 | 加号 | 右 24 */
 const THREAD_LIST_SORT_BAR_GAP: number = 12;
+/**
+ * 吧内搜索结果多列「列均衡」阈值（vp，方案 B 滞回，2026-09-14，与 §4.9 / §4.10 同款）：
+ * 轮转目标列与最短列的估算高差超过该值时，本卡改投最短列（补位）；否则照常轮转（保序）。
+ * 取 240 ≈ 一张短卡高：搜索结果长短交错明显（有无图 / 图多图少），滞回把补位次数压到最少。
+ */
+const THREAD_SEARCH_COL_BALANCE_THRESHOLD: number = 240;
 /** 平板适配 §4.8 T-F：底栏宽度上限（多列档不随屏宽拉伸，锁到手机 360vp 下的取值 244） */
 const THREAD_LIST_SORT_BAR_MAX_WIDTH: number = 244;
 /** 平板适配 §4.8 T-F：吧头经验条宽度上限（多列档不随屏宽拉伸；手机档取大值不生效） */
@@ -325,6 +336,97 @@ struct ForumMoreDialogCard {
 }
 
 /**
+ * 跳转官方吧主页确认弹窗（系统 CustomDialog + API 26 沉浸光感）。
+ *
+ * 页内复刻 ThreadDetail 的 JumpTiebaDialogCard（2026-09-14）：几何 / 材质 / 按钮样式逐项一致，
+ * 仅文案换成吧主页语境（用户指定标题「确认是否跳转官方吧主页」）。ThreadDetail 原件一行未动。
+ * 数据传递：链接预览走 @Link 快照 —— forumAppUrl() 是宿主方法，弹窗内取不到。
+ */
+@CustomDialog
+struct ForumJumpDialogCard {
+  /** 系统弹窗必须声明 CustomDialogController 类型属性（ArkTS 编译期强校验） */
+  controller?: CustomDialogController;
+  @Link isDark: boolean;
+  @Link fontScale: number;
+  /** 目标链接预览（宿主在打开前算好并写入） */
+  @Link targetUrl: string;
+  /** 确定：拉起官方贴吧（业务全在宿主 confirmJump，弹窗只负责回调） */
+  onConfirm: () => void = () => {};
+  /** 取消 / 点遮罩 / 返回键（同源，宿主 onWillDismiss 与取消钮共用） */
+  onDismiss: () => void = () => {};
+
+  build() {
+    Column() {
+      // 标题 + 说明 + 目标链接预览
+      Column({ space: 6 }) {
+        Text('确认是否跳转官方吧主页')
+          .fontSize(fs(17, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary(this.isDark))
+          .textAlign(TextAlign.Center)
+        Text('将在官方贴吧中打开本吧（仅携带吧名，不含登录信息）')
+          .fontSize(fs(13, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .lineHeight(fs(18, this.fontScale))
+          .textAlign(TextAlign.Center)
+        Text(this.targetUrl)
+          .fontSize(fs(12, this.fontScale))
+          .fontColor(Theme.textSecondary(this.isDark))
+          .textAlign(TextAlign.Center)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.lg, bottom: Spacing.md })
+
+      // 确定 / 取消（竖排全宽，与 ThreadDetail 弹窗逐项一致）
+      Column({ space: Spacing.sm }) {
+        Button() {
+          Text('确定')
+            .fontSize(fs(15, this.fontScale))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Color.White)
+        }
+        .width('100%')
+        .height(44)
+        // 品牌蓝主按钮：材质 + 半透明底 + 同色浮起阴影（与 ThreadDetail / 收藏页确认弹窗同源）
+        .systemMaterial(ImmMaterial.accent(this.isDark))
+        .backgroundColor('#CC3173FF')
+        .borderRadius(Radius.full)
+        .shadow({
+          radius: 14,
+          color: this.isDark ? '#663173FF' : '#4D3173FF',
+          offsetY: 4
+        })
+        .accessibilityText('确认跳转官方吧主页')
+        .onClick(() => { this.onConfirm(); })
+
+        Button() {
+          Text('取消')
+            .fontSize(fs(15, this.fontScale))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.textPrimary(this.isDark))
+        }
+        .width('100%')
+        .height(44)
+        // 次按钮：材质 + 半透明底 + 中性轻投影（底色不透明会盖掉材质）
+        .systemMaterial(ImmMaterial.cardAction())
+        .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
+        .borderRadius(Radius.full)
+        .shadow({ radius: 10, color: this.isDark ? '#4D000000' : '#1F101824', offsetY: 3 })
+        .accessibilityText('取消跳转')
+        .onClick(() => { this.onDismiss(); })
+      }
+      .width('100%')
+      .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
+    }
+    .width('100%')
+    .padding({ top: Spacing.md })
+  }
+}
+
+/**
  * 吧内帖子列表 WaterFlow 数据源（§4.8 决策 13）：把「置顶卡 + 普通帖」合并为一个列表，
  * 通过 `threads` 的 `@Watch('onThreadsChanged')` 自动同步。
  * `reload()` 全量替换（刷新 / 切排序），`notifyAdd()` 尾部追加（加载更多）。
@@ -416,6 +518,13 @@ struct ThreadList {
   @State @Watch('onShowMoreChanged') showMoreSheet: boolean = false;
   /** 弹窗展示快照：打开那一刻是否已关注（可空对象 forumInfo 不能直接 @Link 进 @CustomDialog） */
   @State moreSheetLiked: boolean = false;
+  /**
+   * 跳转官方吧主页确认弹窗显隐（系统 CustomDialog + API 26 沉浸光感）。
+   * 与 ThreadDetail 同机制：保留单一布尔状态，真正 open/close 由 @Watch 驱动。
+   */
+  @State @Watch('onShowJumpChanged') showJumpDialog: boolean = false;
+  /** 弹窗内的目标链接预览快照（打开前由宿主算好写入，弹窗内取不到宿主方法） */
+  @State jumpUrlPreview: string = '';
   // 吧主页关注/取消关注进行中，防止重复点击
   @State forumFollowBusy: boolean = false;
   @State refreshing: boolean = false;
@@ -858,14 +967,8 @@ struct ThreadList {
     });
   }
 
-  private openCompose(): void {
-    this.getUIContext().getRouter().pushUrl({
-      url: 'pages/ComposeThread',
-      params: { kw: this.forumName, fid: this.forumId }
-    }).catch(() => {
-      this.getUIContext().getPromptAction().showToast({ message: '发帖页面打开失败，请稍后重试' });
-    });
-  }
+  // 原底部加号 FAB 的 openCompose() 已移除（2026-09-14）：加号改为「确认跳转官方吧主页」，
+  // 走 openJumpDialog / confirmJump（四级兜底链，见下方 jumpDialogController 一带）。
 
   /** 本吧搜索：进入搜索态（服务端搜索优先，失败降级本地扫描；退出返回帖子列表） */
   private openSearch(): void {
@@ -2121,6 +2224,184 @@ struct ThreadList {
   }
 
   /**
+   * 跳转官方吧主页确认弹窗控制器（系统 CustomDialog，与 moreSheetController 同构）：
+   * 底部锚点 + 上移 110、宽 dialogCardWidth()、systemMaterial 沉浸光感、customStyle=false
+   * （customStyle=true 时弹窗背景强制透明、圆角归 0 且材质不生效）。
+   * onWillDismiss 承接「点遮罩 / 返回键 / 侧滑」→ 与取消钮共用 closeJumpDialog。
+   */
+  private jumpDialogController: CustomDialogController = new CustomDialogController({
+    builder: ForumJumpDialogCard({
+      isDark: $isDark,
+      fontScale: $fontScale,
+      targetUrl: $jumpUrlPreview,
+      onConfirm: () => { this.confirmJump(); },
+      onDismiss: () => { this.closeJumpDialog(); }
+    }),
+    autoCancel: true,
+    alignment: DialogAlignment.Bottom,
+    offset: { dx: 0, dy: -110 },
+    maskColor: '#06000000',
+    cornerRadius: 32,
+    width: this.dialogCardWidth(),
+    customStyle: false,
+    systemMaterial: ImmMaterial.dialog(),
+    openAnimation: { duration: 220, curve: Curve.EaseOut },
+    closeAnimation: { duration: 200, curve: Curve.EaseInOut },
+    onWillDismiss: () => { this.closeJumpDialog(); }
+  });
+
+  /** showJumpDialog 变化即驱动系统弹窗 open/close（openJumpDialog / confirmJump 只写状态） */
+  onShowJumpChanged(): void {
+    if (this.showJumpDialog) {
+      this.jumpDialogController.open();
+    } else {
+      this.jumpDialogController.close();
+    }
+  }
+
+  private openJumpDialog(): void {
+    if (this.forumName.length === 0) {
+      this.getUIContext().getPromptAction().showToast({ message: '吧信息暂不可用' });
+      return;
+    }
+    // 打开前算好链接预览快照（弹窗内取不到宿主方法 forumWebUrl）
+    this.jumpUrlPreview = this.forumWebUrl();
+    this.showJumpDialog = true;
+  }
+
+  private closeJumpDialog(): void {
+    this.showJumpDialog = false;
+  }
+
+  /** 官方 App 内吧主页直达链接：wapp 域（官方鸿蒙贴吧声明的 skills 不匹配 tieba.baidu.com） */
+  private forumAppUrl(): string {
+    return `https://wapp.baidu.com/f?kw=${encodeURIComponent(this.forumName)}`;
+  }
+
+  /** 网页版吧主页（兜底用，格式与页内分享功能同源） */
+  private forumWebUrl(): string {
+    return `https://tieba.baidu.com/f?kw=${encodeURIComponent(this.forumName)}`;
+  }
+
+  /** 官方贴吧是否已安装（只判断包是否存在，不读取内部结构字段） */
+  private isTiebaInstalled(): boolean {
+    try {
+      const info: bundleManager.BundleInfo =
+        bundleManager.getBundleInfoSync(TIEBA_OFFICIAL_BUNDLE, bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      return info !== undefined && info !== null;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 隐式拉起（浏览器 / 应用市场网页） */
+  private startViewUrl(url: string): void {
+    const hostCtx = this.getUIContext().getHostContext();
+    if (!hostCtx) {
+      return;
+    }
+    try {
+      const ctx: common.UIAbilityContext = hostCtx as common.UIAbilityContext;
+      const want: Want = { uri: url, action: 'ohos.want.action.viewData', type: 'text/plain' };
+      ctx.startAbility(want).catch(() => {
+        this.getUIContext().getPromptAction().showToast({ message: '打开失败，请稍后重试' });
+      });
+    } catch (e) {
+      this.getUIContext().getPromptAction().showToast({ message: '打开失败，请稍后重试' });
+    }
+  }
+
+  /** 记录跳转失败原因，便于真机 hilog 定位（不会打扰用户） */
+  private logJumpFail(step: string, e: Object): void {
+    const err = e as BusinessError;
+    console.info(`[跳转官方吧主页] ${step}失败 code=${err?.code ?? ''} msg=${err?.message ?? String(e)}`);
+  }
+
+  private copyJumpLink(url: string): void {
+    try {
+      const sysPasteboard = pasteboard.getSystemPasteboard();
+      const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, url);
+      sysPasteboard.setData(pasteData, (err: BusinessError | undefined) => {
+        const msg: string = err ? '复制失败，请手动复制' : '无法打开官方贴吧，链接已复制';
+        this.getUIContext().getPromptAction().showToast({ message: msg });
+      });
+    } catch (e) {
+      this.getUIContext().getPromptAction().showToast({ message: '复制失败，请手动复制' });
+    }
+  }
+
+  /**
+   * 确认跳转：① 限定官方贴吧 + wapp 吧主页 uri（命中贴吧声明的 skills 时直达吧主页）
+   * ② 显式 EntryAbility + uri ③ 官方入口 Want / 显式入口名（进 App 首页）
+   * ④ 已安装回落浏览器网页版，未安装引导去应用市场（四级链与 ThreadDetail.confirmJump 同源）
+   */
+  private async confirmJump(): Promise<void> {
+    const url: string = this.forumWebUrl();
+    const appUrl: string = this.forumAppUrl();
+    this.showJumpDialog = false;
+    const hostCtx = this.getUIContext().getHostContext();
+    if (!hostCtx) {
+      this.copyJumpLink(url);
+      return;
+    }
+    const ctx: common.UIAbilityContext = hostCtx as common.UIAbilityContext;
+    // ① 限定官方贴吧 + wapp 吧主页链接：命中贴吧声明的 skills，直达 App 内吧主页
+    try {
+      await ctx.startAbility({
+        bundleName: TIEBA_OFFICIAL_BUNDLE,
+        uri: appUrl,
+        action: 'ohos.want.action.viewData'
+      });
+      return;
+    } catch (e) {
+      this.logJumpFail('wapp直达', e);
+    }
+    // ② 显式指定 EntryAbility 并带 uri：App 在 onNewWant 里解析链接也能落到吧主页
+    try {
+      await ctx.startAbility({
+        bundleName: TIEBA_OFFICIAL_BUNDLE,
+        abilityName: 'EntryAbility',
+        uri: appUrl,
+        action: 'ohos.want.action.viewData'
+      });
+      return;
+    } catch (e) {
+      this.logJumpFail('EntryAbility+uri', e);
+    }
+    // ③ 系统提供的官方入口 Want（打开 App 首页）
+    try {
+      const launchWant: Want = bundleManager.getLaunchWantForBundleSync(TIEBA_OFFICIAL_BUNDLE);
+      await ctx.startAbility(launchWant);
+      return;
+    } catch (e) {
+      this.logJumpFail('launchWant', e);
+    }
+    // ③ 显式指定常见入口 ability 名兜底（查询三方包信息受权限限制，不能只依赖检测结果）
+    const abilityCandidates: string[] = ['EntryAbility', 'MainAbility'];
+    for (const abilityName of abilityCandidates) {
+      try {
+        await ctx.startAbility({ bundleName: TIEBA_OFFICIAL_BUNDLE, abilityName: abilityName });
+        return;
+      } catch (e) {
+        this.logJumpFail(abilityName, e);
+      }
+    }
+    // ④ 全部拉起失败：确认已安装则回落浏览器网页版，否则引导去应用市场
+    if (this.isTiebaInstalled()) {
+      try {
+        await ctx.startAbility({ uri: url, action: 'ohos.want.action.viewData', type: 'text/plain' });
+        return;
+      } catch (e) {
+        this.logJumpFail('浏览器', e);
+      }
+      this.copyJumpLink(url);
+      return;
+    }
+    this.getUIContext().getPromptAction().showToast({ message: '未安装官方贴吧，正在前往应用市场' });
+    this.startViewUrl(TIEBA_MARKET_URL);
+  }
+
+  /**
    * 页面主体层（原 build() 根 Stack）：官方槽位路径 / 兜底路径共用。
    * 内层 = 列表 + 悬浮顶栏（槽位路径下改挂 ThreadTitleBar），外层 BottomEnd Stack = 悬浮 FAB
    * （槽位路径下改挂 FabSlotShell）与「更多」面板。
@@ -2620,7 +2901,7 @@ struct ThreadList {
         this.FabSlotShell()
       }
     } else {
-    // 发主题 FAB - 沉浸光感圆形加号
+    // 跳转官方吧主页 FAB - 沉浸光感圆形加号
     Stack() {
       SymbolGlyph($r('sys.symbol.plus'))
         .fontSize(fs(26, this.fontScale))
@@ -2641,7 +2922,7 @@ struct ThreadList {
     .translate({ y: (1 - this.fabReveal()) * 20 })
     .hitTestBehavior(this.searchMode ? HitTestMode.None : HitTestMode.Default)
     .animation({ duration: 220, curve: Curve.FastOutSlowIn })
-    .onClick(() => this.openCompose())
+    .onClick(() => this.openJumpDialog())
     }
 
     // 底部排序底栏（官方槽位壳，§6.10 同机制）：热门 / 最新 / 精选 三枚等分钮，整条背板走
@@ -2846,7 +3127,7 @@ struct ThreadList {
   @Builder
   FabSlotColumn() {
     Column() {
-      // 发主题 FAB - 沉浸光感圆形加号（图标取系统语义色，才能随材质一起反色）
+      // 跳转官方吧主页 FAB - 沉浸光感圆形加号（图标取系统语义色，才能随材质一起反色）
       Stack() {
         SymbolGlyph($r('sys.symbol.plus'))
           .fontSize(fs(26, this.fontScale))
@@ -2857,7 +3138,7 @@ struct ThreadList {
       .borderRadius(28)
       .systemMaterial(ImmMaterial.fabFlat())
       .hitTestBehavior(this.searchMode ? HitTestMode.None : HitTestMode.Default)
-      .onClick(() => this.openCompose())
+      .onClick(() => this.openJumpDialog())
     }
     .width('100%')
     .height(THREAD_LIST_FAB_SHELL_HEIGHT)
@@ -2977,9 +3258,15 @@ struct ThreadList {
     }
     .width('100%')
     .height(THREAD_LIST_SORT_BAR_HEIGHT)
-    // 锚点分档：手机（单列）左对齐 + 左缘 24 = 现状；平板（多列）整体居中
-    .justifyContent(this.threadColumns() > 1 ? FlexAlign.Center : FlexAlign.Start)
-    .padding({ left: this.threadColumns() > 1 ? 0 : 24 })
+    // 视觉居中（2026-09-14 修复「底栏 + 加号整体偏左」）：原先单列档写死「Start + 左缘 24」、
+    // 多列档 Center，两者都只对特定屏宽恰好对称 —— 组合壳内容宽 336（栏 244 + 缝 12 + 加号壳 80），
+    // 可视宽只有 312（加号壳 80 内含右缘 24）。360vp 屏下「24 + 336 = 360」恰好贴满；屏宽更大的手机
+    // （460vp 等）右侧多出 (屏宽 − 360) 空白 → 整组明显偏左。
+    // 改为统一按可视宽对称公式：左缘 = (屏宽 − 312) / 2 —— 360vp 时 = 24 逐像素不变；
+    // 任意屏宽左右可视边距恒对称；多列档（栏锁 244）同式自然居中，且修正了原先 Center 档
+    // 「左 (w−336)/2 / 右 (w−336)/2+24」的 24vp 不对称。
+    .justifyContent(FlexAlign.Start)
+    .padding({ left: Math.max(0, (this.currentWidth - 312) / 2) })
     .margin({ bottom: THREAD_LIST_SORT_BAR_BOTTOM })
     .zIndex(20)
     .hitTestBehavior(HitTestMode.None)
@@ -3259,6 +3546,82 @@ struct ThreadList {
     return rows;
   }
 
+  /** §4.8 T-D 搜索多列（2026-09-14 改瀑布流）：列索引数组 [0..列数-1]——外层 ForEach 只遍历索引，保证列容器 key 稳定可复用 */
+  private searchColIndexes(): number[] {
+    const n: number = this.threadColumns();
+    const arr: number[] = [];
+    for (let i = 0; i < n; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  /**
+   * 搜索结果分桶（方案 B「带滞回的最短列」，2026-09-14，与 §4.9 / §4.10 同款）：
+   * 默认按 `i % 列数` 轮转（保序观感），仅当轮转目标列与最短列的估算高差
+   * > `THREAD_SEARCH_COL_BALANCE_THRESHOLD` 时改投最短列补位——搜索结果有无图 / 图多图少
+   * 长短交错明显，行分组（原实现）会把矮卡下方留白拉大，瀑布流分桶后各列底部收敛。
+   * 高度为确定性估算（同步可算、无测量循环）；前缀稳定贪心：结果追加从头重算，旧卡落列不变（不跳位）。
+   */
+  private searchColumnsData(): ThreadItem[][] {
+    const cols: number = this.threadColumns();
+    const buckets: ThreadItem[][] = [];
+    const heights: number[] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+      heights.push(0);
+    }
+    // 列宽（估算换行 / 图片比例用）：屏宽 − 结果区左右 padding(12×2) − 列间 gap(6×(cols−1))
+    const colWidth: number = (this.currentWidth - 24 - 6 * (cols - 1)) / cols;
+    const items: ThreadItem[] = this.searchThreads();
+    for (let i = 0; i < items.length; i++) {
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > THREAD_SEARCH_COL_BALANCE_THRESHOLD) {
+        target = shortest;
+      }
+      buckets[target].push(items[i]);
+      heights[target] += this.estimateSearchCardHeight(items[i], colWidth) + 6;
+    }
+    return buckets;
+  }
+
+  /**
+   * 搜索结果卡估算高（vp，仅供列均衡分桶，不求像素准只求相对准；**按多列档口径**，
+   * 与 `ThreadCard` 的 `cardColumns > 1` 渲染分支同式）：
+   * 头像行 40 + 互动行 36 + 卡内 padding/留白 48 为常数底数 124；
+   * 标题 ≤2 行（fs16→行高 22）、摘要 ≤2 行（fs14→行高 20），每行字数按列宽折算；
+   * 单图 = min(列宽 / 1.6, 220)（aspectRatio 1.6 + maxHeight 封顶，与渲染同式）；
+   * 多图宫格 = ⌈n/3⌉ 行 × min(列宽 / 3, 140)（1:1 格 + maxHeight 封顶，同渲染）。
+   */
+  private estimateSearchCardHeight(item: ThreadItem, colWidth: number): number {
+    let h: number = 124;
+    const title: string = item.title ?? '';
+    if (title.length > 0) {
+      const cpl: number = Math.max(8, Math.floor(colWidth / 16));
+      h += Math.min(Math.ceil(title.length / cpl), 2) * 22 + 6;
+    }
+    const abs: string = item.abstract ?? '';
+    if (abs.length > 0) {
+      const cpl2: number = Math.max(10, Math.floor(colWidth / 14));
+      h += Math.min(Math.ceil(abs.length / cpl2), 2) * 20 + 6;
+    }
+    const n: number = (item.images ?? []).length;
+    if (n === 1) {
+      h += Math.min(colWidth / 1.6, 220) + 6;
+    } else if (n > 1) {
+      const cellH: number = Math.min(colWidth / 3, 140);
+      h += Math.ceil(n / 3) * cellH + 6;
+    }
+    return h;
+  }
+
+
   /** 末行补空位下标：不足 cols 时用等宽空白补齐，避免最后一张卡被拉伸占满整行（§6.1 A2） */
   private threadBlankSlots(rowLen: number): number[] {
     const cols: number = this.threadColumns();
@@ -3342,42 +3705,47 @@ struct ThreadList {
         .padding({ left: 4, top: 8, bottom: 2 })
 
         if (this.threadColumns() > 1) {
-          // 多列档（§4.8 T-D）：与列表态同款行分组 + 末行补空位
-          ForEach(this.threadRows(this.searchThreads()), (row: ThreadItem[], rowIdx: number) => {
-            Row({ space: 6 }) {
-              ForEach(row, (item: ThreadItem) => {
-                Column() {
-                  ThreadCard({
-                    item: {
-                      tid: item.tid, postId: item.postId ?? '',
-                      title: item.title, forumName: item.forumName,
-                      forumAvatar: item.forumAvatar ?? '',
-                      author: item.author,
-                      authorAvatar: item.authorAvatar ?? '',
-                      authorId: item.authorId ?? '',
-                      replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
-                      isLiked: item.isLiked ?? false,
-                      abstract: item.abstract,
-                      firstImage: item.firstImage ?? '', images: item.images ?? [],
-                      createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
-                    } as ThreadItemData,
-                    onTap: (tid: string) => this.openThread(tid),
-                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                    onComment: (tid: string) => this.openThread(tid),
-                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-                  })
-                }
-                .layoutWeight(1)
-              },
-                (item: ThreadItem) => `search_${item.tid}_${item.authorId ?? ''}_${item.authorAvatar ?? ''}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}_${item.replyNum}`)
-              ForEach(this.threadBlankSlots(row.length), (slot: number) => {
-                Column().layoutWeight(1)
-              }, (slot: number) => `search_gap_${rowIdx}_${slot}`)
-            }
-            .width('100%')
-            .alignItems(VerticalAlign.Top)
-          }, (row: ThreadItem[], rowIdx: number) => `search_row_${rowIdx}_${row[0].tid}`)
+          // §4.8 T-D 二次更正（2026-09-14）：多列由「行分组 + 末行补空位」改为**列内独立堆叠瀑布流**
+          //（与首页 / 收藏页 / 详情页同款观感）——行分组会把矮卡下方留白拉大（有无图 / 图多图少交错时尤甚）。
+          // 结构照收藏页五轮教训：外层 ForEach **只遍历列索引**（key 稳定 → 列容器复用），
+          // 内层数据源**直读状态源** `searchColumnsData()[colIdx]`（不用外层传入的 col，否则复用断链不更新）。
+          Row({ space: 6 }) {
+            ForEach(this.searchColIndexes(), (colIdx: number) => {
+              Column({ space: 6 }) {
+                ForEach(this.searchColumnsData()[colIdx], (item: ThreadItem) => {
+                  Column() {
+                    ThreadCard({
+                      item: {
+                        tid: item.tid, postId: item.postId ?? '',
+                        title: item.title, forumName: item.forumName,
+                        forumAvatar: item.forumAvatar ?? '',
+                        author: item.author,
+                        authorAvatar: item.authorAvatar ?? '',
+                        authorId: item.authorId ?? '',
+                        replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                        isLiked: item.isLiked ?? false,
+                        abstract: item.abstract,
+                        firstImage: item.firstImage ?? '', images: item.images ?? [],
+                        createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                      } as ThreadItemData,
+                      onTap: (tid: string) => this.openThread(tid),
+                      onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                      onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                      onComment: (tid: string) => this.openThread(tid),
+                      onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                    })
+                  }
+                  // 新增卡片淡入（已有卡片按 key 复用，加载下一批不闪）
+                  .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+                },
+                  (item: ThreadItem) => `search_${item.tid}_${item.authorId ?? ''}_${item.authorAvatar ?? ''}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}_${item.replyNum}`)
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+            }, (colIdx: number) => `scol_${colIdx}`)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Top)
         } else {
           // 单列档：逐像素保持改造前结构
           ForEach(this.searchThreads(), (item: ThreadItem) => {

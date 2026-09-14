@@ -4562,6 +4562,138 @@ export class TiebaService {
     };
   }
 
+  /**
+   * 全吧搜索 · 搜贴（客户端端点，2026-09-15 实抓替换）。
+   *
+   * **替换原因**：旧 web 端点 `/mo/q/search/thread` 已被百度停摆——2026-09-14 实测三重确认：
+   * ① App 内响应 `success + post_list:[] + blank_type:1`（反爬空结果标记）；② PC 直连同签名同样空；
+   * ③ 带 BDUSS cookie 仍空。与登录态无关，端点对所有客户端返回空。
+   *
+   * **新端点**：吧内搜索同款 `/c/s/searchpost`（客户端 form + `tiebaclient!!!` 签名，工程已验证存活），
+   * 实测**【不带 kw 即为全吧搜贴】**——word=冠军 rn=20 命中 20 条、fname 覆盖 13 个不同吧。
+   * 表单 = 客户端公共参数（对齐 fetchUserAgreeThreads 同款模板）+ word/pn/rn/only_thread，签名 signTiebaForm。
+   */
+  async searchPostGlobalClient(keyword: string, page: number = 1, pageSize: number = 20): Promise<GlobalPostSearchData> {
+    const kw: string = keyword.trim();
+    if (kw.length === 0) {
+      return { list: [], hasMore: false, page };
+    }
+    const cuid: string = await this.resolveClientCuid();
+    const form: Record<string, string> = {};
+    form.BDUSS = AuthManager.getInstance().getBduss();
+    form._client_type = '2';
+    form._client_version = '12.41.7.1';
+    form.cuid = cuid;
+    form.cuid_galaxy2 = cuid;
+    form.cuid_gid = '';
+    form.from = 'tieba';
+    form.timestamp = TiebaService.clientTimestampSec();
+    form.model = 'HarmonyOS';
+    form.net_type = '1';
+    // 业务参数：⚠️ 不带 kw——带上 kw 就变成吧内搜索；不带即全吧（2026-09-15 实测）
+    form.word = kw;
+    form.pn = `${Math.max(1, page)}`;
+    form.rn = `${Math.max(1, pageSize)}`;
+    form.only_thread = '1';
+    form.sign = await this.signTiebaForm(form);
+    const resp: string = await HttpClient.postForm('https://tiebac.baidu.com/c/s/searchpost', form, {
+      'Accept': 'application/json, text/plain, */*',
+      'User-Agent': 'tieba/12.41.7.1',
+      'Referer': 'https://tieba.baidu.com/',
+    });
+    const trimmed: string = resp.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('<')) {
+      throw new Error('搜索服务返回异常，请稍后重试');
+    }
+    const payload: Record<string, Object> = JSON.parse(trimmed) as Record<string, Object>;
+    const errorCode: number = this.readNumber(payload, ['no', 'error_code', 'errno']);
+    if (errorCode !== 0) {
+      const msg: string = this.extractErrMsg(trimmed);
+      throw new Error(msg.length > 0 ? msg : `搜索失败(${errorCode})，请稍后重试`);
+    }
+    // post_list 可能挂顶层或 data 节点（版本差异，两处都找，与吧内搜索同款容错）
+    const data: Record<string, Object> = this.searchDataNode(payload);
+    let rawList: Object | undefined = payload['post_list'];
+    let pageNode: Record<string, Object> = this.searchChild(payload, 'page');
+    if (!Array.isArray(rawList)) {
+      rawList = data['post_list'];
+      pageNode = this.searchChild(data, 'page');
+    }
+    const list: GlobalPostResult[] = [];
+    if (Array.isArray(rawList)) {
+      for (const item of rawList as Object[]) {
+        const mapped = this.mapClientGlobalPost(item);
+        if (mapped !== null) {
+          list.push(mapped);
+        }
+      }
+    }
+    // has_more 缺失时按「本页是否满页」推断（与吧内搜索同款兜底）
+    const hasMoreRaw: Object | undefined = pageNode['has_more'];
+    const hasMore: boolean = (hasMoreRaw === undefined || hasMoreRaw === null)
+      ? list.length >= Math.max(1, pageSize)
+      : this.readNumber(pageNode, ['has_more', 'hasMore']) !== 0;
+    if (list.length === 0) {
+      hilog.info(0x0000, TiebaService.TAG, '[GSEARCH] client searchpost empty kw=%{public}s pn=%{public}d', kw, page);
+    }
+    return { list, hasMore, page: Math.max(1, page) };
+  }
+
+  /** 客户端全吧搜贴结果项 → GlobalPostResult（字段缺失全容错，仅 tid 必需） */
+  private mapClientGlobalPost(item: Object): GlobalPostResult | null {
+    if (item === null || typeof item !== 'object') {
+      return null;
+    }
+    const o: Record<string, Object> = item as Record<string, Object>;
+    const tid: string = this.readString(o, ['tid', 'thread_id', 'id']);
+    if (tid.length === 0) {
+      return null;
+    }
+    const author: Record<string, Object> = this.searchChild(o, 'author');
+    return {
+      tid,
+      pid: this.readString(o, ['pid', 'post_id']),
+      forumId: this.readString(o, ['fid', 'forum_id']),
+      forumName: this.readString(o, ['fname', 'forum_name']),
+      forumAvatar: '',
+      title: this.readString(o, ['title']),
+      content: this.readClientPostContent(o),
+      createTime: this.readNumber(o, ['time', 'create_time']),
+      replyNum: this.readNumber(o, ['reply_num', 'reply_count']),
+      authorId: this.readString(author, ['id', 'user_id', 'uid']) || this.readString(o, ['author_id', 'user_id']),
+      authorName: this.readString(author, ['name']) || this.readString(o, ['author_name', 'user_name']),
+      authorShowName: this.readString(author, ['name_show']) || this.readString(o, ['name_show', 'author_name_show']),
+      authorAvatar: this.normalizePortraitAvatar(this.readString(author, ['portrait']) || this.readString(o, ['portrait'])),
+    };
+  }
+
+  /** 客户端搜索 content 字段容错：字符串直取；段数组（[{type,text}]）拼 type=0 的 text */
+  private readClientPostContent(o: Record<string, Object>): string {
+    const raw: Object | undefined = o['content'];
+    if (raw === undefined || raw === null) {
+      return '';
+    }
+    if (typeof raw === 'string') {
+      return (raw as string).replace(/\s+/g, ' ').trim().substring(0, 120);
+    }
+    if (Array.isArray(raw)) {
+      const parts: string[] = [];
+      for (const seg of raw as Object[]) {
+        if (seg !== null && typeof seg === 'object') {
+          const so: Record<string, Object> = seg as Record<string, Object>;
+          const type: number = this.readNumber(so, ['type']);
+          if (type === 0) {
+            parts.push(this.readString(so, ['text']));
+          }
+        } else if (typeof seg === 'string') {
+          parts.push(seg as string);
+        }
+      }
+      return parts.join(' ').replace(/\s+/g, ' ').trim().substring(0, 120);
+    }
+    return '';
+  }
+
   /* ================= 吧内搜索（服务端，TiebaLite 同款端点） =================
    * 端点来源：TiebaLite（贴吧 Lite）SearchPostActivity → MiniTiebaApi.searchPost
    *   POST {host}/c/s/searchpost   (form-urlencoded)
@@ -5454,32 +5586,71 @@ export class TiebaService {
   }
 
   /**
-   * 拉取用户关注的吧列表（分页）。
-   * 注：接口地址与返回字段待批 A 抓包确认；当前为结构化占位实现。
+   * 拉取用户关注的吧列表（分页，含他人主页）。
+   * 已抓包确认（2026-09-15 PC 侧真实登录态实测）：POST https://c.tieba.baidu.com/c/f/forum/like，
+   * 即「我的关注吧」同款端点，需全套客户端公共参数（同 fetchUserAgreeThreads 模板）+ 登录态。
+   * 参数语义（实测）：带 BDUSS 时服务端【忽略 uid】恒回本人列表；**查他人必须用 friend_uid=目标 uid**
+   * （uid 传查看者自己）。实测 friend_uid 换不同目标返回不同列表、与自己列表交集极小，非「共同关注」。
+   * 缺公共参数时服务端返回 error_code=0 但数据为空，别误判为「该用户没关注吧」。
+   * 响应：forum_list[0]."non-gconforum" 为吧列表（id/name/level_id/level_name/avatar/slogan），
+   * 顶层 has_more 判定分页；rn 服务端最低按 50 返回。未登录（游客）实测拿不到数据。
    */
   async fetchUserLikeList(userId: string, page: number = 1, pageSize: number = 20): Promise<PagedResult<UserLikeItem>> {
     if (userId.length === 0) {
       throw new Error('缺少用户 ID，无法加载关注的吧');
     }
-    const form: Record<string, string> = {
-      'uid': userId,
-      'page': `${page}`,
-      'page_size': `${pageSize}`,
-      'ie': 'utf-8',
-    };
+    const cuid: string = await this.resolveClientCuid();
+    const viewerId: string = AuthManager.getInstance().getUser()?.userId ?? '';
+    const bduss: string = AuthManager.getInstance().getBduss();
+    const form: Record<string, string> = {};
+    if (bduss.length > 0) {
+      form.BDUSS = bduss;
+      form.is_guest = '0';
+    } else {
+      form.is_guest = '1';
+    }
+    form._client_type = '2';
+    form._client_version = '12.41.7.1';
+    form.cuid = cuid;
+    form.cuid_galaxy2 = cuid;
+    form.cuid_gid = '';
+    form.from = 'tieba';
+    form.timestamp = TiebaService.clientTimestampSec();
+    form.model = 'HarmonyOS';
+    form.net_type = '1';
+    // 带 BDUSS 时服务端忽略 uid 恒回本人列表，查他人必须 friend_uid=目标 uid（uid 传查看者自己）
+    form.uid = viewerId;
+    form.friend_uid = userId;
+    form.pn = `${Math.max(1, page)}`;
+    form.rn = `${Math.max(1, pageSize)}`;
+    form.sign = await this.signTiebaForm(form);
+    let resp: string = '';
     try {
-      // TODO(批A): 关注吧列表接口地址与返回字段待抓包确认
-      const resp = await HttpClient.postForm(`${API.USER_LIKE}`, form);
-      if (!resp.trim().startsWith('{')) {
-        throw new Error('关注的吧接口返回异常（接口待接入，请等待后续版本）');
-      }
-      const parsed: Record<string, Object> = JSON.parse(resp) as Record<string, Object>;
+      resp = await HttpClient.postForm('https://c.tieba.baidu.com/c/f/forum/like', form,
+        this.buildClientApiHeaders(cuid, viewerId));
+    } catch (e) {
+      throw new Error(`加载关注的吧失败：${(e as Error).message ?? '网络异常'}`);
+    }
+    const trimmed: string = resp.trim();
+    if (trimmed.startsWith('<')) {
+      throw new Error('关注的吧接口返回了网页内容，登录态可能已失效，请重新登录');
+    }
+    let list: UserLikeItem[] = [];
+    let hasMore: boolean = false;
+    try {
+      // 与 requestModernApi 同款归一化：服务端返回怪键 "non-gconforum"
+      const parsed = JSON.parse(trimmed.replace(/"non-gconforum"/g, '"non_gconforum"')) as Record<string, Object>;
       const errCode: string = `${parsed.error_code ?? parsed.errorCode ?? '0'}`;
       if (errCode !== '0' && errCode !== '' && errCode !== 'undefined') {
         throw new Error(this.extractErrMsg(resp) || '加载关注的吧失败');
       }
-      const rawList: Object[] = (parsed.like_forum ?? parsed.forum_list ?? parsed.list ?? []) as Object[];
-      const list: UserLikeItem[] = [];
+      if (bduss.length === 0) {
+        throw new Error('登录后才能查看用户关注的吧');
+      }
+      // forum_list 实测形态：数组 [{non_gconforum: [吧...]}]；做防御兼容（数组/对象/缺失均不崩）
+      const rawList: Object[] = this.collectUserLikeForums(parsed);
+      console.info(`[USERLIKE] resp_len=${trimmed.length} items=${rawList.length}`);
+      list = [];
       for (const raw of rawList) {
         const r: Record<string, Object> = raw as Record<string, Object>;
         const item: UserLikeItem = {
@@ -5493,14 +5664,48 @@ export class TiebaService {
           list.push(item);
         }
       }
-      const hasMore: boolean = `${parsed.has_more ?? parsed.hasMore ?? '0'}` === '1' || list.length >= pageSize;
-      return { list, hasMore, page };
+      hasMore = `${parsed.has_more ?? parsed.hasMore ?? '0'}` === '1';
     } catch (e) {
-      if ((e as Error).name === 'SyntaxError' || e instanceof SyntaxError) {
-        throw new Error('关注的吧接口返回异常（接口待接入，请等待后续版本）');
+      if (e instanceof Error && (e.message.startsWith('登录后才能') || e.message.endsWith('加载关注的吧失败') || e.message.includes('登录态可能已失效'))) {
+        throw e;
       }
-      throw new Error((e as Error).message ?? '加载关注的吧失败');
+      console.error(`[USERLIKE] parse failed: ${(e as Error).message ?? 'unknown'} stack=${(e as Error).stack ?? ''}`);
+      throw new Error('关注的吧数据解析失败，请稍后重试');
     }
+    return { list, hasMore, page };
+  }
+
+  /**
+   * 从 /c/f/forum/like 响应中提取「关注的吧」条目数组（防御形态）。
+   * 实测形态：forum_list = [{ "non-gconforum": [吧...] }]（归一化后键为 non_gconforum）；
+   * 兼容：forum_list 为对象（直接含 non_gconforum）、顶层 like_forum 直挂数组、条目散挂等异常形态。
+   */
+  private collectUserLikeForums(parsed: Record<string, Object>): Object[] {
+    const out: Object[] = [];
+    // 形态 0：顶层 like_forum 直挂数组（旧占位实现的预期形态，兜底兼容）
+    const direct = this.readObjectArray(parsed, ['like_forum']);
+    for (const it of direct) {
+      out.push(it);
+    }
+    if (out.length > 0) {
+      return out;
+    }
+    // 形态 1/2：forum_list 为分组数组或单个分组对象，真实列表在每组的 non_gconforum 键下
+    const groupsValue: Object | undefined = parsed['forum_list'];
+    if (groupsValue === undefined || groupsValue === null) {
+      return out;
+    }
+    const groups: Object[] = Array.isArray(groupsValue) ? groupsValue as Object[] : [groupsValue];
+    for (const group of groups) {
+      if (group === null || typeof group !== 'object') {
+        continue;
+      }
+      const inner = this.readObjectArray(group as Record<string, Object>, ['non_gconforum', 'forum_list', 'list']);
+      for (const it of inner) {
+        out.push(it);
+      }
+    }
+    return out;
   }
 
   /**

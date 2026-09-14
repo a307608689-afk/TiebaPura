@@ -29,7 +29,9 @@
  *  - 推荐位大卡 / 相关吧列表卡等全部使用 Theme 玻璃/卡片体系
  */
 import { curves } from '@kit.ArkUI';
-import { Theme, Radius, fs, isDarkMode, ImmMaterial, MaterialManager } from '../common/Theme';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { display } from '@kit.ArkUI';
+import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager } from '../common/Theme';
 import { TiebaService } from '../service/TiebaService';
 import {
   GlobalForumResult, GlobalForumSearchData, GlobalPostResult, GlobalPostSearchData,
@@ -61,6 +63,17 @@ struct GlobalQueryPage {
   @State materialSupported: boolean = false;
   // 官方悬浮条宽度依赖的屏宽（onAreaChange 实时更新）
   @State currentWidth: number = 360;
+
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.7，2026-09-15 用户拍板重定）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别（§4.8 T-B 同款） */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口宽 / 高（vp）：aboutToAppear 同步取首帧初值，onAreaChange 兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+  private isLandscape: boolean = false;
 
   private scroller: Scroller = new Scroller();
   private searchController: TextInputController = new TextInputController();
@@ -104,6 +117,112 @@ struct GlobalQueryPage {
       // 入参关键词：直接进入首轮搜索
       this.submitSearch();
     }
+    // 首帧形态初值（§4.6 H-A / §4.8 T-B 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏
+    // 若不预置会出现「先 1 列再跳 3/4 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
+    this.refreshFormMetrics();
+  }
+
+  /** 形态度量回填（display 实时值）：aboutToAppear 首帧 + 根容器 onAreaChange 兜底共用（§4.11/§4.12 同款） */
+  private refreshFormMetrics(): void {
+    try {
+      const d = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w <= 0 || h <= 0) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
+      this.isLandscape = w > h;
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败
+    }
+  }
+
+  /**
+   * 结果列数：大屏竖屏 3 / 横屏 4（2026-09-15 用户拍板，与首页 §4.2 决策 12 同口径）。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
+   */
+  private searchColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return this.isLandscape ? 4 : 3;
+  }
+
+  /** 列索引数组 [0..列数-1]：外层 ForEach 只遍历索引（key 稳定 → 列容器复用，收藏页五轮教训） */
+  private searchColIndexes(): number[] {
+    const n: number = this.searchColumns();
+    const arr: number[] = [];
+    for (let i = 0; i < n; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  /**
+   * 通用分桶（方案 B「带滞回的最短列」，2026-09-15，与 §4.9/§4.10/§4.12 同款）：
+   * 默认按 `i % 列数` 轮转（保序观感），仅当轮转目标列与最短列的估算高差 > 240vp（≈一张短卡）
+   * 时改投最短列补位。确定性估算、无测量循环；前缀稳定贪心：结果追加从头重算，旧卡落列不变。
+   * `gap` 为列内间距（各模块与自身渲染间距同源：搜吧/搜人/搜贴列内均为 12）。
+   */
+  private bucketColumns<T>(items: T[], estimate: (item: T) => number): T[][] {
+    const cols: number = this.searchColumns();
+    const buckets: T[][] = [];
+    const heights: number[] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+      heights.push(0);
+    }
+    for (let i = 0; i < items.length; i++) {
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > 240) {
+        target = shortest;
+      }
+      buckets[target].push(items[i]);
+      heights[target] += estimate(items[i]) + 12;
+    }
+    return buckets;
+  }
+
+  /** 搜吧卡估算高（多列档口径：头像行 52 + padding 28，slogan ≤1 行 +22） */
+  private estimateForumCard(item: GlobalForumResult): number {
+    let h: number = 92;
+    if (item.slogan.length > 0) {
+      h += 22;
+    }
+    return h;
+  }
+
+  /** 搜人卡估算高（与搜吧卡同构：头像行 52 + padding 28，intro ≤1 行 +22） */
+  private estimateUserCard(item: GlobalUserResult): number {
+    let h: number = 92;
+    if (item.intro.length > 0) {
+      h += 22;
+    }
+    return h;
+  }
+
+  /** 搜贴卡估算高（多列档口径：padding 28 + 信息行 24；标题 ≤2 行 fs16、摘要 ≤2 行 fs13） */
+  private estimatePostCard(item: GlobalPostResult): number {
+    let h: number = 124;
+    const title: string = item.title.length > 0 ? item.title : item.content;
+    if (title.length > 0) {
+      h += Math.min(Math.ceil(title.length / 18), 2) * 22 + 6;
+    }
+    if (item.title.length > 0 && item.content.length > 0 && item.title !== item.content) {
+      h += Math.min(Math.ceil(item.content.length / 20), 2) * 20 + 6;
+    }
+    return h;
   }
 
   onPageShow(): void {
@@ -238,7 +357,9 @@ struct GlobalQueryPage {
       this.postLoadingMore = true;
     }
     const nextPage: number = loadMore ? this.postData.page + 1 : 1;
-    TiebaService.getInstance().searchPostGlobal(kw, nextPage, 20).then((result: GlobalPostSearchData) => {
+    // 2026-09-15 切客户端端点 /c/s/searchpost（不带 kw = 全吧搜贴）：旧 web 端点 /mo/q/search/thread
+    // 已被百度停摆（success + 空结果 + blank_type:1，带签名直连/带 BDUSS 均空，见 service 注释）
+    TiebaService.getInstance().searchPostGlobalClient(kw, nextPage, 20).then((result: GlobalPostSearchData) => {
       if (loadMore) {
         this.postData = { list: this.postData.list.concat(result.list), hasMore: result.hasMore, page: nextPage };
       } else {
@@ -555,16 +676,33 @@ struct GlobalQueryPage {
           this.SectionHeader('推荐')
           this.ForumExactCard()
         }
-        // 相关吧
+        // 相关吧（2026-09-15 拍板：竖 3 / 横 4 列，列内独立堆叠）
         if (this.forumData.list.length > 0) {
           Column() {
             this.SectionHeader('相关吧')
           }
           .width('100%')
           .margin({ top: 16 })
-          ForEach(this.forumData.list, (item: GlobalForumResult) => {
-            this.ForumRowCard(item)
-          }, (item: GlobalForumResult) => `${item.forumId}_${item.forumName}`)
+          if (this.searchColumns() > 1) {
+            Row({ space: 12 }) {
+              ForEach(this.searchColIndexes(), (colIdx: number) => {
+                Column({ space: 12 }) {
+                  ForEach(this.bucketColumns(this.forumData.list, (it: GlobalForumResult) => this.estimateForumCard(it))[colIdx],
+                    (item: GlobalForumResult) => {
+                      this.ForumRowCard(item)
+                    }, (item: GlobalForumResult) => `${item.forumId}_${item.forumName}`)
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+              }, (colIdx: number) => `fcol_${colIdx}`)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Top)
+          } else {
+            ForEach(this.forumData.list, (item: GlobalForumResult) => {
+              this.ForumRowCard(item)
+            }, (item: GlobalForumResult) => `${item.forumId}_${item.forumName}`)
+          }
         }
         this.ModuleFooter(this.forumData.hasMore, this.forumLoadingMore)
       }
@@ -686,9 +824,27 @@ struct GlobalQueryPage {
         .height(160)
     } else {
       Column({ space: 12 }) {
-        ForEach(this.postData.list, (item: GlobalPostResult) => {
-          this.PostCard(item)
-        }, (item: GlobalPostResult) => `${item.tid}_${item.pid}_${item.createTime}`)
+        // 搜贴（2026-09-15 拍板：首页同款瀑布流，竖 3 / 横 4 列，列内独立堆叠 + 方案 B 分桶）
+        if (this.searchColumns() > 1) {
+          Row({ space: 12 }) {
+            ForEach(this.searchColIndexes(), (colIdx: number) => {
+              Column({ space: 12 }) {
+                ForEach(this.bucketColumns(this.postData.list, (it: GlobalPostResult) => this.estimatePostCard(it))[colIdx],
+                  (item: GlobalPostResult) => {
+                    this.PostCard(item)
+                  }, (item: GlobalPostResult) => `${item.tid}_${item.pid}_${item.createTime}`)
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+            }, (colIdx: number) => `pcol_${colIdx}`)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Top)
+        } else {
+          ForEach(this.postData.list, (item: GlobalPostResult) => {
+            this.PostCard(item)
+          }, (item: GlobalPostResult) => `${item.tid}_${item.pid}_${item.createTime}`)
+        }
         this.ModuleFooter(this.postData.hasMore, this.postLoadingMore)
       }
       .width('100%')
@@ -766,9 +922,26 @@ struct GlobalQueryPage {
           }
           .width('100%')
           .margin({ top: 16 })
-          ForEach(this.userData.list, (item: GlobalUserResult) => {
-            this.UserRowCard(item)
-          }, (item: GlobalUserResult) => `${item.userId}_${item.userName}`)
+          if (this.searchColumns() > 1) {
+            Row({ space: 12 }) {
+              ForEach(this.searchColIndexes(), (colIdx: number) => {
+                Column({ space: 12 }) {
+                  ForEach(this.bucketColumns(this.userData.list, (it: GlobalUserResult) => this.estimateUserCard(it))[colIdx],
+                    (item: GlobalUserResult) => {
+                      this.UserRowCard(item)
+                    }, (item: GlobalUserResult) => `${item.userId}_${item.userName}`)
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+              }, (colIdx: number) => `ucol_${colIdx}`)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Top)
+          } else {
+            ForEach(this.userData.list, (item: GlobalUserResult) => {
+              this.UserRowCard(item)
+            }, (item: GlobalUserResult) => `${item.userId}_${item.userName}`)
+          }
         }
         this.ModuleFooter(this.userData.hasMore, this.userLoadingMore)
       }
@@ -1166,10 +1339,16 @@ struct GlobalQueryPage {
 
   /* ============== 构建 ============== */
 
-  /** 官方悬浮底栏宽度（vp）：与手写定稿一致（屏宽 - 48，下限 240 防极端异常） */
+  /** 官方悬浮底栏宽度（vp，形态分档）：手机档「屏宽 - 48」（下限 240）逐像素不变；
+   *  平板 / 大屏档封顶 **480**（与首页底栏平板档同口径——同为 icon+文字三钮栏，观感统一），
+   *  防「屏宽 - 48」在 1024 下拉成 976vp 通栏（2026-09-15 用户拍板「底栏不拉伸」） */
   private pillWidth(): number {
     const w: number = this.currentWidth > 0 ? this.currentWidth - 48 : 312;
-    return w > 240 ? w : 240;
+    if (!this.isWideFormDevice) {
+      return w > 240 ? w : 240;
+    }
+    const capped: number = w > 480 ? 480 : w;
+    return capped > 240 ? capped : 240;
   }
 
   /** API26+ 官方路径：真实 Tabs 单内容承载页叠层，底部模块栏整体放入 .tabBar() 槽位，
@@ -1332,6 +1511,9 @@ struct GlobalQueryPage {
     .width('100%')
     .height('100%')
     .scrollBar(BarState.Off)
+    // Scroll 在内容不足一屏时默认垂直居中（搜人等结果少时表现为内容悬在屏幕中部），
+    // 显式对齐到顶部：少结果靠顶显示，多结果滚动能力不受影响
+    .align(Alignment.TopStart)
     .onReachEnd(() => this.onReachBottom())
     .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
     .overlay(this.TopFadeOverlay())
@@ -1424,6 +1606,8 @@ struct GlobalQueryPage {
       if (width > 0) {
         this.currentWidth = width;
       }
+      // 形态变化兜底（横竖屏 / 分屏拖宽：§4.7，与 §4.8 T-B 同款同点追加）
+      this.refreshFormMetrics();
     })
   }
 }

@@ -148,6 +148,7 @@ entry/src/main/ets/
 专项方案与 BUG 应对记录统一存放于 `docs/` 目录：
 
 - `docs/floor-vanish-viewport-fix.md` — 沉浸场景下 `List` 虚拟滚动列表项整层消失问题的实证排查与修复（含可复用的快速排查清单）
+- `docs/fade-band-fullwidth-fix.md` — 沉浸场景下顶部渐显带不满宽（右缘缺竖带）的实证排查与修复：整页 DST_IN 遮罩离屏层宽度解析异常的判定、背景色渐变条替代方案与快速排查清单
 - `docs/immersive-light-sense-api26-official.md` — API 26 官方沉浸光感能力的适用槽位与实证结论
 - `docs/新API26沉浸光感经验汇总.md` — 沉浸光感落地经验汇总（各页面清单与判据）
 - `docs/immersive-material-guide.md` — 沉浸材质总览指南

@@ -40,6 +40,28 @@ enum TabIndex {
   Mine = 4,
 }
 
+// ===== 底栏几何微调参数（手机档收一档，宽屏维持原值不动）=====
+// 调整口诀：BAR_H_PHONE 改 n，则 BAR_RADIUS_PHONE 同步改 n/2；
+// ITEM_H_PHONE 改 m，则 ITEM_RADIUS_PHONE 同步改 m/2（Glow 高度自动跟随条目高）。
+// 留白估算：上下留白 ≈ PAD_V_PHONE + (BAR_H_PHONE - ITEM_H_PHONE) / 2 + (ITEM_H_PHONE - 内容高) / 2
+const BAR_H_PHONE = 66;          // 手机档底栏总高（原 74）
+const BAR_RADIUS_PHONE = 33;     // 手机档胶囊圆角 = 栏高/2
+const ITEM_H_PHONE = 54;         // 手机档单条目高（原 58）
+const ITEM_RADIUS_PHONE = 27;    // 手机档条目圆角 = 条目高/2
+const PAD_V_PHONE = 4;           // 手机档条目行上下内边距（原 6）
+const BAR_H_WIDE = 74;           // 宽屏/平板**竖屏**档总高（维持现状，勿动）
+const BAR_RADIUS_WIDE = 37;
+const ITEM_H_WIDE = 58;
+const ITEM_RADIUS_WIDE = 29;
+const PAD_V_WIDE = 6;
+// 宽屏/平板**横屏**档（2026-09-14 用户反馈：横屏底栏内部偏高、图标文字上下留空多 → 收一档；竖屏不动）。
+// 同口诀：栏高改 n 则圆角改 n/2；条目高改 m 则条目圆角改 m/2。
+const BAR_H_WIDE_LAND = 62;      // 横屏底栏总高（竖屏 74）
+const BAR_RADIUS_WIDE_LAND = 31; // = 62/2
+const ITEM_H_WIDE_LAND = 50;     // 横屏单条目高（竖屏 58）
+const ITEM_RADIUS_WIDE_LAND = 25;// = 50/2
+const PAD_V_WIDE_LAND = 4;       // 横屏条目行上下内边距（竖屏 6）
+
 @Entry
 @Component
 struct Index {
@@ -67,6 +89,8 @@ struct Index {
   userProfileVerified: boolean = false;
   @State isWideScreen: boolean = false;
   @State currentWidth: number = 360;
+  /** 窗口高（vp）：与 currentWidth 配对做横竖屏判定（底栏三档几何）；onAreaChange 维护 */
+  @State currentHeight: number = 800;
   @StorageLink('fontScale') fontScale: number = 1.0;
   @StorageLink('favEditing') favEditing: boolean = false;
   @State materialSupported: boolean = true;
@@ -438,6 +462,7 @@ struct Index {
     .onAreaChange((oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
       this.currentWidth = width;
+      this.currentHeight = newValue.height as number;
       this.isWideScreen = width >= 840;
     })
   }
@@ -573,9 +598,9 @@ struct Index {
     .scrollable(false)
     .barOverlap(true)
     // favEditing（收藏编辑态）时把栏高收为 0：真实 Tabs 槽位即便 tabBar 内容为空，悬浮磨砂背板
-    // （barFloatingStyle + systemMaterial）仍会按 74vp 渲染，压住收藏页底部编辑操作栏；
+    // （barFloatingStyle + systemMaterial）仍会按 barHeightVal() 渲染，压住收藏页底部编辑操作栏；
     // 收为 0 后整条背板随栏一起消失（barOverlap 下内容区尺寸不变，PagesStack 不重建、页面状态不丢）
-    .barHeight(this.favEditing ? 0 : 74)
+    .barHeight(this.favEditing ? 0 : this.barHeightVal())
     .barBackgroundColor(Color.Transparent)
     // 收藏编辑态：barHeight 收 0 后官方悬浮背板（barFloatingStyle + systemMaterial）仍会残留一条磨砂，
     // 压住收藏页底部编辑按钮；故编辑态整体不传 floating style（Optional 传 undefined）彻底移除残留底栏
@@ -607,6 +632,47 @@ struct Index {
     return w > 240 ? w : 240;
   }
 
+  /** 平板横屏（2026-09-14 用户反馈：横屏底栏内部偏高一档；竖屏维持 74 不动） */
+  private isWideLandscape(): boolean {
+    return this.isWideScreen && this.currentWidth > this.currentHeight;
+  }
+
+  /** 底栏几何取值：手机档 / 平板竖屏档 / 平板横屏档（isWideScreen 冷启动首帧可能短暂按手机档渲染，onAreaChange 后纠正） */
+  private barHeightVal(): number {
+    if (!this.isWideScreen) {
+      return BAR_H_PHONE;
+    }
+    return this.isWideLandscape() ? BAR_H_WIDE_LAND : BAR_H_WIDE;
+  }
+
+  private barRadiusVal(): number {
+    if (!this.isWideScreen) {
+      return BAR_RADIUS_PHONE;
+    }
+    return this.isWideLandscape() ? BAR_RADIUS_WIDE_LAND : BAR_RADIUS_WIDE;
+  }
+
+  private itemHeightVal(): number {
+    if (!this.isWideScreen) {
+      return ITEM_H_PHONE;
+    }
+    return this.isWideLandscape() ? ITEM_H_WIDE_LAND : ITEM_H_WIDE;
+  }
+
+  private itemRadiusVal(): number {
+    if (!this.isWideScreen) {
+      return ITEM_RADIUS_PHONE;
+    }
+    return this.isWideLandscape() ? ITEM_RADIUS_WIDE_LAND : ITEM_RADIUS_WIDE;
+  }
+
+  private padVVal(): number {
+    if (!this.isWideScreen) {
+      return PAD_V_PHONE;
+    }
+    return this.isWideLandscape() ? PAD_V_WIDE_LAND : PAD_V_WIDE;
+  }
+
   @Builder
   FloatingBarSlot() {
     if (!this.favEditing) {
@@ -620,7 +686,7 @@ struct Index {
         }
         .width('100%')
         .height('100%')
-        .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+        .padding({ left: 8, right: 8, top: this.padVVal(), bottom: this.padVVal() })
 
         Row() {
           this.BottomItem('⌂', '首页', TabIndex.Home)
@@ -631,7 +697,7 @@ struct Index {
         }
         .width('100%')
         .height('100%')
-        .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+        .padding({ left: 8, right: 8, top: this.padVVal(), bottom: this.padVVal() })
       }
       .width('100%')
       .height('100%')
@@ -726,7 +792,7 @@ struct Index {
       }
       .width('100%')
       .height('100%')
-      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+      .padding({ left: 8, right: 8, top: this.padVVal(), bottom: this.padVVal() })
 
       Row() {
         this.BottomItem('⌂', '首页', TabIndex.Home)
@@ -737,16 +803,16 @@ struct Index {
       }
       .width('100%')
       .height('100%')
-      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+      .padding({ left: 8, right: 8, top: this.padVVal(), bottom: this.padVVal() })
     }
     .width(this.isWideScreen ? 480 : 'calc(100% - 48vp)')
-    .height(74)
+    .height(this.barHeightVal())
     // 本分支仅 API<26 执行（26+ 走 FloatingTabsShell 槽位材质），此时 manualGlass 即兜底视觉
     .backgroundColor(MaterialManager.isSupported() ? Color.Transparent : Theme.manualGlass(this.isDark))
     .border({ width: 0.5, color: Theme.manualGlassBorder() })
     .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.bar())
     .systemMaterial(ImmMaterial.bar())
-    .borderRadius(37)
+    .borderRadius(this.barRadiusVal())
     .shadow({
       radius: 24,
       color: this.isDark ? '#55000000' : '#30101824',
@@ -761,7 +827,7 @@ struct Index {
     if (this.selectedTab === index) {
       Blank()
         .layoutWeight(1)
-        .height(58)
+        .height(this.itemHeightVal())
         .margin({ left: 2, right: 2 })
     } else {
       Blank().layoutWeight(1)
@@ -786,9 +852,9 @@ struct Index {
           : $r('sys.color.font_primary'))
     }
     .layoutWeight(1)
-    .height(58)
+    .height(this.itemHeightVal())
     .justifyContent(FlexAlign.Center)
-    .borderRadius(29)
+    .borderRadius(this.itemRadiusVal())
     .backgroundColor(Color.Transparent)
     .scale({ x: this.selectedTab === index ? 1.05 : 1, y: this.selectedTab === index ? 1.05 : 1 })
     .animation({ duration: 360, curve: curves.springMotion(0.72, 0.86) })

@@ -57,6 +57,12 @@ const SUBPOST_MAIN_WIDTH: number = 420;
  * 手机档可用宽 ≈ 296vp < 上限 → 不生效（逐像素不变）。
  */
 const SUBPOST_IMAGE_GRID_MAX_WIDTH: number = 336;
+/**
+ * 回复区多列「列均衡」阈值（vp，方案 B 滞回，2026-09-14，与 §4.9 同款）：
+ * 轮转目标列与最短列的估算高差超过该值时，本卡改投最短列（补位）；否则照常轮转（保序）。
+ * 取 240 ≈ 一张短卡高：小波动不乱序（横向看楼层基本递增），只有连续长卡压弯一列才插空。
+ */
+const SUBPOST_COL_BALANCE_THRESHOLD: number = 240;
 
 /**
  * 内容卡片圆角（vp）：父楼层卡与楼中楼回复卡统一 26（2026-09-11 用户指定）。
@@ -733,17 +739,55 @@ struct SubPostDetail {
     }
   }
 
-  /** 回复交替分桶：`i % 列数` 轮流进列（与 §4.9 同一策略，零估算） */
+  /**
+   * 回复分桶（方案 B「带滞回的最短列」，2026-09-14，与 §4.9 同款）：默认按 `i % 列数` 轮转（保序），
+   * 仅当轮转目标列与最短列的估算高差 > `SUBPOST_COL_BALANCE_THRESHOLD` 时改投最短列补位。
+   * 高度确定性估算、前缀稳定贪心：翻页追加从头重算，旧卡落列不变（不跳位），定位 id 随卡走零改动。
+   */
   private commentColumnsData(): CommentItem[][] {
     const cols: number = this.replyColumns();
     const buckets: CommentItem[][] = [];
+    const heights: number[] = [];
     for (let c = 0; c < cols; c++) {
       buckets.push([]);
+      heights.push(0);
     }
+    // 列宽（估算正文换行用）：屏宽 − 横向 padding(左 8 + 右 lg) − 列间 gap(sm×(cols−1))
+    const colWidth: number = (this.currentWidth - 8 - Spacing.lg - Spacing.sm * (cols - 1)) / cols;
     for (let i = 0; i < this.commentsState.length; i++) {
-      buckets[i % cols].push(this.commentsState[i]);
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > SUBPOST_COL_BALANCE_THRESHOLD) {
+        target = shortest;
+      }
+      buckets[target].push(this.commentsState[i]);
+      heights[target] += this.estimateCommentCardHeight(this.commentsState[i], colWidth) + Spacing.sm;
     }
     return buckets;
+  }
+
+  /**
+   * 回复卡估算高（vp，仅供列均衡分桶，不求像素准只求相对准）：
+   * 头部 / 底部 / 卡内留白取常数 96；正文 = 行数 × 22（fs(14) 行高）+ 6（每行字数 ≈ 列宽 / 14）；
+   * 图片宫格 = 显式总高（行 × 120 + 间隙，与渲染同式）。各卡共享同一底数，常数误差在「列高差」里抵消。
+   */
+  private estimateCommentCardHeight(comment: CommentItem, colWidth: number): number {
+    let h: number = 96;
+    const text: string = comment.content ?? '';
+    if (text.length > 0) {
+      const charsPerLine: number = Math.max(10, Math.floor(colWidth / 14));
+      h += Math.min(Math.ceil(text.length / charsPerLine), 20) * 22 + 6;
+    }
+    const imgRows: number = Math.ceil((comment.images ?? []).length / 3);
+    if (imgRows > 0) {
+      h += imgRows * 120 + (imgRows - 1) * 6 + 8;
+    }
+    return h;
   }
 
   /** 单张回复卡（含定位锚点 id，竖屏 / 横屏 / 单列 / 多列共用同一份包装） */

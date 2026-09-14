@@ -88,6 +88,27 @@ export struct MessagesTab {
     deviceInfo.deviceType === 'tablet'
       || deviceInfo.deviceType === '2in1'
       || display.isFoldable();
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.4，2026-09-14 用户拍板：回复/提到我的采用首页同款
+  // 瀑布流观感，竖 3 / 横 4；按 floor-vanish 教训以「Scroll + 列内独立堆叠」实现，禁止回归虚拟滚动容器）=====
+  /** 窗口宽 / 高（vp）：aboutToAppear 首帧初值 + NotifyContent 根 Column onAreaChange 兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+
+  /** 横竖屏：宽高比（与 §4.1 / §4.2 同口径） */
+  private isLandscape(): boolean {
+    return this.pageWidth > this.pageHeight;
+  }
+
+  /** 列数：大屏竖 3 / 横 4；窄窗与手机 1 列（形态闸门放首行，防手机横屏误命中） */
+  private notifyColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < 600) {
+      return 1;
+    }
+    return this.isLandscape() ? 4 : 3;
+  }
   /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
   @State fadeCoverVp: number = 0;
   @State selectedTab: NotifyTab = NotifyTab.Reply;
@@ -106,6 +127,11 @@ export struct MessagesTab {
   // 「回复/提到」两页在 Tabs 中并存，各自镜像互不干扰。
   @State shownReply: NotifyTabState = new NotifyTabState();
   @State shownAt: NotifyTabState = new NotifyTabState();
+  // §4.4 真机修复：多列分桶结果**主动算好写入 @State**（同步在 syncAll）——原实现 UI 在 @Builder 内
+  // 经方法间接读取镜像，Tabs/TabContent 嵌套下 @State 替换未触发重渲染（数据到 175 条而 UI 停在第一页），
+  // 直接读 @State 数组绕开依赖收集问题
+  @State shownReplyCols: NotifyMessage[][] = [];
+  @State shownAtCols: NotifyMessage[][] = [];
   private tabsCtrl: TabsController = new TabsController();
 
   aboutToAppear(): void {
@@ -115,8 +141,11 @@ export struct MessagesTab {
     try {
       const d: display.Display = display.getDefaultDisplaySync();
       this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+      // §4.4：pageWidth / pageHeight 首帧初值（§6.2 第 6 步：形态判定须首帧就位，防多列闪变）
+      this.pageWidth = d.width / d.densityPixels;
+      this.pageHeight = d.height / d.densityPixels;
     } catch (e) {
-      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例；pageWidth=0 → notifyColumns()=1 安全方向
     }
     this.enterPage();
   }
@@ -194,10 +223,13 @@ export struct MessagesTab {
     return copy;
   }
 
-  /** 把两个 Tab 的缓存态同步成新 @State 镜像，分别驱动「回复/提到」两个列表刷新 */
+  /** 把两个 Tab 的缓存态同步成新 @State 镜像，分别驱动「回复/提到」两个列表刷新；
+   *  §4.4：分桶结果同步主动计算写入 @State（loadMessages 数据到达后的渲染驱动源） */
   private syncAll(): void {
     this.shownReply = this.snapshotOf(this.replyState);
     this.shownAt = this.snapshotOf(this.atState);
+    this.shownReplyCols = this.notifyColumnsData(this.replyState.list);
+    this.shownAtCols = this.notifyColumnsData(this.atState.list);
   }
 
   /** 读取指定 Tab 的展示镜像（TabContent 内各态判断/渲染共用） */
@@ -228,7 +260,10 @@ export struct MessagesTab {
     state.loadState = LoadState.Loading;
     state.errorMsg = '';
     // silent 刷新不清列表也不中途切 Loading：有旧内容不打断浏览，真·无消息时保持空态，结果返回后一次性更新
-    if (!silent) {
+    // §4.4 加载体验优化（2026-09-14）：**仅首屏 / 空列表**在加载前同步一次（需要 Loading / 空态切换）；
+    // 已有内容时跳过这一步——列表态不看 loadState，提前 syncAll 只会多一次整体重建（用户看到的"闪一下"），
+    // 改为结果返回后一次性 syncAll（静默加载，无中间态闪烁）
+    if (!silent && state.list.length === 0) {
       this.syncAll();
     }
     try {
@@ -255,6 +290,13 @@ export struct MessagesTab {
       }
     }
     this.syncAll();
+    // §4.4 真机修复（平板翻页卡死）：多列下内容可能填不满视口 → onReachEnd 永不触发。
+    // 每页加载完成后主动检查：内容高仍不足视口（+150 让位余量）就续拉下一页，
+    // 直到填满或 hasMore=false（本方法开头双重防重，递归每页一次、有限终止）
+    if (this.notifyColumns() > 1 && this.notifyContentH > 0 && this.notifyViewportH > 0
+      && this.notifyContentH < this.notifyViewportH + 150) {
+      this.loadMessages(tab, false);
+    }
   }
 
   /** 进入某 Tab 时按缓存/过期策略装载数据（点击与滑动共用入口） */
@@ -513,6 +555,82 @@ export struct MessagesTab {
       .hitTestBehavior(HitTestMode.None)
   }
 
+  /** §4.4 消息多列「列均衡」阈值（vp，方案 B 滞回，与 §4.9 / 收藏页同款） */
+  private static readonly NOTIFY_COL_BALANCE_THRESHOLD: number = 240;
+  // §4.4 真机修复（平板翻页卡死）：内容高 / 视口高记录（onAreaChange 写入）——平板多列把一页摊薄后
+  // 内容可能填不满视口 → onReachEnd 永不触发；且 minHeight 撑满下内容高度恒定、onAreaChange 也不再触发，
+  // 故 loadMessages 完成后须主动用这两个值判断「是否仍不足一屏」并续拉
+  private notifyContentH: number = 0;
+  private notifyViewportH: number = 0;
+  // §4.4 加载体验优化：两个子 Tab 各自的滚动位置与控制器——加载后 UI 重建时恢复到原位置，
+  // 避免滚动位置丢失造成的"跳一下"
+  private replyScroller: Scroller = new Scroller();
+  private atScroller: Scroller = new Scroller();
+  private replyScrollY: number = 0;
+  private atScrollY: number = 0;
+
+  /**
+   * 消息分桶（方案 B 带滞回最短列，2026-09-14）：默认 `i % 列数` 轮转（保序），
+   * 轮转列与最短列估算高差 > 阈值才补位；前缀稳定贪心 → 数据刷新从头重算、旧卡落列不变（不跳位）。
+   * 本页 floor-vanish 已实证虚拟滚动剔除风险 → 多列用「列内独立堆叠」+ Scroll 全量渲染，禁止 WaterFlow/List。
+   */
+  private notifyColumnsData(items: NotifyMessage[]): NotifyMessage[][] {
+    const cols: number = this.notifyColumns();
+    const buckets: NotifyMessage[][] = [];
+    const heights: number[] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+      heights.push(0);
+    }
+    const colWidth: number = (this.pageWidth - Spacing.lg * 2 - Spacing.md * (cols - 1)) / cols;
+    for (let i = 0; i < items.length; i++) {
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > MessagesTab.NOTIFY_COL_BALANCE_THRESHOLD) {
+        target = shortest;
+      }
+      buckets[target].push(items[i]);
+      heights[target] += this.estimateMessageCardHeight(items[i], colWidth) + Spacing.md;
+    }
+    return buckets;
+  }
+
+  /** §4.4：列索引数组 [0..列数-1]——外层 ForEach 只遍历索引，保证列容器 key 稳定可复用 */
+  private colIndexes(): number[] {
+    const n: number = this.notifyColumns();
+    const arr: number[] = [];
+    for (let i = 0; i < n; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  /** MessageCard 估算高（vp，仅供列均衡）：昵称行基线 + 标题 1 行 + 正文 ≤3 行 + 引用 ≤2 行 + 吧名行 */
+  private estimateMessageCardHeight(item: NotifyMessage, colWidth: number): number {
+    let h: number = 64; // 昵称/时间行 ~20 + 卡片上下 padding 32 + 首个 space
+    const textColWidth: number = Math.max(60, colWidth - 44 - Spacing.md - Spacing.lg * 2);
+    if (item.title.length > 0) {
+      h += 20 + 6;
+    }
+    if (item.content.length > 0) {
+      const cpl: number = Math.max(8, Math.floor(textColWidth / 14));
+      h += Math.min(Math.ceil(item.content.length / cpl), 3) * 20 + 6;
+    }
+    if (item.quoteContent.length > 0) {
+      const cpl2: number = Math.max(8, Math.floor(textColWidth / 12));
+      h += Math.min(Math.ceil(item.quoteContent.length / cpl2), 2) * 17 + 12 + 6;
+    }
+    if (item.forumName.length > 0) {
+      h += 16 + 6;
+    }
+    return h;
+  }
+
   /** 单个子 Tab 页：Loading/Error/Empty/消息列表四态，数据取自对应展示镜像 */
   @Builder
   TabPane(tab: NotifyTab) {
@@ -529,32 +647,111 @@ export struct MessagesTab {
       } else {
         // 消息卡全量渲染：沉浸布局 + 虚拟滚动(List)存在视口剔除误删项的风险，
         // 改用 Scroll + Column 全量真实布局规避（见 docs/floor-vanish-viewport-fix.md）
-        Scroll() {
-          Column({ space: Spacing.md }) {
-            ForEach(this.mirrorOf(tab).list, (item: NotifyMessage) => {
-              this.MessageCard(item)
-            }, (item: NotifyMessage) => item.id)
-
-            // 底部让位：保证内容可滚出底部渐隐/悬浮区
-            Column()
+        if (this.notifyColumns() > 1) {
+          // §4.4 平板多列（2026-09-14 用户拍板：回复/提到我的采用首页同款瀑布流观感，竖 3 / 横 4）：
+          // 「列内独立堆叠」Scroll 全量渲染——本页 floor-vanish 已实证虚拟滚动剔除风险，禁止回归 WaterFlow/List
+          Scroll(tab === NotifyTab.Reply ? this.replyScroller : this.atScroller) {
+            Column({ space: Spacing.md }) {
+              // §4.4 真机修复（2026-09-14 四轮）：多列块**内联**在此，不能再经 @Builder 传参——
+              // @Builder 参数按值传递时只有传入「状态变量本身」才触发刷新，传三元表达式（原写法）不触发
+              // → 数据加载了而界面永远停在第一页。内联后由 build 上下文直接读 @State，依赖可靠建立。
+              // §4.4 加载体验优化（2026-09-14 五轮）：外层 ForEach **只遍历列索引**（key 稳定 → 列容器复用、
+              // 不整列重建闪屏），内层数据源**直接读 @State 分桶数组** `shownReplyCols[colIdx]`——
+              // 若内层仍用外层传入的 col（上一版写法），列容器被复用时新数组传不进去 → 数据更新而 UI 不动
+              Row({ space: Spacing.md }) {
+                ForEach(this.colIndexes(), (colIdx: number) => {
+                  Column({ space: Spacing.md }) {
+                    ForEach(tab === NotifyTab.Reply ? this.shownReplyCols[colIdx] : this.shownAtCols[colIdx],
+                      (item: NotifyMessage) => {
+                        Column() {
+                          this.MessageCard(item)
+                        }
+                        // 新增卡片淡入（已有卡片按 key 复用，不闪）
+                        .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+                      }, (item: NotifyMessage) => `ncol_${item.id}`)
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+                }, (colIdx: number) => `ncolgrp_${colIdx}`)
+              }
               .width('100%')
-              .height(150)
+              .alignItems(VerticalAlign.Top)
+
+              // 底部让位：保证内容可滚出底部渐隐/悬浮区
+              Column()
+                .width('100%')
+                .height(150)
+            }
+            .width('100%')
+            // 修复"首卡上方大片空白"：内容不足一屏时 Scroll 会垂直居中 → 最小撑满视口贴顶（同单列口径）
+            .constraintSize({ minHeight: '100%' })
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: NOTIFY_TOP_PAD })
+            // 真机修复（2026-09-14）：平板 3/4 列把一页 20 条摊薄后内容可能填不满视口 → Scroll 无可滚
+            // 距离、onReachEnd 一次都不触发。内容高 / 视口高记录进字段（供 loadMessages 完成后主动判断续拉；
+            // minHeight 撑满下高度恒定、本回调未必再触发，故主动判断在 loadMessages 末尾兜底）
+            .onAreaChange((_o: Area, n: Area) => {
+              this.notifyContentH = n.height as number;
+              if (this.notifyContentH > 0 && this.notifyViewportH > 0
+                && this.notifyContentH < this.notifyViewportH + 150) {
+                this.loadMessages(tab, false);
+              }
+            })
           }
           .width('100%')
-          // 修复“首卡上方大片空白”：Scroll 内容高度不足一屏时会被整体垂直居中（实测
-          // 内容 2079 < 视口 2544 时 Column 起点 = 视口顶 + (2544-2079)/2）。
-          // 让内容列最小撑满视口即可贴顶显示，内容超出视口时不受影响。
-          .constraintSize({ minHeight: '100%' })
-          // 顶部让位：padding-top 计入内容、随滚动一起上移（沉浸），且不会被 Column space 再叠加一份
-          .padding({ left: Spacing.lg, right: Spacing.lg, top: NOTIFY_TOP_PAD })
+          .layoutWeight(1)
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .clip(false)
+          .align(Alignment.TopStart)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .onAreaChange((_o: Area, n: Area) => {
+            this.notifyViewportH = n.height as number;
+          })
+          .onScroll(() => {
+            // §4.4：实时记录滚动位置，供重建后恢复
+            if (tab === NotifyTab.Reply) {
+              this.replyScrollY = this.replyScroller.currentOffset().yOffset;
+            } else {
+              this.atScrollY = this.atScroller.currentOffset().yOffset;
+            }
+          })
+          .onAppear(() => {
+            // §4.4：加载后 UI 重建 → 立即恢复到重建前的滚动位置（用户感知"原地续接"，不跳）
+            if (tab === NotifyTab.Reply) {
+              this.replyScroller.scrollTo({ xOffset: 0, yOffset: this.replyScrollY });
+            } else {
+              this.atScroller.scrollTo({ xOffset: 0, yOffset: this.atScrollY });
+            }
+          })
+          .onReachEnd(() => { this.loadMessages(tab, false); })
+        } else {
+          Scroll(tab === NotifyTab.Reply ? this.replyScroller : this.atScroller) {
+            Column({ space: Spacing.md }) {
+              ForEach(this.mirrorOf(tab).list, (item: NotifyMessage) => {
+                this.MessageCard(item)
+              }, (item: NotifyMessage) => item.id)
+
+              // 底部让位：保证内容可滚出底部渐隐/悬浮区
+              Column()
+                .width('100%')
+                .height(150)
+            }
+            .width('100%')
+            // 修复“首卡上方大片空白”：Scroll 内容高度不足一屏时会被整体垂直居中（实测
+            // 内容 2079 < 视口 2544 时 Column 起点 = 视口顶 + (2544-2079)/2）。
+            // 让内容列最小撑满视口即可贴顶显示，内容超出视口时不受影响。
+            .constraintSize({ minHeight: '100%' })
+            // 顶部让位：padding-top 计入内容、随滚动一起上移（沉浸），且不会被 Column space 再叠加一份
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: NOTIFY_TOP_PAD })
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .onReachEnd(() => { this.loadMessages(tab, false); })
         }
-        .width('100%')
-        .layoutWeight(1)
-        .scrollBar(BarState.Off)
-        .edgeEffect(EdgeEffect.Spring)
-        .clip(false)
-        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .onReachEnd(() => { this.loadMessages(tab, false); })
       }
     }
     .width('100%')
@@ -598,6 +795,11 @@ export struct MessagesTab {
       }
     .width('100%')
     .height('100%')
+    // §4.4：根容器实宽 / 实高 → 形态判定与列数（首帧由 aboutToAppear 兜底）
+    .onAreaChange((_old: Area, n: Area) => {
+      this.pageWidth = n.width as number;
+      this.pageHeight = n.height as number;
+    })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .overlay(this.BottomFadeOverlay())
     .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)

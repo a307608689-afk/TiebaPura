@@ -21,7 +21,9 @@ import { CACHE_KEY } from '../common/Constants';
 import { PersonalContentItem, PagedResult } from '../model/DataModel';
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop } from '../common/Theme';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { display } from '@kit.ArkUI';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 
 enum PersonalMode {
@@ -41,6 +43,13 @@ const PERSONAL_CONTENT_OFFICIAL_TITLE_BAR: boolean = true;
 /** 槽位高度 = 44(状态栏让位) + 44(按钮行高) + 10(底部呼吸)，与原悬浮 TopBar 的 padding 逐项一致；
  *  内容让位（List 首项占位 98）一行未改。 */
 const PERSONAL_CONTENT_TITLE_BAR_HEIGHT: number = 98;
+/**
+ * 「我的帖子 / 我的点赞 / 浏览历史（/ 我的收藏）」多列「列均衡」阈值（vp，方案 B 滞回，2026-09-14，
+ * 与 §4.9 / §4.10 / §4.8 T-D 同款）：轮转目标列与最短列的估算高差超过该值时改投最短列（补位）。
+ * ContentCard 无图片区（仅标题/摘要 ≤2 行 + 信息行），高度差 ≤80vp，滞回 240 下几乎恒为纯轮转（保序），
+ * 只有极端长短交错才补位。
+ */
+const PERSONAL_COL_BALANCE_THRESHOLD: number = 240;
 
 @Entry
 @Component
@@ -56,6 +65,19 @@ struct PersonalContent {
   @State hasMore: boolean = true;
   @State accountId: string = '';
   @StorageLink('fontScale') fontScale: number = 1.0;
+
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.11，2026-09-14）=====
+  /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别（§4.8 T-B 同款） */
+  private readonly isWideFormDevice: boolean =
+    deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable();
+  /** 窗口宽 / 高（vp）：aboutToAppear 同步取首帧初值，onAreaChange 实时兜底 */
+  @State pageWidth: number = 0;
+  @State pageHeight: number = 0;
+  private isLandscape: boolean = false;
+  /** 内容区实宽（vp）：分桶估算列宽用，根 Stack onAreaChange 维护 */
+  @State currentWidth: number = 0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位，否则回退自绘玻璃 TopBar（与 ThreadDetail 同判据） */
@@ -76,7 +98,27 @@ struct PersonalContent {
     this.title = this.modeTitle(this.mode);
     this.isDark = isDarkMode();
     this.accountId = AuthManager.getInstance().getUser()?.userId ?? '';
+    // 首帧形态初值（§4.6 H-A / §4.8 T-B 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏
+    // 若不预置会出现「先 1 列再跳 3/4 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
+    this.refreshFormMetrics();
     this.loadItems();
+  }
+
+  /** 形态度量回填（display 实时值）：aboutToAppear 首帧 + 根 Stack onAreaChange 兜底共用 */
+  private refreshFormMetrics(): void {
+    try {
+      const d = display.getDefaultDisplaySync();
+      const w: number = this.getUIContext().px2vp(d.width);
+      const h: number = this.getUIContext().px2vp(d.height);
+      if (w <= 0 || h <= 0) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
+      this.isLandscape = w > h;
+    } catch (e) {
+      // 忽略：窗口未 attach 时取宽会失败
+    }
   }
 
   private modeTitle(mode: string): string {
@@ -162,13 +204,40 @@ struct PersonalContent {
           ListItem() {
             Column().width('100%').height(98)
           }
-          // key 只用 tid：tid 是合并去重的主键，用 `${id}_${tid}` 时同一条帖的 id 若在
-          // 本地缓存 / 云端之间不一致会换 key，导致 ListItem 被销毁重建（闪现）。
-          ForEach(this.items, (item: PersonalContentItem) => {
+          if (this.pcColumns() > 1) {
+            // 多列档（§4.11 P-B，2026-09-14）：列内独立堆叠瀑布流（与首页 / 收藏页 / 搜索页同款观感）。
+            // 结构照收藏页五轮教训：外层 ForEach **只遍历列索引**（key 稳定 → 列容器复用），
+            // 内层数据源**直读状态源** `pcColumnsData()[colIdx]`（不用外层传入 col，否则复用断链不更新）；
+            // ⚠️ 列外必须有**横排 Row**（首个版本漏了 → 4 个 ListItem 纵排通栏，视觉与单列无异）；
+            // List 容器不变 → onReachEnd / onScrollIndex / 滚动架构零改动。
             ListItem() {
-              this.ContentCard(item)
+              Row({ space: 6 }) {
+                ForEach(this.pcColIndexes(), (colIdx: number) => {
+                  Column({ space: 6 }) {
+                    ForEach(this.pcColumnsData()[colIdx], (item: PersonalContentItem) => {
+                      Column() {
+                        this.ContentCard(item, 0)
+                      }
+                      .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+                    }, (item: PersonalContentItem) => item.tid)
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+                }, (colIdx: number) => `pcol_${colIdx}`)
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Top)
             }
-          }, (item: PersonalContentItem) => item.tid)
+          } else {
+            // 单列档：逐像素保持改造前结构
+            // key 只用 tid：tid 是合并去重的主键，用 `${id}_${tid}` 时同一条帖的 id 若在
+            // 本地缓存 / 云端之间不一致会换 key，导致 ListItem 被销毁重建（闪现）。
+            ForEach(this.items, (item: PersonalContentItem) => {
+              ListItem() {
+                this.ContentCard(item, Spacing.md)
+              }
+            }, (item: PersonalContentItem) => item.tid)
+          }
         }
         .layoutWeight(1)
         .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
@@ -180,7 +249,15 @@ struct PersonalContent {
         .onReachEnd(() => { this.loadMore(); })
         // 距末尾还有 5 项就提前取下一页：让追加落在视口下方、在用户滑到底部边界之前完成，
         // 避免「边界回弹的瞬间插入新内容」造成抽搐；onReachEnd 保留作兜底（列表不满一屏等）。
+        // 多列档整个内容区只有 1 个 ListItem（内含横排 Row）→ end >= 1 即「内容行可见」时提前取
+        // （loadMore 有 loadingMore 防抖，重复触发无副作用；内容超过一屏后 end 恒为 1 → 相当于持续预取位）。
         .onScrollIndex((start: number, end: number) => {
+          if (this.pcColumns() > 1) {
+            if (end >= 1) {
+              this.loadMore();
+            }
+            return;
+          }
           if (end >= this.items.length - 5) {
             this.loadMore();
           }
@@ -196,6 +273,11 @@ struct PersonalContent {
     .height('100%')
     .backgroundColor(Theme.bg(this.isDark))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    // 内容区实宽（分桶估算列宽用）+ 形态变化兜底（横竖屏 / 分屏拖宽：§4.11 P-B，与 §4.8 T-B 同款同点追加）
+    .onAreaChange((_old: Area, n: Area) => {
+      this.currentWidth = n.width as number;
+      this.refreshFormMetrics();
+    })
   }
 
   build() {
@@ -291,9 +373,88 @@ struct PersonalContent {
     return merged;
   }
 
+  /**
+   * 列数：大屏竖屏 3 / 横屏 4（与首页 §4.2 决策 12 同口径，§4.11 P-B）。
+   * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
+   */
+  private pcColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 1;
+    }
+    if (this.pageWidth < Breakpoint.sm) {
+      return 1;
+    }
+    return this.isLandscape ? 4 : 3;
+  }
+
+  /** 列索引数组 [0..列数-1]：外层 ForEach 只遍历索引（key 稳定 → 列容器复用，收藏页五轮教训） */
+  private pcColIndexes(): number[] {
+    const n: number = this.pcColumns();
+    const arr: number[] = [];
+    for (let i = 0; i < n; i++) {
+      arr.push(i);
+    }
+    return arr;
+  }
+
+  /**
+   * 内容分桶（方案 B「带滞回的最短列」，2026-09-14，与 §4.9 / §4.10 / §4.8 T-D 同款）：
+   * 默认按 `i % 列数` 轮转（保序观感），仅当轮转目标列与最短列的估算高差
+   * > `PERSONAL_COL_BALANCE_THRESHOLD` 时改投最短列补位。
+   * ContentCard 无图片区、高度差 ≤80vp → 滞回 240 下几乎恒为纯轮转；确定性估算、无测量循环；
+   * 前缀稳定贪心：翻页追加从头重算，旧卡落列不变（不跳位）。
+   */
+  private pcColumnsData(): PersonalContentItem[][] {
+    const cols: number = this.pcColumns();
+    const buckets: PersonalContentItem[][] = [];
+    const heights: number[] = [];
+    for (let c = 0; c < cols; c++) {
+      buckets.push([]);
+      heights.push(0);
+    }
+    // 列宽（估算换行用）：内容区宽 − List 左右 padding(lg×2) − 列间 gap(6×(cols−1))
+    const colWidth: number = (this.currentWidth - Spacing.lg * 2 - 6 * (cols - 1)) / cols;
+    for (let i = 0; i < this.items.length; i++) {
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > PERSONAL_COL_BALANCE_THRESHOLD) {
+        target = shortest;
+      }
+      buckets[target].push(this.items[i]);
+      // 列内间距 6 = 渲染层 `Column({ space: 6 })`（卡片 margin 已参数化为 0，2026-09-14）
+      heights[target] += this.estimateContentCardHeight(this.items[i], colWidth) + 6;
+    }
+    return buckets;
+  }
+
+  /**
+   * ContentCard 估算高（vp，仅供列均衡分桶，不求像素准只求相对准，与渲染同式）：
+   * padding(lg×2=32) + 信息行 ~16 + 间距 = 常数底数 62；
+   * 标题 ≤2 行（fs16→行高 22）、摘要 ≤2 行（fs13→行高 18），每行字数按列宽折算。
+   * 多列档卡片无底部外距（margin 参数化为 0），列间距由分桶循环的 +6 承担。
+   */
+  private estimateContentCardHeight(item: PersonalContentItem, colWidth: number): number {
+    let h: number = 62;
+    const title: string = item.title ?? '';
+    if (title.length > 0) {
+      const cpl: number = Math.max(8, Math.floor(colWidth / 16));
+      h += Math.min(Math.ceil(title.length / cpl), 2) * 22 + 6;
+    }
+    const abs: string = item.abstract ?? '';
+    if (abs.length > 0) {
+      const cpl2: number = Math.max(10, Math.floor(colWidth / 13));
+      h += Math.min(Math.ceil(abs.length / cpl2), 2) * 18 + 6;
+    }
+    return h;
+  }
+
   /** 触底翻页：收藏走 offset，点赞走 1 基页码 pn（服务端 data.has_more 判定） */
-  private async loadMore(): Promise<void> {
-    if (this.loading || this.loadingMore || !this.hasMore) return;
+  private async loadMore(): Promise<void> {    if (this.loading || this.loadingMore || !this.hasMore) return;
     const isLikes: boolean = this.mode === PersonalMode.Likes;
     if (!isLikes && this.mode !== PersonalMode.Collections) return;
     this.loadingMore = true;
@@ -387,8 +548,13 @@ struct PersonalContent {
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
   }
 
+  /**
+   * 内容卡。`bottomMargin` = 卡片底部外距：**单列档传 `Spacing.md`(12)**（原样承担手机行间距，
+   * 逐像素不变）；**多列档传 0**（列内间距由外层 `Column({ space: 6 })` 承担 → 上下 6 = 左右列间 6，
+   * 2026-09-14 用户要求「上下间距跟左右间距一致」；原样叠加会造成上下 18 vs 左右 6）。
+   */
   @Builder
-  ContentCard(item: PersonalContentItem) {
+  ContentCard(item: PersonalContentItem, bottomMargin: number) {
     Column({ space: 6 }) {
       Text(item.title)
         .fontSize(fs(16, this.fontScale))
@@ -424,7 +590,7 @@ struct PersonalContent {
     // 卡片圆角 26：我的帖子 / 我的点赞 / 浏览历史 / 我的收藏四页共用本卡片，与首页 ThreadCard、
     // 详情页卡片统一口径（不借用全局 Radius.lg）
     .borderRadius(26)
-    .margin({ bottom: Spacing.md })
+    .margin({ bottom: bottomMargin })
     .onClick(() => {
       // 点击即预取：利用跳转动画窗口后台取详情，详情页打开即命中缓存秒开
       TiebaService.getInstance().prefetchThreadDetail(`${item.tid}`, '');

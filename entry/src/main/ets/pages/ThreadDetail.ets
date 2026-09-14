@@ -103,6 +103,12 @@ const DETAIL_IMAGE_GRID_MAX_WIDTH: number = 336;
  * 跳转框（原回复框）在岛内为 `layoutWeight(1)`，随岛宽自动拉伸，无需单独处理。
  */
 const DETAIL_DOCK_TABLET_WIDTH: number = 592;
+/**
+ * 回复区多列「列均衡」阈值（vp，方案 B 滞回，2026-09-14）：
+ * 轮转目标列与最短列的估算高差超过该值时，本卡改投最短列（补位）；否则照常轮转（保序）。
+ * 取 240 ≈ 一张短卡高：小波动不乱序（横向看楼层基本递增），只有连续长卡压弯一列才插空。
+ */
+const DETAIL_COL_BALANCE_THRESHOLD: number = 240;
 
 // 官方贴吧（鸿蒙版）包名与帖子页 URL 模板：跳转仅携带 tid，不含任何登录态参数
 const TIEBA_OFFICIAL_BUNDLE: string = 'com.baidu.tiebaapp';
@@ -2481,17 +2487,61 @@ struct ThreadDetail {
     }
   }
 
-  /** 楼层交替分桶：`i % 列数` 轮流进列（顺序观感与瀑布流一致，零估算） */
+  /**
+   * 楼层分桶（方案 B「带滞回的最短列」，2026-09-14）：默认按 `i % 列数` 轮转（保序观感），
+   * 仅当轮转目标列与最短列的估算高差 > `DETAIL_COL_BALANCE_THRESHOLD`（≈一张短卡高）时
+   * 改投最短列补位 —— 连续一列短卡 / 一列长卡时列尾差被钳回一卡以内，且穿插次数最少。
+   * 高度为**确定性估算**（正文行数 + 图片宫格行 + 楼中楼条 + 固定件），同步可算、无测量循环；
+   * 分桶是前缀稳定贪心：翻页追加时从头重算，旧卡落列不变（不跳位），定位 / 高亮 id 随卡走零改动。
+   */
   private floorColumnsData(): FloorItem[][] {
     const cols: number = this.replyColumns();
     const buckets: FloorItem[][] = [];
+    const heights: number[] = [];
     for (let c = 0; c < cols; c++) {
       buckets.push([]);
+      heights.push(0);
     }
+    // 列宽（估算正文换行用）：屏宽 − 横向 padding(lg×2) − 列间 gap(md×(cols−1))
+    const colWidth: number = (this.currentWidth - Spacing.lg * 2 - Spacing.md * (cols - 1)) / cols;
     for (let i = 0; i < this.floors.length; i++) {
-      buckets[i % cols].push(this.floors[i]);
+      let target: number = i % cols;
+      let shortest: number = 0;
+      for (let c = 1; c < cols; c++) {
+        if (heights[c] < heights[shortest]) {
+          shortest = c;
+        }
+      }
+      if (heights[target] - heights[shortest] > DETAIL_COL_BALANCE_THRESHOLD) {
+        target = shortest;
+      }
+      buckets[target].push(this.floors[i]);
+      heights[target] += this.estimateFloorCardHeight(this.floors[i], colWidth) + Spacing.md;
     }
     return buckets;
+  }
+
+  /**
+   * 楼层卡估算高（vp，仅供列均衡分桶，不求像素准只求相对准）：
+   * 头部 / 底部 / 卡内留白取常数 128；正文 = 行数 × 26（行高）+ 8（每行字数 ≈ 列宽 / 16 字号）；
+   * 图片宫格 = 显式总高（行 × 120 + 间隙，与渲染同式）；楼中楼预览条 40。
+   * 各卡共享同一底数，常数误差在「列高差」里互相抵消。
+   */
+  private estimateFloorCardHeight(floor: FloorItem, colWidth: number): number {
+    let h: number = 128;
+    const text: string = floor.contentText ?? '';
+    if (text.length > 0) {
+      const charsPerLine: number = Math.max(8, Math.floor(colWidth / 16));
+      h += Math.min(Math.ceil(text.length / charsPerLine), 20) * 26 + 8;
+    }
+    const imgRows: number = Math.ceil((floor.images ?? []).length / 3);
+    if (imgRows > 0) {
+      h += imgRows * 120 + (imgRows - 1) * 6 + 12;
+    }
+    if ((floor.comments ?? []).length > 0 || (floor.commentsTotal ?? 0) > 0) {
+      h += 40;
+    }
+    return h;
   }
 
   /** 单张楼层卡（含定位锚点 id 与高亮底，竖屏 / 横屏 / 单列 / 多列共用同一份包装） */

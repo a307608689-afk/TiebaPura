@@ -376,8 +376,6 @@ export struct ForumsTab {
     deviceInfo.deviceType === 'tablet'
       || deviceInfo.deviceType === '2in1'
       || display.isFoldable();
-  /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
-  @State fadeCoverVp: number = 0;
   @State loggedIn: boolean = false;
   @State forumState: LoadState = LoadState.Loading;
   @State follows: FollowItem[] = [];
@@ -425,6 +423,13 @@ export struct ForumsTab {
   private signAllNotifyTitle: string = '一键签到完成';
   @State isDark: boolean = isDarkMode();
   @State isWideScreen: boolean = false;
+  // ===== 平板适配（docs/TiebaPura平板适配.md §4.1，2026-09-14 开工：竖 3 / 横 4，手机 2 列不变）=====
+  /** 横竖屏：宽高比（不用宽度阈值，13 寸平板竖屏也有 ~960vp） */
+  @State isLandscape: boolean = false;
+  /** 窗口宽（vp）：列数判定依赖，aboutToAppear 首帧 + 根容器 onAreaChange 兜底 */
+  @State pageWidth: number = 0;
+  /** 窗口高（vp）：与 pageWidth 配对判横竖屏 */
+  @State pageHeight: number = 0;
   @StorageLink('fontScale') fontScale: number = 1.0;
   // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
   @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
@@ -485,7 +490,9 @@ export struct ForumsTab {
   private dialogCardWidth(): number {
     const info: display.Display = display.getDefaultDisplaySync();
     const widthVp: number = info.width / info.densityPixels;
-    return Math.max(200, widthVp - 48);
+    // §4.1 顺带（2026-09-14）：平板封顶 400（系统弹窗默认宽度上限），与 ThreadList §4.8 T-H /
+    // 收藏页同款；手机档 312 < 400 逐像素不变
+    return Math.max(200, Math.min(400, widthVp - 48));
   }
 
   /** showSignAll 变化即驱动系统弹窗 open/close（保留既有 `this.showSignAll = x` 调用点） */
@@ -542,9 +549,12 @@ export struct ForumsTab {
     // 顶部渐显带覆盖基准（平板收窄用）：取屏幕长边（竖屏视口高），窗口未 attach 时忽略
     try {
       const d: display.Display = display.getDefaultDisplaySync();
-      this.fadeCoverVp = Math.max(d.width, d.height) / d.densityPixels;
+      // §4.1：列数首帧初值（防横屏先 3 列再跳 4 列）
+      this.pageWidth = d.width / d.densityPixels;
+      this.pageHeight = d.height / d.densityPixels;
+      this.isLandscape = d.width > d.height;
     } catch (e) {
-      // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例
+      // 忽略：窗口未 attach，pageWidth 保持 0 → 列数回落手机档（安全方向）
     }
     // 一键签到开关（慢速模式 / 官方一键签到）恢复：未初始化过才真正读缓存
     AutoSignManager.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
@@ -1354,24 +1364,51 @@ export struct ForumsTab {
     .backgroundColor(Color.Transparent)
   }
 
-  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（98vp 折算），手机维持 15% */
-  private topFadeStop(): number {
-    if (!this.isWideFormDevice || this.fadeCoverVp <= 0) {
-      return 0.15;
+  /**
+   * §4.1 平板列数（2026-09-14 开工）：大屏横 4 / 竖 3；窄窗与手机维持 2 列。
+   * 判据三层：① 大屏形态闸门（deviceType tablet/2in1 或 isFoldable——折叠屏 deviceType 为 'phone'）；
+   * ② 宽度门槛 600（兜住折叠态 / 分屏 / 自由多窗窄窗）；③ 宽高比判横竖屏。
+   * 「最小单列宽保护」按用户拍板**不启用**（先用主方案看真机）；「创建吧」卡片随流、不独占。
+   */
+  private forumColumns(): number {
+    if (!this.isWideFormDevice) {
+      return 2;
     }
-    return Math.min(0.15, 98 / this.fadeCoverVp);
+    if (this.pageWidth < 600) {
+      return 2;
+    }
+    return this.isLandscape ? 4 : 3;
   }
 
+  /** 列数 → Grid 列模板（手机 2 / 平板竖 3 / 平板横 4） */
+  private columnsTemplateOf(n: number): string {
+    if (n >= 4) {
+      return '1fr 1fr 1fr 1fr';
+    }
+    if (n === 3) {
+      return '1fr 1fr 1fr';
+    }
+    return '1fr 1fr';
+  }
+
+  /**
+   * 顶部满宽渐显带（2026-09-14 顺带修复，同 `docs/fade-band-fullwidth-fix.md`）：原整页 DST_IN
+   * 遮罩（挂滚动层）离屏层宽度解析异常 → 渐显带右缘缺一条竖带。改 **背景色渐变条** 挂在页面顶层：
+   * 下层是纯背景色，背景色渐变条叠加 = 视觉等价渐隐，宽度不依赖滚动容器 / 离屏层解析。
+   * 高 98 = 顶栏（按钮 + 标题）；渐变自顶部线性、无全实段（否则内容到顶栏会被"硬切"）。
+   */
   @Builder
-  BottomFadeOverlay() {
-    Stack()
-      .height('100%')
+  TopFadeBand() {
+    Column()
       .width('100%')
+      .height(98)
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
 
@@ -1784,7 +1821,7 @@ export struct ForumsTab {
                   }
                 }, (forum: FollowItem) => forum.forumName)
               }
-              .columnsTemplate(this.isWideScreen ? '1fr 1fr 1fr' : '1fr 1fr')
+              .columnsTemplate(this.columnsTemplateOf(this.forumColumns()))
               .columnsGap(Spacing.md)
               .rowsGap(Spacing.md)
               .width('100%')
@@ -1803,8 +1840,10 @@ export struct ForumsTab {
     .scrollBar(BarState.Off)
     .clip(false)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .overlay(this.BottomFadeOverlay())
-    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+
+    // §4.1 顺带（2026-09-14）：顶部渐显带改挂页面层（盖列表内容）；位置在悬浮 TopBar **之前**，
+    // 故不会盖住顶栏按钮——官方 title 槽位路径 TopBar 在 Navigation title 层，更不受影响
+    this.TopFadeBand()
 
     // 悬浮TopBar层（内容可穿过TopBar区域）；官方 title 槽位路径下三钮已在槽位里，这里不再叠一层
     if (!FORUMS_OFFICIAL_TITLE_BAR) {
@@ -1837,7 +1876,12 @@ export struct ForumsTab {
     .backgroundColor(Color.Transparent)
     .onAreaChange((oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
+      const height = newValue.height as number;
       this.isWideScreen = width >= 840;
+      // §4.1：窗口宽 / 高 → 列数判定
+      this.pageWidth = width;
+      this.pageHeight = height;
+      this.isLandscape = width > height;
     })
   }
 

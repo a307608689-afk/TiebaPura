@@ -31,6 +31,37 @@
 > 更新：2026-09-13 · **§4.8 吧内帖子列表渐显带平板收窄（同五页批次）**：用户反馈吧内页同况 → ThreadList 的 `BottomFadeOverlay()`（写死 0.15，多列 WaterFlow 与单列 Scroll 两处挂点共用）接 `topFadeStop()`：平板 = `min(0.15, THREAD_LIST_HEADER_TOP_SPACE(90) / pageHeight)`（吧头让位 90 折算；pageHeight 为实时窗口高，横竖屏都准；**分母不用 viewportH**——那是 Scroll 视口高、已被顶栏与底栏让位吃掉，与窗口高不等，见 §4.8 字段注释），手机 0.15。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m23s）；**lint 0**；**待真机复验**（平板吧内页渐显只到吧头顶缘、手机不变）。
 > 更新：2026-09-13 · **§4.2 / 消息页渐显带收窄补漏（首页与消息页首轮未生效的根因）**：用户反馈首页与消息页仍覆盖过深 → ① **首页**：`updateFadeStop()` / `fadeStop` 是**无消费点的历史遗留**（§4.2 决策 5 时代残留），首页真正的渐显是自带的 `BottomFadeOverlay()`（写死 0.15，两条 feed 各挂一次）→ 已接 `topFadeStop()`（平板 = `HOME_TITLE_BAR_HEIGHT(108) / pageHeight` 实时窗口高，手机 0.15）；`updateFadeStop` / `fadeStop` / `HOME_FADE_MIN/MAX` 保留为无害遗留（后续 H-F 类清理项）。② **消息页**：底部 Tab 的消息页实际是 **`MessagesTab.ets`**（通知中心），首轮误改的 `Message.ets` 是另一路由页 → MessagesTab 已补同款收窄（isWideFormDevice + fadeCoverVp 长边 + topFadeStop 98 折算）。`tools/build.ps1` → **BUILD SUCCESSFUL**（56s）；**lint 0**；**待真机复验**（平板竖屏首页两条 feed 与消息页渐显只到顶栏底缘；手机不变）。
 > 更新：2026-09-13 · **五个 Tab 页顶部渐显带平板收窄（只覆盖顶部按钮与标题）**：用户真机反馈平板竖屏下首页 / 进吧 / 收藏 / 消息 / 我的五页的顶部满宽渐显带覆盖过深（到首页第一个卡片用户名位置），要求只覆盖顶部按钮与标题 → 根因 = 各页渐显 stop 按比例（0.15 / 0.20 / 动态夹取 [108,180]），平板竖屏 800vp 下即 120~160vp，远超顶栏 98。**修复（形态分档，手机零变化）**：① **HomeTab**：`updateFadeStop()` 平板档 raw 直接取 `HOME_TITLE_BAR_HEIGHT`(108)，手机维持 `vh × 0.15` 夹取；② **ForumsTab / Message / MineTab**：各新增 `isWideFormDevice` + `fadeCoverVp`（屏幕长边，aboutToAppear 取）+ `topFadeStop()`（平板 = `min(0.15, 98/长边)`，手机 0.15），`BottomFadeOverlay` 中间 stop 改走该方法；③ **Favorite**：同款但覆盖基准 = **132vp**（TopBar 98 + 分段切换区至 132，避免分段区下沿内容突兀变实），手机 0.20。补 import：ForumsTab / Favorite 加 `deviceInfo`，Message / MineTab 加 `deviceInfo + display`。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m00s）；**lint 0**；**待真机复验**（平板竖屏五页渐显只到顶栏底缘〔收藏到分段区底〕、卡片内容清晰；手机五页渐显逐像素不变；平板横屏渐显同步收窄）。
+> 更新：2026-09-14 · **渐显带修复经验沉淀为新文档 `docs/fade-band-fullwidth-fix.md`**：四轮排查（挂点回迁 / 容器显式宽 / Refresh 全宽 / 弃 DST_IN 改背景色渐变条）+ 硬切教训 + 快速排查清单 + 层级表，后续其它页面渐显带同类问题直接套用；README 维护文档清单同步登记。
+> 更新：2026-09-15 · **§4.11 他人信息页平板适配落地（用户重定方案，构建通过）**：用户重新拍板 2 项并当场落地——① **发布的帖子 + 关注的吧都采用首页同款瀑布流竖 3 / 横 4**（原 §4.11「`List + lanes` 竖 2 / 横 3」方案作废）：判据从零建补齐（`isWideFormDevice` + `refreshFormMetrics()` 首帧/onAreaChange 兜底 + `profileColumns()` 闸门+≥600+横4/竖3；`isWideScreen`(840) 系底部浮槽胶囊旧判据保留不动）；两 Tab 均改**列内独立堆叠**——`ListItem > Row({space:8}) > ForEach(列索引) > Column.layoutWeight(1)`（§4.12 修复后结构：列外必须有横排 Row、内层直读 `bucketColumns(...)[colIdx]`），通用 `bucketColumns<T>()` 方案 B（阈值 240，LikeCard 等高小卡恒为纯轮转）；间距语言 = List space 8 全同源（卡片无 margin，列内 8 = 列间 8 天然一致）；`Header` / 顶部 98 占位 / 底部 160 占位保持通栏；`onReachEnd` 分页 / 骨架（columns 默认 1 红线）/ 沉浸挂点零改动。② **弹窗不拉伸**：取消关注 / 拉黑确认两处自绘浮层卡片 `calc(100%−48vp)` → **`panelWidth()` = max(200, min(400, 屏宽−48))**（T-H 同款，手机 312 逐像素不变）；排序菜单 bindMenu 宽 180 固定不受影响；LegacyShell 底部胶囊（API<26 兜底）非弹窗不动。原 §4.11 「用户信息居中已满足零改动」结论维持。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m03s）；**lint 0**；**待真机复验**（两 Tab 竖 3 / 横 4 瀑布流、弹窗居中 400 不拉伸、翻页不跳位、手机单列与弹窗 312 逐像素不变、折叠屏展开↔折叠切换）。
+> 更新：2026-09-15 · **§4.7 全吧搜索平板适配落地（用户重定方案，构建通过）**：用户不按原 §4.7 方案（横屏搜索框封顶 1000 / 宽高比判据等），重新拍板 3 项并当场落地——① **底栏不拉伸**：`pillWidth()` 形态分档，平板档封顶 **480**（与首页底栏平板档同口径，同为 icon+文字三钮栏），手机档「屏宽−48」逐像素不变；② **搜吧 / 搜人页竖 3 / 横 4 列**：`ForumResults` / `UserResults` 相关吧列表、用户列表改**列内独立堆叠**（推荐位 exact 卡、空态、ModuleFooter 保持通栏）；③ **搜贴页首页同款瀑布流竖 3 / 横 4**：`PostResults` 改列内独立堆叠 + **方案 B 带滞回最短列分桶**（通用 `bucketColumns<T>()`，阈值 240；估算器按多列档口径——PostCard 标题/摘要 ≤2 行、Forum/User 卡头像行+slogan/intro ≤1 行）。判据从零建（§4.12 模板）：`isWideFormDevice` + `refreshFormMetrics()`（aboutToAppear 首帧 + 根容器 onAreaChange 兜底）+ `searchColumns()`（闸门 + ≥600 + 横 4 / 竖 3）；结构照收藏页五轮教训（外层 ForEach 遍历列索引、内层直读 `bucketColumns(...)[colIdx]`）。三个模块共居 `Tabs+TabContent` 滚动容器（非 List），无 ListItem 迁移、无骨架/预加载改动；模块对滑动画 / 沉浸属性零改动。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m12s）；**lint 0**；**待真机复验**（搜吧/搜人/搜贴三模块 3/4 列、底栏 480 居中不拉伸、翻页不跳位、手机单列逐像素不变；另注：搜吧/搜人数据当前因旧 web 端点停摆必空——多列空态即空态居中，不受影响）。
+> 更新：2026-09-14 · **§4.12 间距统一（上下 = 左右 = 6vp，模拟器验收通过）**：用户反馈多列档卡片「上下间距跟左右间距不一致」→ 根因 = `ContentCard` 自带 `.margin({ bottom: Spacing.md })(12)`（单列时代承担行间距）叠加列内 `space 6` → 上下 18 vs 左右 6。修复：`ContentCard` 加 `bottomMargin` 参数——**单列档传 `Spacing.md`(12) 逐像素不变**、**多列档传 0**（间距全交外层 `Column({ space: 6 })` 承担 → 上下 = 左右 = 6）；分桶估算器同步（去 `+12` 底距、列内间距 `Spacing.md` → 6 与渲染同源）。`tools/build.ps1` → **BUILD SUCCESSFUL**（32s）；**lint 0**；hdc 装包 + 自动导航截图验收：**我的点赞页上下左右间距一致**。
+> 更新：2026-09-14 · **§4.12 个人内容三界面瀑布流落地 + 模拟器装包验收通过（修「漏横排 Row」布局 bug）**：用户拍板「三个界面采用首页一样的瀑布流，竖屏 3 列 / 横屏 4 列」→ **推翻 2026-09-13 的 `List + lanes` 竖 2 / 横 3 方案**，改**列内独立堆叠 + 方案 B 分桶**（同 §4.9/4.10/§4.8 T-D 范式）。**首版 bug（模拟器装包实测揪出）**：`cols=4` 判据已生效但渲染仍通栏——多列分支把 4 列直接纵向塞进 4 个 `ListItem`，**漏了横排 `Row` 容器**（对比 §4.8 T-D 搜索页实现有 `Row({space:6})`）→ 修复：`ListItem > Row({space:6}) > ForEach(列索引) > Column.layoutWeight(1)`；连带修预加载判据（多列下内容区只有 1 个 ListItem，`end >= 列数-1` 永不成立 → 改 `end >= 1`）。**验收（hdc 全自动：install -r → aa start → uitest 点击导航 → snapshot 截图）**：我的点赞 / 我的帖子 / 浏览历史三页**横屏四列瀑布流全部正常**（各列底部收敛、卡内底行窄列无溢出）；诊断日志确证 `type=tablet w=1440 land=true cols=4`、首帧 `cols=1` 由 `onAreaChange` 兜底回填——判据链工作正常（用户此前「没变化」根因 = 模拟器跑旧包，本轮已装最新 HAP）。临时诊断日志已删、`tools/` 临时截图已清；干净包（29s）已重装模拟器。**剩余复验**：竖屏三列、折叠屏展开↔折叠切换、翻页不跳位、手机单列逐像素不变。
+> 更新：2026-09-14 · **§4.8 T-D 二次更正：吧内搜索结果改「列内独立堆叠 + 方案 B 分桶」瀑布流（落地 + 构建通过）**：用户要求搜索结果「跟首页一样的瀑布流」→ 原「行分组 + 末行补空位」把矮卡下方留白拉大（有无图 / 图多图少交错时尤甚）。落地（仅动 `SearchResultsBuilder` 多列分支）：① 新增 `searchColumnsData()`（方案 B 带滞回最短列，阈值 `THREAD_SEARCH_COL_BALANCE_THRESHOLD=240`）+ `estimateSearchCardHeight()`（按 `cardColumns>1` 渲染口径：标题/摘要行数 + 单图 `min(w/1.6,220)` + 宫格 `⌈n/3⌉×min(w/3,140)`）+ `searchColIndexes()`；② 多列分支改列内独立堆叠（外层遍历列索引、内层**直读状态源** `searchColumnsData()[colIdx]`——收藏页五轮教训：外层稳定 key 复用 + 内层用传入 col = 更新断链）；新增卡片 160ms 淡入。**容器不变**：搜索态在外层 `Scroll` 内（WaterFlow 嵌 Scroll 是滚动劫持反模式），预加载 / 触底 / 自动续载全部原样；`cardColumns` 全局标记已无条件下发无需处理。§4.8 T-D 小节二次更正。`tools/build.ps1` → **BUILD SUCCESSFUL**（48s）；**lint 0**；**待真机复验**（搜索结果三/四列瀑布流、长列被补位填平、翻批不跳位不闪、单列手机不变）。
+> 更新：2026-09-14 · **§4.1 进吧页平板适配开工落地（竖 3 / 横 4，构建通过待真机验收）**：用户拍板（① 最小单列宽保护不启用；② 「创建吧」卡片随流不独占；③ 顺带修弹窗封顶 + 渐显带满宽）。落地：① 列数基础设施（`pageWidth/pageHeight/isLandscape`，aboutToAppear 首帧 + 根 onAreaChange 兜底；`forumColumns()` 大屏横 4 / 竖 3、闸门 + 600 门槛、手机 2 列不变；`columnsTemplateOf()`）；② `columnsTemplate` 换 `columnsTemplateOf(forumColumns())`；③ 顺带 1：两处弹窗 `dialogCardWidth()` 封顶 400（T-H 同款，手机档 312 < 400 逐像素不变）；④ 顺带 2：顶部渐显带**弃整页 DST_IN 遮罩**（`BottomFadeOverlay`/`topFadeStop`/`fadeCoverVp` 死代码删除），改 `TopFadeBand` 背景色渐变条（高 98 = 顶栏按钮 + 标题，挂页面层列表之后、悬浮 TopBar 之前——官方 title 槽位路径 TopBar 更高不受影响），按 `docs/fade-band-fullwidth-fix.md` 经验杜绝右缘缺块。`tools/build.ps1` → **BUILD SUCCESSFUL**（29s）；**lint 0**；模拟器已装包，**待真机复验**（平板竖 3 / 横 4、折叠态回 2、手机 2 列逐像素不变、弹窗 400 封顶、渐显带满宽只盖顶栏）。
+> 更新：2026-09-14 · **§4.6 宿主底栏平板横屏档（用户反馈：横屏底栏内部偏高、图标文字上下留空多）**：底栏几何由「手机 / 宽屏」两档扩为**三档**——新增**平板横屏档**（`BAR_H_WIDE_LAND=62` / `BAR_RADIUS_WIDE_LAND=31` / `ITEM_H_WIDE_LAND=50` / `ITEM_RADIUS_WIDE_LAND=25` / `PAD_V_WIDE_LAND=4`），由新增判据 `isWideLandscape()`（`isWideScreen && currentWidth > currentHeight`）驱动；**平板竖屏档（74/37/58/29/6）与手机档（66/33/54/27/4）完全不动**。同步新增 `@State currentHeight`（根 `onAreaChange` 写入）。`tools/build.ps1` → **BUILD SUCCESSFUL**（29s）；**lint 0**；模拟器已装包，**待横屏复验**（若仍觉留空可把 62 再降到 56，圆角同步 28）。
+> 更新：2026-09-14 · **§4.4 五轮（加载体验优化回归修复，实测已通）**：优化"列 key 稳定化"后翻页又失效——外层 ForEach 复用列容器时，**内层拿到的还是旧的 col 数组**（数据源是外层传入值）→ 数据更新而 UI 不动（`contentH` 又恒定 1753）。修法：外层 ForEach **只遍历列索引**（`colIndexes()`，key = `ncolgrp_${colIdx}` 稳定复用），内层数据源**直接读 @State 分桶数组** `shownReplyCols[colIdx]`（每次 build 重新取值 → 增量生效）。**实测（hdc + 模拟器）**：reach end → 加载成功且 **contentH 1753 → 3064 → 4293** 持续增长，page 2→5 连续翻页 ✓。**踩坑模式（记）**：外层 ForEach 稳定 key 复用 + 内层用外层传入的数据 = 更新断链；嵌套 ForEach 的内层必须直读状态源。最终优化保留：加载前 syncAll 仅空列表执行（静默加载）、新增卡片 160ms 淡入、Scroller 记录/恢复滚动位置。诊断日志已全部移除，`tools/build.ps1` → **BUILD SUCCESSFUL**（28s）；**lint 0**；模拟器已装最终包，**待用户复验闪屏观感**。
+> 更新：2026-09-14 · **§4.4 加载体验优化（翻页不再闪）**：① 加载**前**的 `syncAll()` 改为**仅空列表时执行**（列表态不看 loadState，提前同步只多一次整体重建 = 用户看到的"闪一下"），已有内容时静默加载、结果返回后一次性同步；② 分桶外层 ForEach 的 key 由 `colIdx+col.length+首元素id` 改为 **`colIdx+列数`**——数据追加时列容器复用、只增量渲染尾部卡片，杜绝"整列销毁重建"；③ 新增卡片加 `TransitionEffect.OPACITY` 160ms 淡入；④ 两个子 Tab 各配 `Scroller` + `onScroll` 记录 / `onAppear` 恢复滚动位置，加载后 UI 重建仍在原位置续接（不跳）。`tools/build.ps1` → **BUILD SUCCESSFUL**（25s）；**lint 0**；模拟器已装包，**待用户复验**（滑动到分页点是否还有闪屏 / 位置是否跳）。
+> 更新：2026-09-14 · **§4.4 翻页修复四轮（真因：`@Builder` 参数按值传递，实测已修复）**：三轮结论有误（误把"截图"当证据，实际硬指标 `contentH` 仍恒定 1753）→ 继续 hilog 实证定位真因：**`@Builder` 参数按值传递**——`this.NotifyColumnsBlock(tab === Reply ? colsA : colsB)` 传的是**三元表达式**，ArkUI 规则下按值传递**只有传入"状态变量本身"才触发刷新，表达式不触发** → 分桶数据更新了但多列块永不重建（界面永远第一页）。修复：**多列 Row 内联进 TabPane**（build 上下文直接读 @State，依赖可靠建立），废弃 `NotifyColumnsBlock` @Builder。**实测（hdc + 模拟器，硬指标）**：进消息页 `contentH=1753` → 滑动翻页后 **`contentH=5728`**（内容高度增长 3 倍多 = 新卡片真实渲染）。诊断日志已移除，最终包已装模拟器启动。`tools/build.ps1` → **BUILD SUCCESSFUL**（28s）；**lint 0**。**教训（新增）**：① 列表渲染数据**禁止经 @Builder 参数传递**（尤其表达式），必须内联或改用 `@Component` / `$$` 按引用；② 验证 UI 是否更新要看**可量化的布局指标日志**（内容高度 / 节点数），不能靠"看起来对"。
+> 更新：2026-09-14 · **§4.4 翻页修复三轮（hilog 实证定位真因：镜像更新未驱动渲染）**：加 `[NotifyPager]` 诊断日志 + hdc 连模拟器（Matex7，已登录）实测滑动复现——**数据层完全正常**（page 1→10、listLen 0→175、hasMore=false），但 **UI 停在第一页**（内容高度恒 1753、`notifyColumnsData` 不再被调用）→ 真因 = `@State` 镜像（shownReply）替换后，**TabPane（@Builder 经 Tabs/TabContent 嵌套 + `mirrorOf()` 方法间接取值）未被触发重渲染**。修复（数据驱动兜底）：分桶结果**主动算好写入独立 `@State`**（`shownReplyCols` / `shownAtCols`，在 `syncAll` 内随镜像同步计算），`NotifyColumnsBlock` 数据源直接读该 @State 数组（不再经方法间接取镜像）→ 装包实测翻页链路全通（bucket src=20→120、page 3→7 连续加载、UI 渲染出后续页卡片，截图实证）。诊断日志已全部移除，模拟器已装最终包。**经验**：@Builder（尤其经 Tabs/TabContent 嵌套）内通过方法间接读取 @State 的更新触发不可靠，列表类渲染数据应显式写入 @State（分桶结果 / IDataSource 同思路）。`tools/build.ps1` → **BUILD SUCCESSFUL**（29s）；**lint 0**。
+> 更新：2026-09-14 · **§4.4 翻页修复二轮（数据驱动续拉）**：一轮的 onAreaChange 方案失效——`minHeight '100%'` 撑满下内容高度恒定、onAreaChange 首次触发又撞上第一页 Loading（被防重挡掉）→ 此后高度不变永不再触发。改为**数据驱动**：内容高 / 视口高记入字段（onAreaChange 写入），`loadMessages` 每页完成后**主动判断**内容高 < 视口 + 150 即续拉下一页（递归每页一次、hasMore=false / Loading 双重防重终止）；onAreaChange 触发时也同步判断兜底。**经验**：依赖布局回调的自动续拉在 minHeight 撑满场景会失效（高度不变 = 回调不来），续拉判断必须挂在数据加载完成点。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m05s）；**lint 0**。
+> 更新：2026-09-14 · **§4.4 真机修复（平板翻页卡死）**：平板 3/4 列把一页 20 条摊薄后内容可能**填不满视口** → Scroll 无可滚距离、`onReachEnd` 一次都不触发 → 卡在第一页（手机单列 20 条必超屏故正常）。修复：多列分支内容 Column 挂 `onAreaChange`——内容高未超视口（+150 让位余量）即自动续拉 `loadMessages`，直到填满或没有更多（`loadState Loading` / `hasMore=false` 内部双重防重，无死循环）。`tools/build.ps1` → **BUILD SUCCESSFUL**（54s）；**lint 0**；**待真机复验**（平板进入两子 Tab 自动连续加载填满一屏、滚到底继续翻页、消息少的分类不无限请求）。
+> 更新：2026-09-14 · **§4.4 消息页平板适配落地（回复 / 提到我的多列，构建通过待真机验收）**：用户拍板「回复和提到我的都采取首页一样的瀑布流，竖屏三列，横屏四列」。按本页 floor-vanish 实证（§4.4 现状注释：沉浸布局 + 虚拟滚动(List)有视口剔除误删风险，已改 Scroll 全量渲染）→ 瀑布流以**观感等价的「列内独立堆叠 + 方案 B 带滞回最短列分桶」**实现（Scroll 全量渲染，**禁止回归 WaterFlow/List 虚拟滚动**），未用 WaterFlow 容器。落地：① 基础设施 `pageWidth/pageHeight`（aboutToAppear 首帧 + NotifyContent 根 Column onAreaChange）、`isLandscape()`、`notifyColumns()`（闸门 + 600 门槛，竖 3 / 横 4）；② `notifyColumnsData()` 分桶（阈值 240）+ `estimateMessageCardHeight()`（昵称行基线 64 + 标题 1 行 + 正文 ≤3 行 fs14 + 引用 ≤2 行 + 吧名行，文本列宽 = 列宽 − 头像 44 − 间距 − padding）；③ `NotifyColumnsBlock()` 列内独立堆叠 Row；④ `TabPane` 双分支——多列 Scroll（含 minHeight '100%' 贴顶修复口径、NOTIFY_TOP_PAD 让位、底部 150、onReachEnd 平移）/ 单列原样逐像素不变。手机档闸门恒 1 列走原结构。`tools/build.ps1` → **BUILD SUCCESSFUL**（30s）；**lint 0**；**待真机验收**（平板竖 3 / 横 4 两子 Tab、列均衡、翻页不跳位、渐显带满宽、手机单列逐像素回归、折叠屏展开↔折叠）。
+> 更新：2026-09-14 · **§4.3 渐显带四修（去全实段消硬切）**：用户反馈背景色条方案「内容到顶栏像被硬切」——首版渐变 [bg,0]→[bg,0.5]→[透明,1] 的前半段全实背景色让内容一进条顶就被盖死。改 **[bg,0]→[transparent,1] 线性渐变**（顶部即开始渐现，与首页挖洞式「内容从顶栏下渐现」观感一致）。`tools/build.ps1` → **BUILD SUCCESSFUL**（29s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 渐显带终版方案（弃整页 DST_IN 遮罩，改 Stack 顶层背景色渐变条）**：Refresh 全宽修复后手机仍缺块（平板正常）→ 判定「整页 DST_IN 遮罩 + blendMode OFFSCREEN」的**离屏层宽度在手机上解析异常**，挂点怎么调都不可靠 → **弃用该方案**：`BottomFadeOverlay`（整页 DST_IN）删除，新增 **`TopFadeBand`**——FavContent Stack 顶层满宽（zIndex 8）**背景色渐变条**（高 132 = TopBar 98 + 分段区 ~34；`Theme.bg` → 透明三段渐变，ThreadList TopFadeBand 成品同款思路；下层是纯背景色故视觉等价渐隐），宽度跟随 Stack（全宽已被页面背景实证），彻底不依赖列表宿主宽度解析；8 处列表上的 `.overlay(BottomFadeOverlay)` + `.blendMode` 全部移除（expandSafeArea / clip 保留）。层级：盖列表内容，低于 EditBar(15) / 兜底胶囊行(13)，槽位顶栏在 Navigation title 层更高；`hitTestBehavior(None)` 不挡交互。`tools/build.ps1` → **BUILD SUCCESSFUL**（31s）；**lint 0**；**待真机复验**（四界面渐显带满宽无缺块、只盖按钮与标题区、暗色模式渐变色同步、点击不被遮挡）。
+> 更新：2026-09-14 · **§4.3 渐显带三次修复（Refresh 显式全宽，缺块真因）**：用户再次截图实证四界面渐显带右缘均有竖直分界线（右侧无渐隐）。真因：四个列表的 `Refresh` 均未挂显式宽度 → 内部 `width('100%')` 相对 Refresh 测量成循环、解析为**内容固有宽** → 遮罩 / 列表不满屏。修复：4 处 `Refresh` 统一补 `.width('100%')`（挂在 Refresh 链上，与 onRefreshing 同层）。**教训**：`Refresh` / `Tabs` 等包裹型容器作滚动列表宿主时必须显式 `width('100%')`，不得依赖百分比子项反向撑宽。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m02s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 渐显带二次修复（滚动条 + 覆盖区收窄）**：① ForumThreadsView 的 Scroll 丢失 `.scrollBar(BarState.Off)`（改写时被吞）→ 默认滚动条绘制在遮罩之上 → 右缘竖条 + 渐显带「右边缺一块」观感，已补；② `topFadeStop()` 手机原按视口高 20%（≈160vp > 首卡顶 110vp）盖到首卡 → **全设备统一收窄**为 `min(0.20, 132 / 长边)`（只盖顶部按钮 / 标题 + 分段切换区，用户要求），fadeCoverVp 未就绪回退 0.20。`tools/build.ps1` → **BUILD SUCCESSFUL**（56s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 手机端三处修复（渐显带 / 同步提示间距 / 搜索态回归 List）**：① **同步提示贴卡**——`ListItemGroup` 组内项不吃 List space，header（占位 + 同步提示）与首卡零间距 → `FolderListHeader` / `CategoryListHeader` 根 Column 加 `margin bottom 12` 补偿；② **渐显带漏边 + 盖到内容**——遮罩 / 沉浸挂带 padding 的包裹 Column（真机驳回方案）→ **恢复挂滚动层本身**（padding 同层，与原 List 逐项同口径），两个点开列表多列分支落实；③ **搜索态手机档回归 List 单列**（原 WaterFlow 单列属虚拟滚动容器，同有 floor-vanish 风险 + 手机零回归红线），多列走 Scroll 全量渲染。**挂点纪律（新增）**：渐显遮罩 / blendMode / expandSafeArea / padding 必须与滚动容器同层，禁止再上移到外层包裹容器。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m17s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 方案四入口补充：长按分类卡唤起排序面板**：用户要求平板下长按自定义分类卡也能触发排序 → 手势挂**主列表多列分支的 ListItem**（`LongPressGesture` 350ms → `openCategorySortPanel()`；不挂卡片本体——手机单列 editMode 长按拖拽会与卡片手势抢事件、面板内长按须留给拖拽）；抽出共用入口方法 `openCategorySortPanel()`（切 Custom + 持久化 + rebuild + Haptic + 开面板），排序菜单「自定义排序」与长按两入口共用；未分类卡与面板内不启用手势。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m06s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 Scroll 改造两处残留修复**：① 自定义分类点开列表多列分支改 Scroll 时**包裹 Column 的修饰链被替换丢失**（padding / 遮罩 / 沉浸全无）→ 卡片贴屏幕边缘 → 补回 `width/layoutWeight/padding(lg)/clip(false)/expandSafeArea/overlay/blendMode`；② 吧分类点开列表出现**双 98 占位**（包裹 Column 旧占位 + Scroll 内新占位）→ 顶部留空翻倍 → 删外层旧占位（Scroll 内保留）。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m09s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 floor-vanish 同源问题修复（两个帖子列表 WaterFlow → Scroll 全量渲染）**：用户真机反馈吧分类点开列表与自定义分类点开列表都出现 `docs/floor-vanish-viewport-fix.md` 记录的「卡片整层消失」——`WaterFlow` 与 `List` 同属虚拟滚动容器，在「`clip(false)` + `expandSafeArea` 沉浸 + 底部悬浮 Tab」场景下视口剔除错位（文档已实证与懒加载无关、换 Scroll 全量渲染必然绕过）。按文档结论修复：两列表多列分支 `WaterFlow` → **`Scroll` + `Column` 全量渲染 + 「列内独立堆叠」分桶**（`PostColumnsBlock`：`i % 列数` 轮转 + 滞回最短列补位，阈值 240，方案 B 与 §4.9 ThreadDetail 同款；估算器 = 标题 ≤2 行 + 摘要 ≤3 行 + 基线）；`CategoryThreadsView` 分页改 **`Scroll.onReachEnd`** 驱动（文档 §5：全量渲染下懒回收哨兵失效）；顶部 98 让位 / 底部 90 占位 / loadingMore 回归滚动内容内（全量渲染无「占 1 格」问题），遮罩 / 沉浸挂包裹 Column 不变；前缀稳定分桶翻页不跳位。**容器分叉终版**：等高收藏夹列表 = `List + lanes`；可变高帖子列表（吧收藏 / 分类内 / 搜索态）= `Scroll + 列内独立堆叠`。手机档原 List 单列不变。`tools/build.ps1` → **BUILD SUCCESSFUL**（59s）；**lint 0**；**待真机复验**（滚到底不再整层消失、多列无行内留白、翻页不跳位、拖拽面板不受影响、手机单列回归）。
+> 更新：2026-09-14 · **§4.3 改动六 B 二次更正 + 落地（分类内帖子列表改瀑布流）**：用户核实分类内帖子（`PostCard`）高度同样不一致 → 多列分支由 `lanes` 改 **`WaterFlow`**（与 ForumThreadsView 同口径：让位 / 占位移出流、空态替换整流、遮罩挂包裹 Column、`onReachEnd` 留在流上）。**连带**：`editMode / onItemDragStart` 拖拽 API 为 List 专有、WaterFlow 不支持 → 帖子自定义排序**收进半屏排序面板**（方案四同款）：面板按当前视图分流（`selectedCategoryId` 空 = 分类卡 / 非空 = 帖子，单列 `List` 长按拖拽 + `ThreadDragPreview`，`prepend=1` + 独立 `panelThreadScroller`）；**打开面板即切 Custom**（与手机点该项语义一致，且面板内 PostCard 长按让位于拖拽）。手机档不变。`tools/build.ps1` → **BUILD SUCCESSFUL**（60s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 真机第三处修复（点开列表渐显带 / 底部沉浸）**：`BottomFadeOverlay` 是整页 DST_IN 透明度遮罩（顶部 `topFadeStop()` 以上渐隐）——原挂 List 时首子项是 98 让位占位 → 渐隐只吃占位区；换 `WaterFlow` 后遮罩误挂流上、首项变卡片 → 渐隐盖到第一行卡 + 底部让位区失去渐隐露出硬边。修复：`overlay(BottomFadeOverlay)` / `blendMode(SRC_OVER, OFFSCREEN)` / `expandSafeArea` 从 `WaterFlow` 上移到包裹 `Column`（其首尾正是顶部 98 让位与底部 90 占位 → 渐隐带与让位区重新对齐），点开列表与搜索态两处同改。`tools/build.ps1` → **BUILD SUCCESSFUL**（58s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 真机两处修复（落地当日）**：① **卡片行距贴紧**——`List({ space })` 不作用于 `ListItemGroup` 组内项，收组后行距全丢（手机档同受影响）→ 三处组体（收藏夹 / 自定义分类 / 分类内帖子）卡片 `ListItem` 加 `margin({ bottom: Spacing.md })` 补回等值行距；② **自定义分类"没适配"**——新建卡 / 未分类卡原在通栏 header（恒整行），0 自定义分类时整页只见两张整行卡 → 移进组体参与 lanes 分列，header 只留占位 / 同步提示。`tools/build.ps1` → **BUILD SUCCESSFUL**（59s）；**lint 0**。
+> 更新：2026-09-14 · **§4.3 收藏页平板适配开工落地（改动一~七全部完成，构建通过、待真机验收）**：① 胶囊平板左对齐（两处同步）；② 收藏夹列表 `lanes(3/4)` + `ListItemGroup` 收纳通栏项；③ 点开的帖子列表 `WaterFlow`（3/4 列、通栏项移出流、无 sections）；④ 形态基础设施（`favColumns()` 竖 3 横 4 / 首帧初值 / onAreaChange）；⑤ 搜索框内嵌返回钮（两处）+ 搜索态 `WaterFlow`；⑥ **拖拽方案四落地**：回调抽共享方法参数化（prepend / Scroller），平板主列表多列浏览无拖拽，**半屏排序面板**（`bindSheet` + `ImmMaterial.sheet()`，面板内单列复用拖拽状态机、长按保留、入口不变），`CategoryThreadsView` 多列 lanes 拖拽保留（索引基准组内 0 起）；壳由讨论时的 `CustomDialog` 更正为 `bindSheet`（§6.8 实证半模态为官方 A 档槽位）；⑦ 弹窗六处 `dialogCardWidth()` 封顶 400。§6.2 留痕（A 有 2 处已规避；B/C/D 无）。`tools/build.ps1` → **BUILD SUCCESSFUL**（31s）；**lint 0**；**待真机验收**（平板竖 3 横 4 四个列表 + 胶囊左对齐 + 弹窗不拉伸 + 面板长按拖拽 + 搜索框对齐 + 手机逐像素回归 + 折叠屏展开↔折叠）。
+> 更新：2026-09-14 · **§4.3 容器二次更正（更新文档，不开工）**：用户复核发现**收藏夹点开后的列表卡片高度不一致**（`PostCard` 高度随文本行数可变，首轮「宽度和高度都一致」的判断不成立）→ 改动三由 `lanes` **二次更正为 `WaterFlow` 瀑布流**；收藏夹列表（`FolderCard` 等高 80）维持 `lanes` 不变 → 两列表容器**有意分叉**（等高 `lanes` / 可变高 `WaterFlow`）。执行要点 4 条：通栏项（顶部 98 让位 / 底部 90 占位）移出流 + 空态替换整流；流内仅帖子一种格子**无需 `sections`**（§4.9/4.10 段计数竞态坑天然规避）；`PostCard` 无宫格区无 Grid 高度坑；无 scroller / `onReachEnd` / 分页零牵动。§6.2 留痕（A 有 1 处已规避；B/C/D 无）。**代码未改**。
+> 更新：2026-09-14 · **§4.3 收藏页全量拍板转「已确认」（更新文档，不开工）**：用户拍板 4 项——① **列数竖 3 / 横 4**（收藏夹列表 / 点开的帖子列表 / 搜索态同口径，原「竖 2 / 横 3」作废）；② 容器（**同日二次更正**：收藏夹列表 `List + lanes`、点开的帖子列表 `WaterFlow` 瀑布流，见上条）；③ **拖拽采用方案四**（排序收进半屏 CustomDialog 面板：入口不变、面板内单列复用现有拖拽状态机 → 长按保留 + `ImmMaterial.dialog()` 沉浸光感 + 零重写；宽 `min(屏宽−48, 520)` / 高约 60% 屏；方案一 / 三出局留档）；④ **弹窗不拉伸**：六处 `dialogCardWidth()` 封顶 T-H 同款 `max(200, min(400, 屏宽−48))`，手机档 312 < 400 逐像素不变。§4.3 全部相关小节 + §三 第 3 项转「已确认」；§6.2 七步自检留痕。**代码未改，待开工**。
+> 更新：2026-09-14 · **§4.3 收藏页增量讨论并入（更新文档，不开工）**：① 改动六拖拽候选新增**方案四**——排序收进**半屏 CustomDialog 面板**（入口不变：平板档点排序菜单「自定义排序」= 开面板；面板内**单列 `List` 完整复用现有拖拽状态机** → 长按触发与手机逐像素一致、拖拽零重写；宽 `min(屏宽−48, 520)` / 高约 60% 屏 / `ImmMaterial.dialog()` **官方沉浸光感成立**〔CustomDialog 是官方认可弹窗宿主，`bindSheet` 非官方槽位、页面自绘浮层 `out of scope` 均排除〕；主列表多列纯浏览、长按回归置顶语义），候选一 / 三 / 四留档待拍板；② 增量讨论 4 条：弹窗六处 `dialogCardWidth()` 封顶顺带项（T-H 同款）/ 帖子卡多列容器补「列内独立堆叠 + 方案 B 分桶」备选（默认仍推 `lanes`）/ 骨架屏 `columns` 默认 1 红线 / 拖拽常数 80/92 脆弱点备忘；§6.2 七步自检留痕（A/B/C/D 全无）。**代码未改**。
+> 更新：2026-09-14 · **§4.9 / §4.10 回复区多列「列均衡」分桶（方案 B：带滞回的最短列）**：用户真机反馈「连续一列短卡 / 一列长卡时某一列被拉得特别长」，要求空位自动补位但**看上去遵从顺序**。原先轮转分桶（`i % 列数`）只保序不看高度 → 列尾差无界。改为**带滞回的最短列**：默认照常轮转（保序观感），仅当轮转目标列与最短列的**估算高差 > 240vp**（≈一张短卡高，`DETAIL_COL_BALANCE_THRESHOLD` / `SUBPOST_COL_BALANCE_THRESHOLD`）才改投最短列补位 → 小波动不乱序、失衡被钳回一卡以内。高度为**确定性估算**（正文行数×行高 + 图片宫格显式总高 + 楼中楼条 + 常数底数 128/96，同步可算、无测量循环，常数误差在列高差中抵消）；分桶为**前缀稳定贪心**：翻页追加从头重算、旧卡落列不变（不跳位），楼层 / 楼中楼定位 id 随卡走零改动。改动仅 `floorColumnsData()` / `commentColumnsData()` 两函数 + 各一估算器 + 阈值常量；单列档 / 定位 / 高亮 / 分页零改动。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m02s）；**lint 0**；**待真机复验**（长列被补位填平、横向楼层号基本递增、翻页加载不跳位、手机单列逐像素不变）。
 > 更新：2026-09-14 · **§4.9 平板底栏宽度加倍（592vp，跳转框跟随拉伸）**：用户要求「平板下帖子详细页底栏在现有基础宽一倍，里面跳转框也一起跟着拉伸，正序 / 只看全部按钮跟着调整保持与底栏左对齐」→ **单点改动** `dockPillWidth()` 平板档封顶 `DETAIL_DOCK_MAX_WIDTH(296)` → **`DETAIL_DOCK_TABLET_WIDTH`(592 = 296 × 2)**；手机档保持原「屏宽 − 64」公式逐像素不变（教训红线：平板档封顶值严禁作用于手机档）。**自动跟随链（无需额外改动）**：① 官方岛 barWidth 三档 = dockPillWidth() → 岛宽 592；② 岛内跳转框（原回复框）`layoutWeight(1)` 随岛宽自动拉伸；③ 排序壳左缘公式 `(currentWidth − dockPillWidth())/2 − 16` 自动跟随新宽度 → 与岛左对齐（-16 真机微调项保留，如宽度变化后有偏差只调该值）。**跳转框内部注意**：岛宽 592 下「跳转到官方贴吧」胶囊被拉长属预期（用户点名要拉伸）；文案截断情况同步复查。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m03s）；**lint 0**；**待真机复验**（平板底栏 592 居中、跳转框拉伸无裁切、排序胶囊与底栏左缘对齐、手机底栏 329 逐像素不变）。
 > 更新：2026-09-13 · **字号调节平板不生效修复（fontTick 全局广播，darkTick 同款模式）**：用户真机反馈平板上「设置-个性化-字体大小调节无法生效」，现象定位（用户确认）= **字号设置页内预览正常变化，返回后其他页面文字压根没变** → 根因 = 常驻 Tab 页处于挂载态，字号页覆盖期间 `@StorageLink('fontScale')` 虽同步了状态但**离屏缓存不重绘**（FontSizePage 注释自证的工程已知问题；Tab 页是 @Component 无 onPageShow，FontSizePage 靠自增 fontSizeTick 绕过而 Tab 页没有等价机制；darkTick 深色有广播、字号没有）。**修复 = fontTick 全局广播**：① `FontSizePage` 三处字号写入（selectLevel + 两处 pan）同步自增 `AppStorage 'fontTick'`；② 宿主 `Index.onPageShow` 返回时也自增 fontTick（覆盖"返回瞬间刷新当前 Tab"）；③ 五个常驻 Tab 页（HomeTab / ForumsTab / FavoriteTab / MessagesTab / MineTab）各加 `@StorageLink('fontTick') @Watch('onFontTick')`，回调显式回写 `this.fontScale = AppStorage.get('fontScale')` → 触发本页全部 `fs(x, fontScale)` 依赖刷新。**顺手修复**：FontSizePage `selectLevel`（点击圆点）此前只写 AppStorage 不经 FontSizeManager.setLevel → **不持久化、重启丢档**，已补。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m02s）；**lint 0**；**待真机复验**（平板调字号返回后五 Tab 页字体立即生效；切 Tab 后其他页也生效；重启后档位保持；手机行为不变）。
 > 更新：2026-09-13 · **§4.9 岛壳解耦方案已回退（用户拍板：底栏保持居中）**：「平板横屏岛 / 排序壳与帖子卡左对齐」的岛壳解耦方案（内容层移出 Tabs + `FloatingIslandOnly` 纯岛壳 + 排序壳左缘 16）已按用户要求**整体回退**——底栏岛恢复**居中**于屏幕（官方沉浸材质不变），排序壳恢复公式定位 `-16`（横屏分栏修正，回撤至解耦前的值）。`FloatingIslandOnly` 死代码已删除。**经验留存**：官方岛水平定位可行路径 = 「内容层移出 Tabs + 空 TabContent 岛壳跟随容器」（本轮已实现并构建通过，被产品决策回退而非技术失败），将来若要岛靠左 / 靠右可按此复刻。当前底栏 / 排序壳状态 = 解耦前（宽度分档 296/329 + 补偿 8 两端统一 + 横屏垂直呼吸 14 + 排序壳 -16）。
@@ -153,16 +184,16 @@
 |---|------|------|------|------|
 | 1 | 首页 | `pages/HomeTab.ets` | 主 Tab | **已落地（2026-09-13，**方案 B 行分组** + **平板横 3 / 竖 2 列**，构建通过，见 4.2；方案 A `WaterFlow` 真机首测被否决后已回退；横屏曾因行内高度差过大收为 2 列〔决策 9〕，同日按用户拍板**撤销并恢复 3 列**〔决策 10〕）** |
 | 2 | 进吧 | `pages/ForumsTab.ets` | 主 Tab | 已确认（见 4.1） |
-| 3 | 收藏 | `pages/Favorite.ets` | 主 Tab | 已出方案（待确认，见 4.3） |
+| 3 | 收藏 | `pages/Favorite.ets` | 主 Tab | **已确认（见 4.3；2026-09-14 拍板：竖 3 / 横 4；容器分叉——收藏夹列表 `lanes` / 点开的帖子列表 `WaterFlow` 瀑布流；拖拽方案四半屏面板、弹窗六处封顶）** |
 | 4 | 消息 | `pages/MessagesTab.ets` | 主 Tab | **已确认（方案 A，见 4.4）** |
 | 5 | 我的 | `pages/MineTab.ets` | 主 Tab | 已出方案（待确认，见 4.5） |
 | 6 | 宿主壳 | `pages/Index.ets` | 宿主 | **已确认（见 4.6）** |
-| 7 | 全吧搜索（首页入口） | `pages/Search.ets` | 二级 | **已确认（见 4.7；多列例外页）** |
+| 7 | 全吧搜索（首页入口） | `pages/Search.ets` | 二级 | **已落地（2026-09-15 重定方案并开工，见 4.7）**：搜贴瀑布流竖 3 / 横 4（列内独立堆叠 + 方案 B）、搜吧 / 搜人 3 / 4 列、底栏平板档锁 480 不拉伸；多列例外页 |
 | 8 | 吧内帖子列表 | `pages/ThreadList.ets` | 二级 | **已确认（见 4.8；多列二级页，受 §4.6 H-B 前置阻塞）** |
 | 9 | 帖子详情 | `pages/ThreadDetail.ets` | 二级 | **已落地（见 4.9；DT-A/G/H/I/J 已落地、构建通过、待真机验收；`DETAIL_MAIN_WIDTH=420` / `DETAIL_IMAGE_GRID_MAX_WIDTH=336` / 右栏维持三列）** |
 | 10 | 楼中楼详情 | `pages/SubPostDetail.ets` | 二级 | **已落地**（见 4.10；SP-A/B/D/E/G-K 已落地、构建通过、待真机验收；`SUBPOST_MAIN_WIDTH=420` / `SUBPOST_IMAGE_GRID_MAX_WIDTH=336`、段数=2、间距=8、底部留白=20 三处差异兑现） |
-| 11 | 个人内容 | `pages/PersonalContent.ets` | 二级 | **已确认**（见 4.12；与 §4.11 同范式 —— 用户 2026-09-13 拍板「两页采用同一方案」并按推荐值全部拍板转已确认；命名易混：本页**无用户信息区**，只有槽位标题栏 + 单一 `List`；受 §4.6 H-B 前置阻塞） |
-| 12 | 用户主页 | `pages/UserProfile.ets` | 二级 | **已确认**（见 4.11；用户信息居中已满足 + 下方内容竖 2 / 横 3，走 `List.lanes`，2026-09-13 按推荐值全部拍板；受 §4.6 H-B 前置阻塞） |
+| 11 | 个人内容 | `pages/PersonalContent.ets` | 二级 | **已落地（2026-09-14，见 4.12 二次拍板）**：用户拍板「首页同款瀑布流竖 3 / 横 4」推翻原 lanes 方案 → 列内独立堆叠 + 方案 B 分桶落地，构建通过待真机验收；命名易混：本页**无用户信息区**，只有槽位标题栏 + 单一 `List` |
+| 12 | 用户主页 | `pages/UserProfile.ets` | 二级 | **已落地（2026-09-15 重定方案并开工，见 4.11 二次拍板）**：发布帖 + 关注吧瀑布流竖 3 / 横 4（列内独立堆叠 + 方案 B）、确认弹窗封顶 400 不拉伸；用户信息 Header 保持通栏居中 |
 | 13 | 关注列表 | `pages/FollowList.ets` | 二级 | 待补充 |
 | 14 | 关注 | `pages/Follow.ets` | 二级 | 待补充 |
 | 15 | 消息详情 | `pages/Message.ets` | 二级 | 待补充 |
@@ -634,6 +665,9 @@ Stack()
 2. **竖屏**：收藏夹显示 **2 列**，收藏夹里面帖子显示 **2 列**
 3. **横屏**：收藏夹显示 **3 列**，收藏夹里面帖子显示 **3 列**
 
+> **2026-09-14 拍板更正**：列数改为**竖 3 / 横 4**（收藏夹列表与点开的帖子列表同列数，与首页 / 吧内列表口径一致），原「竖 2 / 横 3」作废。同批拍板：拖拽选**方案四**（半屏排序面板）、**弹窗不拉伸**（六处 `dialogCardWidth()` 封顶）。
+> **2026-09-14 二次更正（容器）**：**收藏夹列表**（`FolderCard` 等高 80）定案 `List + lanes` 不用瀑布流；**收藏夹点开的帖子列表**（`PostCard` 高度随文本行数可变）**改用瀑布流 `WaterFlow`**——用户核实「点开后列表卡片高度不一致」，行内留白不可接受 → 改动三由 `lanes` 改判 `WaterFlow`。
+
 **现状（代码事实）**
 
 | 位置 | 内容 |
@@ -687,7 +721,7 @@ Row({ space: Spacing.sm }) {
 - **两处必须同步改**：槽位路径 `FavTitleBar`（4544-4568）与兜底路径 `CategoryTabs`（4635-4663）。只改一处会导致开关 `FAV_OFFICIAL_TITLE_BAR` 切换后行为不一致。
 - **行高不变**：仍为 2 + 40 + 8 = 50 → `FAV_CAT_TAB_ROW_HEIGHT`(50)、`favTitleBarHeight()`、`placeholderHeight()`(148) **全部无需调整**。
 
-**改动二：收藏夹列表 2 / 3 列（`FolderListView`）**
+**改动二：收藏夹列表 3 / 4 列（`FolderListView`；2026-09-14 拍板竖 3 / 横 4，原 2 / 3 作废）**
 
 `FolderCard` **等高**（头像 48 + 上下 padding 16 → 固定 80vp），因此可直接用 `List` 自带的 `lanes`，无需换瀑布流：
 
@@ -717,17 +751,23 @@ List({ space: Spacing.md, scroller: this.folderScroller }) {
 
 其中 `FolderListHeader()` = 现有「占位 + 同步提示」两项，`FolderListFooter()` = 现有底部 90 占位。
 
-**改动三：收藏夹内帖子 2 / 3 列（`ForumThreadsView`）**
+**改动三：收藏夹内帖子 3 / 4 列（`ForumThreadsView`；2026-09-14 拍板 `WaterFlow` 瀑布流，二次更正）**
 
 `PostCard` **高度可变**（标题 1~2 行、摘要 0~3 行），同一行若用 `lanes` 会被最高卡撑开、矮卡下方留白。两个选项：
 
 | 选项 | 改法 | 优点 | 代价 |
 |------|------|------|------|
-| **A（推荐）** | 换 `WaterFlow`，`ForEach(forumThreads())` → `FlowItem { PostCard }`，挂 `.columnsTemplate(this.forumColumnsTemplate())` + `.columnsGap(Spacing.md)` + `.rowsGap(Spacing.md)` | 卡片高度各自独立，无留白 | 容器要换，占位/空态改为 `FlowItem` 或移出 |
-| B | 继续用 `List` + `.lanes(...)`（与改动二同款） | 改动最小、与收藏夹同范式 | 行内高度差留白（最多差约 3 行 ≈ 54vp） |
+| **A（✅ 2026-09-14 二次拍板采用）** | 换 `WaterFlow`，`ForEach(forumThreads())` → `FlowItem { PostCard }`，挂 `.columnsTemplate(this.forumColumnsTemplate())` + `.columnsGap(Spacing.md)` + `.rowsGap(Spacing.md)` | 卡片高度各自独立，无行内留白 | 容器要换，占位/空态移出流 |
+| ~~B~~ | ~~继续用 `List` + `.lanes(...)`~~ | ~~改动最小~~ | 行内高度差留白（最多差约 54vp）——**用户核实卡片高度不一致后否决** |
 
-- 该列表**没有 scroller**（`List({ space: Spacing.md })`，3290），也**没有 `onReachEnd`** → 换 `WaterFlow` 不牵动滚动恢复与分页逻辑，成本比首页低得多。
-- 空态（3301-3320）与底部 90 占位同理：走 `WaterFlow` 时改为独立于流的兄弟节点，或保留为 `FlowItem`（占 1 格，会左右不均，不推荐）。
+> **拍板沿革（2026-09-14）**：首轮拍「`lanes` 不用瀑布流」（理由「宽度和高度都一致」）；同日用户复核发现**点开后的列表卡片高度并不一致** → **二次更正为瀑布流（选项 A）**。收藏夹列表（`FolderCard` 等高 80）维持改动二 `lanes` 不变——两列表容器**有意分叉**：等高用 `lanes`、可变高用 `WaterFlow`。
+
+**执行要点（本项换容器的四件事）**：
+
+1. **结构**：`Refresh > Column { 顶部 98 占位（通栏）、WaterFlow、底部 90 占位（通栏） }`——顶部让位与底部占位**移出流**（占 1 格的通栏项严禁进 `WaterFlow`，§6.1 第 3 步红线）；空态时整个 `WaterFlow` 替换为 `EmptyView`。
+2. **无需 `sections`**：本流内**只有帖子一种格子**（无跨列通栏项），`ForEach` 直灌 `FlowItem` 即可——§4.9 / §4.10 真机两轮复现的「`WaterFlow + sections` 段计数竞态」在此**天然规避**（该坑只在混排通栏项时触发）。
+3. **无 Grid 高度坑**：`PostCard` 无缩略图 / 宫格区（仅标题 / 摘要 / 作者 / 分享行），卡片高度 = 文本自然高，`WaterFlow` 按自然高摆放无测量歧义。
+4. **滚动 / 分页零牵动**：该列表本就**没有 scroller、没有 `onReachEnd`、无分页**（本地过滤全量 + `ForEach`），换容器不涉及滚动恢复与预加载重挂；`WaterFlow` 内层滚动承接 `Refresh` 下拉语义不变。
 
 **改动四：补平板形态判定基础设施（本页新增）**
 
@@ -744,17 +784,17 @@ private readonly isWideFormDevice: boolean =
   || deviceInfo.deviceType === '2in1'
   || display.isFoldable();
 
-/** 列数：大屏横 3 / 大屏竖 2；窄窗与手机维持 1 列 */
+/** 列数：大屏横 4 / 大屏竖 3（2026-09-14 拍板）；窄窗与手机维持 1 列 */
 private favColumns(): number {
   if (!this.isWideFormDevice) return 1;
   if (this.pageWidth < 600) return 1;        // 折叠态 / 分屏 / 自由多窗窄窗
-  return this.isLandscape ? 3 : 2;
+  return this.isLandscape ? 4 : 3;
 }
 
 private forumColumnsTemplate(): string {
   const n: number = this.favColumns();
-  if (n >= 3) return '1fr 1fr 1fr';
-  if (n === 2) return '1fr 1fr';
+  if (n >= 4) return '1fr 1fr 1fr 1fr';
+  if (n === 3) return '1fr 1fr 1fr';
   return '1fr';
 }
 ```
@@ -772,7 +812,7 @@ private forumColumnsTemplate(): string {
 
 判定口径与 4.1 / 4.2 完全一致（大屏形态 + 宽度门槛 600 + 宽高比），仅列数映射不同。
 
-**改动五：搜索态帖子列表 2 / 3 列（`SearchResultView`）**
+**改动五：搜索态帖子列表 3 / 4 列（`SearchResultView`；2026-09-14 拍板随列数更正）**
 
 **搜索态现状**
 
@@ -896,7 +936,7 @@ Stack({ alignContent: Alignment.Start }) {
 
 **候选收敛（2026-09-12 更新，留档待拍板）**
 
-> **前提变更**：用户明确要求「**平板保留拖拽**」→ 上表 **选项 A（平板关拖拽）出局**；**选项 C（重写网格让位）** 经评估性价比最差（见本节末），不作为候选。候选收敛为两条，另新增一条上表没有的路径。
+> **前提变更**：用户明确要求「**平板保留拖拽**」→ 上表 **选项 A（平板关拖拽）出局**；**选项 C（重写网格让位）** 经评估性价比最差（见本节末），不作为候选。候选收敛为两条，另新增一条上表没有的路径。**2026-09-14 更新**：用户问询收敛出**方案四（半屏排序面板）**，候选从两条增至三条（见下方方案四小节）。
 
 编号对照（对话用「方案」，本文件用字母，避免混淆）：
 
@@ -904,6 +944,7 @@ Stack({ alignContent: Alignment.Start }) {
 |----------|------|------------|
 | **方案三** | 多列 + 交还系统原生让位 | = 上表 **选项 B** |
 | **方案一** | 多列 + 不做让位 + 目标格高亮 + **自算网格落点** | 新增（上表无此项） |
+| **方案四** | **排序收进半屏面板**（面板内单列复用现有拖拽，主列表纯多列浏览） | 2026-09-14 新增（上表无此项） |
 
 **方案三（交还系统原生让位）**
 
@@ -964,9 +1005,21 @@ Stack({ alignContent: Alignment.Start }) {
 
 **当前建议（待拍板）**：先用上面的实机实验验证方案三的两个前提——成立则选**方案三**（体验上限最高、改动最小）；不成立则选**方案一**（精度可控、竖屏零牵连）。
 
+**方案四（2026-09-14 新增：排序收进半屏面板）**
+
+做法：多列浏览态下点排序菜单「自定义排序」（**入口不加新按钮**，平板档只是把「切模式」变成「打开面板」）→ 弹出**半屏排序面板**：`CustomDialog`（`alignment: Bottom`、高度约 60% 屏、宽 `min(屏宽 − 48, 520)`、圆角 32 / 底距 110 与同页 6 处弹窗同族），面板内是**单列 `List` 完整复用现有拖拽状态机**（`draggingCatId` / 步长 92 / `scrollBy` 跟随 / `dragListBottomPad` / `CategoryDragPreview`）→ **长按触发与手机逐像素一致、拖拽逻辑零重写**；面板「完成」→ 落盘 Custom 顺序 → 关面板，主列表多列显示自定义顺序（浏览态不变）。
+
+- **沉浸光感成立**：`CustomDialog` 是官方认可的弹窗宿主 → `options.systemMaterial = ImmMaterial.dialog()`（与同页 6 处弹窗同机制）；`bindSheet` 半模态**不在**官方槽位清单（只有 `backgroundBlurStyle` 真模糊降级）、页面自绘 Stack 浮层必判 `out of scope`（本项目实证坑），故壳必须是 CustomDialog。
+- **长按语义理顺**：主列表（多列浏览态）长按回归「置顶 / 取消置顶」（与吧收纳夹一致），不再承担拖拽 → 浏览 / 排序两态彻底分离，两个长按语义不打架。
+- **与方案一 / 三对比**：零重写零风险（现拖拽实现是 v1.15→v1.19 逐版踩坑产物，能不碰就不碰）；代价 = 多一层面板壳、拖拽时看不到多列上下文（但排序时单列看顺序本就更清晰）。
+- **连带项**：`CategoryThreadsView`（分类内帖子）自定义排序同理——其拖拽是标准索引语义、`lanes` 下可直接用（见下节 B），但排序时**也可收进同一面板**（单列一致体验），拍板时一并定。
+- **手机档**：不弹面板，走原「切模式 + 列表内拖拽」路径，逐像素不变。
+
+**方案四 vs 一 / 三一句话**：一 / 三是「在多列里做拖拽」，四是「把拖拽挪回它最擅长的单列」——工作量最小、风险最低，体验上限让渡给方案三（若其实机实验两个前提成立）。
+
 **为什么不把选项 C（重写网格让位）列为候选**：多列让位在**跨行**时不是「滑动」而是「跳变」（同行内需横向挪一格，下一行首卡需跳到上一行行尾，中间没有连续路径），`translate` 只能让卡片在原位偏移，跨行那张必然是瞬移 → 观感可能比「不让位」更刺眼，且实现风险最高（等于在网格下重踩 v1.15~v1.19 全部坑），性价比最差。
 
-**状态**：方案一 / 方案三**均留档待定**（2026-09-12），本阶段未动代码，等用户后续拍板。
+**状态**：**✅ 方案四已拍板**（2026-09-14）；方案一 / 方案三出局留档（不再实机验证，不再候选）。本阶段未动代码。
 
 **B. `CategoryThreadsView`（分类内帖子，3968）——标准 `onItemDrop` + splice，可直接多列**
 
@@ -1042,26 +1095,49 @@ Stack()
 | 4 | 两处胶囊需同步 | 槽位 `FavTitleBar`（4538）与兜底 `CategoryTabs`（4633）必须同时改 |
 | 5 | `layoutWeight(0)` 行为待实测 | 若宽度异常则回退 `if/else` 双分支写法 |
 | 6 | 自定义分类**已纳入**（改动六），风险不对称 | `CategoryThreadsView` 的 `insertIndex` 是 item 逻辑索引（`lanes` 下**无需换算**）→ 只需改「组内索引基准」（删 `itemIndex < 1` 守卫、`-1` 换算去掉）；`CategoryListView` 的手绘垂直让位（`displaceOffsetOf` / 原位塌陷 / `dragListBottomPad`）与多列**不可兼容** → 必须在「平板关拖拽（推荐）/ 交还系统让位 / 重写网格让位」三选一 |
-| 6.1 | `CategoryListView` 选项 A 的功能损失 | 平板竖/横下失去长按拖动排序（手机端零影响）；若必须保留拖拽，只能走选项 B（丢虚线占位框视觉）或 C（重写让位算法）。**2026-09-12 更新**：用户要求「平板保留拖拽」→ 选项 A 出局；候选收敛为**方案三**（= 原 B，交还系统原生让位）与**方案一**（新增，不做让位 + 目标格高亮 + 自算网格落点），留档待拍板，详见改动六「候选收敛」小节 |
+| 6.1 | `CategoryListView` 选项 A 的功能损失 | 平板竖/横下失去长按拖动排序（手机端零影响）；若必须保留拖拽，只能走选项 B（丢虚线占位框视觉）或 C（重写让位算法）。**2026-09-12 更新**：用户要求「平板保留拖拽」→ 选项 A 出局。**2026-09-14 拍板**：候选新增**方案四**（排序收进半屏 CustomDialog 面板、面板内单列复用现有拖拽 → 长按保留 + `ImmMaterial.dialog()` 官方沉浸光感成立 + 拖拽零重写）并**拍板采用**；方案一 / 方案三出局留档，详见「候选收敛」小节 |
 | 6.2 | `CategoryListView` 前置 3 项 | 占位 / 新建卡 / 未分类卡必须进 `ListItemGroup.header`，否则首行只给分类卡留 1 格；收纳后 `CAT_LIST_PREPEND`（=3）的换算基准要同步核对 |
-| 7 | 搜索态**已纳入**（改动五） | 帖子列表 2/3 列；注意：搜索态**没有收藏夹卡片列表**，`searchResults()` 只返回帖子。搜索结果是 `ForEach` **全量构建**（无 LazyForEach、无分页），3 列后同屏可见卡片由约 3~4 张增至 12~18 张，滚动绘制压力上升（总量不变，与首页「不做 `LazyForEach`」结论同口径） |
+| 7 | 搜索态**已纳入**（改动五） | 帖子列表 3/4 列（2026-09-14 拍板）；注意：搜索态**没有收藏夹卡片列表**，`searchResults()` 只返回帖子。搜索结果是 `ForEach` **全量构建**（无 LazyForEach、无分页），3~4 列后同屏可见卡片由约 3~4 张增至 12~18 张，滚动绘制压力上升（总量不变，与首页「不做 `LazyForEach`」结论同口径） |
 | 7.1 | 搜索框**左右与卡片同宽**（已定稿） | 去 44 圆钮占位、返回箭头内嵌进搜索框（`Stack` 内左上 + `hitTestBehavior(HitTestMode.Block)`），宽 = 屏宽 − 32 = 网格可用宽；外层 `Stack.height(44)` 保证槽位 98 / `placeholderHeight()` 不变。代价：手机端搜索态观感变化需真机确认；若图标点击被输入框吞掉 → 降级用 `.overlay()` 挂图标 |
 | 7.2 | 两处搜索框需同步 | 槽位 `FavTitleBarRow`（4449）与兜底 `TopBar`（4131）必须同改（与风险 4 同理） |
 | 8 | 顶部槽位高度 | 胶囊左对齐不改变行高（2 + 40 + 8 = 50）；搜索态外层 `Stack` 保持 44（与旧圆钮同高）→ `FAV_TITLE_BAR_HEIGHT` / `FAV_CAT_TAB_ROW_HEIGHT` / `placeholderHeight()` **全部不变** |
 
 **涉及文件**：仅 `entry/src/main/ets/pages/Favorite.ets`
 
-**状态**：已出方案，**两项已拍板**（2026-09-11）：
+**状态**：**已确认（2026-09-14 全量拍板）**。历次拍板汇总：
 
-1. 「自定义分类」两列表（`CategoryListView` / `CategoryThreadsView`）**纳入**多列 → 见改动六。
-2. 搜索框**左右与卡片网格同宽**（返回箭头内嵌进搜索框）→ 见改动五结论二。
+1. 「自定义分类」两列表（`CategoryListView` / `CategoryThreadsView`）**纳入**多列 → 见改动六。（2026-09-11）
+2. 搜索框**左右与卡片网格同宽**（返回箭头内嵌进搜索框）→ 见改动五结论二。（2026-09-11）
+3. **列数竖 3 / 横 4**（收藏夹列表 + 点开的帖子列表 + 搜索态同口径）；**容器分叉**：收藏夹列表（等高卡）`List + lanes` 不用瀑布流，**点开的帖子列表（高度可变）采用瀑布流 `WaterFlow`**（2026-09-14 首拍 `lanes` 同日二次更正）→ 见改动二 / 三 / 四 / 五。（2026-09-14）
+4. **拖拽采用方案四**（排序收进半屏 CustomDialog 面板，长按保留 + 沉浸光感）→ 见改动六候选收敛。（2026-09-14）
+5. **弹窗不拉伸**：六处 `dialogCardWidth()` 封顶 T-H 同款 → 见 2026-09-14 增量讨论第 1 条。（2026-09-14）
 
-**剩余待定 1 项（2026-09-12 更新）**：改动六里 `CategoryListView` 的「多列 + 拖拽」——前提已变更为「**平板必须保留拖拽**」（原选项 A「平板关拖拽」出局），候选收敛为两条，均已在改动六「候选收敛」小节留档：
+**改动六拖拽候选沿革（留档）**——前提「平板必须保留拖拽」（原选项 A「平板关拖拽」出局）：
 
 - **方案三** = 交还系统原生让位（= 原选项 B）：体验上限最高、改动最小；但须先实机验证两个前提（`lanes` 下系统会网格让位 / 不返回 preview 仍有跟手预览），且**必然牵连竖屏**（须加分支隔离）。
 - **方案一** = 不做让位 + 目标格高亮 + 自算网格落点：落点精度可控（前提是不裸信系统 `insertIndex`），竖屏可零改动，实现工作量居中。
+- **方案四**（2026-09-14 新增）= 排序收进半屏 CustomDialog 面板（面板内单列复用现有拖拽状态机）：**长按触发保留**（面板内与手机逐像素一致）、`ImmMaterial.dialog()` 官方沉浸光感成立（CustomDialog 是官方认可弹窗宿主；`bindSheet` / 自绘浮层均不行）、拖拽逻辑**零重写**、入口不加新按钮（平板档点「自定义排序」= 开面板）；主列表多列纯浏览、长按回归置顶语义。详见改动六「候选收敛」小节。
 
-**待用户后续拍板**（本阶段仅留档，未动代码）。
+**2026-09-14 增量讨论（同日拍板见各项标注）**
+
+1. **弹窗六处封顶（✅ 已拍板「弹窗不拉伸」）**：本页 6 处 `dialogCardWidth()`（置顶 / 批量删除 / 分类删除 / 分类管理 / 备份 / 导出）均未封顶 → 平板下通栏拉伸（§4.8 T-H 已记的全站遗留项）。拍板采用 T-H 同款：统一为 `max(200, min(400, 屏宽 − 48))`（手机档 312 < 400 **逐像素不变**）。半屏排序面板（方案四）宽度另用 `min(屏宽 − 48, 520)`（要放列表，比确认弹窗宽一档）。
+2. **帖子卡多列容器补备选**：改动三原推 `WaterFlow`；自 §4.9 / §4.10 落地后新增两条实证经验——① `WaterFlow + sections` 存在引擎级段计数竞态（真机两轮复现卡片重叠 / 列溢出，已在 §4.9 / §4.10 弃用）；② 「列内独立堆叠 + **方案 B 带滞回最短列分桶**（阈值 240、确定性高度估算、前缀稳定不跳位）」已落地验证。本页帖子卡若嫌 `lanes` 行内留白（最多差约 54vp），备选改「`Scroll` + 列内独立堆叠 + 方案 B 分桶」，但须重挂 `Refresh` / `onReachEnd` / 滚动恢复 / 空态三个占位 `ListItem`，工作量高于 `lanes`。默认仍推 `lanes`（拖拽语义最稳），方案 B 列为备选留档。
+3. **骨架屏红线**：本页 `ListRowSkeleton` 若加多列分支，`columns` **默认必须 = 1**（§4.8 教训：该类共享组件默认值改了会殃及单列页）。
+4. **拖拽实现脆弱点备忘**：`CATEGORY_CARD_HEIGHT=80` / `STEP=92` 是写死常数，字号放大（fontScale）或改卡结构会错位——无论最终选哪个方案，拖拽相关改动都不得再加深对该常数的耦合；方案四因完全复用现状，天然满足。
+
+**待用户后续拍板** → **全部拍板完毕（2026-09-14）**。
+
+**落地清单（2026-09-14 开工，全部完成，构建通过待真机验收）**：
+
+- **改动一（胶囊左对齐）**：槽位 `FavTitleBar` 与兜底 `CategoryTabs` 两处同步——胶囊 `layoutWeight(favColumns()>1 ? 0 : 1)` + `padding 22`（饱满度），多列档行尾加 `Blank()` 吸右；手机等分逐像素不变。未抽 `CatTabPill` builder（两处玻璃实现不同，直改更稳）。
+- **改动二（收藏夹列表 lanes）**：`FolderListView` 加 `.lanes(max(1, favColumns()), Spacing.md)`；通栏项（顶部让位 `placeholderHeight()` / 同步提示 / 底部 90）收进 **`ListItemGroup` header / footer**（`FolderListHeader` / `FolderListFooter`）→ lanes 下分列、header/footer 恒整行。等高 80 卡无留白，未用瀑布流。
+- **改动三（点开列表瀑布流）**：`ForumThreadsView` 换 `WaterFlow`（`forumColumnsTemplate()` 3/4 列 + gap md）；顶部 98 让位与底部 90 占位**移出流**为兄弟节点、空态替换整流；无 `sections`、无 Grid 坑、无分页牵动（执行要点 4 条兑现）。
+- **改动四（基础设施）**：新增 `pageWidth` / `pageHeight`（`aboutToAppear` 首帧初值 + 根 Stack `onAreaChange` 兜底）、`isLandscape()` / `favColumns()`（竖 3 / 横 4、闸门 + 600 门槛）/ `forumColumnsTemplate()`。
+- **改动五（搜索态）**：搜索框内嵌返回钮（槽位 `FavTitleBarRow` + 兜底 `TopBar` 两处同步，`Stack` 左内嵌 SymbolGlyph + `hitTestBehavior(Block)`，外层高 44 槽位高度不变）；`SearchResultView` 列表换 `WaterFlow`（同改动三口径，让位 / 占位移出流）。
+- **改动六（方案四拖拽 + 两列表多列）**：① 拖拽回调抽共享方法 `catDragBegin` / `catDragMove` / `catDrop`（`prepend` 与跟随 `Scroller` 参数化）+ `displaceOffsetOf(catIndex, prepend)`；② `CategoryListView` 平板多列浏览分支（`lanes` + `ListItemGroup.header` 收纳占位 / 同步 / 新建卡 / 未分类卡，**无拖拽**），手机档原结构原回调逐像素不变；③ **半屏排序面板** `CategorySortPanelContent`：`bindSheet`（62% 高、`ImmMaterial.sheet()`，与「移入分类面板」同机制同材质档）内单列 `List` 完整复用拖拽状态机（prepend=1 + 独立 `panelCategoryScroller`），入口不变（平板点「自定义排序」开面板）、完成按钮关闭 + 下滑关闭时 `resetCatDragState()`；主列表长按回归管理语义；④ `CategoryThreadsView` 平板多列分支（`lanes` + header/footer 收纳，拖拽保留，索引基准 = 组内 0 起免 -1 换算），空态替换整列表。
+- **改动七（弹窗封顶）**：`dialogCardWidth()` → `max(200, min(400, 屏宽 − 48))`（T-H 同款），6 处弹窗一次生效；手机档 312 < 400 逐像素不变。
+- **壳更正说明**：方案四面板壳落地用 **`bindSheet` 半模态**（`ImmMaterial.sheet()`）而非讨论时假设的 `CustomDialog`——本页 §6.8 已实证半模态为官方沉浸光感 A 档槽位（「移入分类面板」同款在用），讨论时「bindSheet 无光感」为误判；好处是面板内容可直接访问页面状态、拖拽复用零桥接。拍板意图（半屏面板 + 官方沉浸光感 + 长按拖拽保留）全部兑现。
+- `tools/build.ps1` → **BUILD SUCCESSFUL**（31s）；**lint 0**。
 
 ### 4.4 消息页（`pages/MessagesTab.ets`）
 
@@ -1967,10 +2043,12 @@ Column({ space: 0 }) {                      // 整体卡背景与圆角保留（
 - **末行补空位**：置顶通常仅 1~3 条，4 列时末行大概率不满 → `threadBlankSlots()` 必补（与 T-C 同款），键前缀 `pin_gap_` 避免与帖子区空位键冲突。
 - **通栏项（§6.2 第 3 步）**：顶部 90 占位、吧头块、**「置顶」标签行**、加载更多行、`EmptyView` / `ErrorView` / 骨架屏、底部 `padding` —— 全部在分列 `Row` 之外 ✅。
 
-**T-D 搜索态多列（同一套行分组；用户 2026-09-13 定：与列表态同列数 = 竖 3 / 横 4）**
+**T-D 搜索态多列（同一套行分组；用户 2026-09-13 定：与列表态同列数 = 竖 3 / 横 4；**2026-09-14 二次更正：改「列内独立堆叠 + 方案 B 分桶」瀑布流**）**
 
-- `SearchResultsBuilder()` 内 `ForEach(this.searchThreads())`（`2821`）→ 同一 `threadRows()` + 同一 `threadColumns()`，末行同样补空位。
-- **通栏项**：进度行（`2813-2819`）、三种提示态（空关键词 / 正在搜索 / 未找到）、底部状态行（`2849+`）—— 全在分列 `Row` 之外 ✅；固定高 320 的三个提示态（`2784` / `2792` / `2809`）是通栏，**不被列宽压缩**，不动。
+- ~~`SearchResultsBuilder()` 内 `ForEach(this.searchThreads())` → 同一 `threadRows()` + 行分组 + 末行补空位~~ → **2026-09-14 用户要求「跟首页一样的瀑布流」**：行分组会把矮卡下方留白拉大（有无图 / 图多图少交错时尤甚）→ 改**列内独立堆叠 + 方案 B 带滞回最短列分桶**（`searchColumnsData()` + `estimateSearchCardHeight()` + `searchColIndexes()`，阈值 `THREAD_SEARCH_COL_BALANCE_THRESHOLD=240`，与 §4.9 / §4.10 / 收藏页同款）。结构照收藏页五轮教训：外层 ForEach **只遍历列索引**（key 稳定复用列容器），内层数据源**直读状态源** `searchColumnsData()[colIdx]`（不用外层传入 col，否则复用断链不更新）；新增卡片 160ms 淡入。
+- **容器不变**：搜索态在外层 `Scroll` 内（与列表态多列的 `WaterFlow` 整页滚动是不同容器），`WaterFlow` 嵌 `Scroll` 是滚动劫持反模式 → 不换容器，滚动 / 预加载（`onScroll` 提前取批）/ `onReachEnd` 兜底 / `maybeAutoContinueSearch` 全部原样。
+- **通栏项**：进度行、三种提示态（空关键词 / 正在搜索 / 未找到）、底部状态行—— 全在分列 `Row` 之外 ✅；固定高 320 的三个提示态是通栏，**不被列宽压缩**，不动。
+- **`cardColumns` 无需处理**：`syncCardColumns()` 本就无条件下发 `threadColumns()`，搜索态多列下 `ThreadCard` 已按多列几何渲染（标题 2 行 / 图 1.6 比例 / 宫格 1:1 封顶）。
 - 搜索态**没有置顶区**（只出 `ThreadCard`）→ T-C 的置顶讨论不涉及搜索态。
 - 取数逻辑（`FSEARCH` 服务端优先 + 本地兜底扫描、`searchNextBatch`、`maybeAutoContinueSearch`、`onReachEnd` 兜底）**零改动**，只改渲染层。
 
@@ -3044,6 +3122,8 @@ List({ space: Spacing.sm, scroller: this.postsScroller }) {
 
 > 用户 2026-09-13 批注：「那就采用同一方案」→ 本节与 §4.11 **同范式**（容器保留 `List` + `.lanes()`），差异项全部单独标注，**两节数值与理由不得互相照抄**。
 
+> **⚠️ 2026-09-14 用户新拍板推翻 lanes 方案 → 已落地瀑布流**：用户要求「我的帖子 / 我的点赞 / 浏览历史三个界面采用首页一样的瀑布流，竖屏 3 列 / 横屏 4 列」→ 原「`List + lanes` 竖 2 / 横 3」**作废**，改**列内独立堆叠 + 方案 B 带滞回最短列分桶**（与 §4.9 / §4.10 / §4.8 T-D / 收藏页同款范式）。落地内容：① 形态判定从零建（§4.12 原记红线兑现）：`isWideFormDevice`（tablet/2in1/isFoldable，T-B 同款）+ `pageWidth` / `pageHeight` / `isLandscape`（`refreshFormMetrics()`：`aboutToAppear` 首帧 + 根 Stack `onAreaChange` 兜底）+ `currentWidth`；`pcColumns()` = 闸门 + `>= Breakpoint.sm(600)` + 横 4 / 竖 3。② 多列档 `List` 结构：外层 ForEach **只遍历列索引**（key `pcol_${i}` 稳定复用列容器），内层**直读状态源** `pcColumnsData()[colIdx]`（收藏页五轮教训：不用外层传入 col）；新增卡片 160ms 淡入。③ `pcColumnsData()` 方案 B（阈值 `PERSONAL_COL_BALANCE_THRESHOLD=240`）+ `estimateContentCardHeight()`（ContentCard 无图片区：标题/摘要 ≤2 行 + 信息行，高度差 ≤80vp → 滞回 240 下几乎恒为纯轮转）。④ 预加载分档：多列档 `onScrollIndex` 改「最后一列可见」触发 `loadMore`（ListItem 数 = 列数，原「距末 5 项」判据失效；`loadingMore` 防抖兜底），单列档原样。⑤ `List` 容器 / `onReachEnd` / padding / 沉浸挂点 / 三态视图 / 4 mode 语义零改动；`collections` mode 无入口但共用同一容器逻辑，随多列生效。**待真机复验**（竖 3 / 横 4 瀑布流 / 长列被补位 / 翻页不跳位 / **卡内底行窄列溢出复查**〔原 §4.12 红线〕/ 手机单列逐像素不变）。
+
 **定位与命名澄清（2026-09-13）**
 - 本页 = 「我的」页三个入口（我的帖子 / 我的点赞 / 浏览历史）进去的内容归档页（`@Entry` 二级页）；全工程 `pages/PersonalContent` 的 `pushUrl` **只有 `MineTab.ets:117` 一处**。
 - 与 §4.11 不是同一页：本页**没有用户信息区**（无头像 / 昵称 / 统计），也**不能看别人**（`accountId` 取 `AuthManager.getInstance().getUser()?.userId`）。两者重叠面 = 同一套帖子卡（`UserProfile` 的 `PostCard` 注释即写明「复用 `PersonalContent.ContentCard` 样式」）与同一取帖接口。
@@ -3372,6 +3452,12 @@ A / B / C / D 四类风险的定义与判定依据见 §6.1 的四张表（A 错
 
 | 日期 | 更新内容 | 自检结论 |
 |---|---|---|
+| 2026-09-15 | **§4.11 用户主页双 Tab 左右滑动切换（交互新增，范式照抄首页 `Index.switchTab`）**：内容区由条件渲染改为**双页平移栈**（两页常驻/首访挂载 + `Visibility` 控制可见 + `translate` 百分比位移 + `zIndex` 进场页在上），新增 `switchTab` 方向感知滑入（`springMotion(0.72,0.86)` 320ms + `animLock` + `setTimeout` 420ms 复位，与首页逐项同源）与水平 `PanGesture` 跟手拖拽（`distance 12` + `PanDirection.Horizontal` 方向竞争让位给列表垂直滚动；位移过 1/4 页宽或甩速 700vp/s 提交，边缘阻尼 35%，未达阈值 spring 回弹；关注的吧页拖拽开始即挂载并触发懒加载）。**不用 Swiper**（沿用本页既有决策：其手势抢占 List 垂直滚动）。`tools/build.ps1` → **BUILD SUCCESSFUL**；**待真机验收**（点击胶囊滑入动画 / 左右跟手拖拽 / 拖拽中列表垂直滚动不冲突 / 两页滚动位置保留 / 折叠屏展开↔折叠） | A 错位：**无**（两页均 `width('100%')` 满宽平移，无双列/网格语义）。B 出屏：**无**（外层 `clip(true)`，页移出即裁剪）。C 重叠：**无**（可见性只允许当前页+退场页/拖拽邻页同屏，进场页恒在上层；顶栏/底栏悬浮层在栈外不受平移影响）。D 手机回归：**无**（不引入形态/列数分支，全宽度档同款行为；两页内部几何零改动；`Header` / 顶部让位 98 / 底部 160 占位 / 分段胶囊零改动；列表垂直滚动方向竞争已由 `PanDirection.Horizontal` + `distance 12` 让位，必测回归 = 帖子 Tab 上下滚动 / 滑动中途反向回弹 / 折叠屏展开↔折叠） |
+| 2026-09-15 | **§4.11 用户主页「关注的吧」顶栏让位修复（手机端缺陷修复，非平板方案变更）**：用户真机反馈关注的吧列表内容与顶栏重叠 → `LikeTabContent` 列表首项补 `height(98 + Spacing.sm)` 顶部占位 `ListItem`（顶栏让位 98 与 `Header` 同源、随内容滚走、列表项从透明标题栏下穿过与帖子 Tab 行为对齐）；Loading（`ThreadListSkeleton`）/ Error / Empty 三个非滚动状态补同值 `.padding({ top: 98 + Spacing.sm })`。**同日微调两轮**：首版呼吸用 `Spacing.md`(12)，真机反馈略多 → 收为 `Spacing.sm`(8) → 仍多 → 收为 **98 整（零呼吸）**，首卡紧贴顶栏下缘。`tools/build.ps1` → **BUILD SUCCESSFUL**；**待真机验收** | A 错位：**无**（占位值单一来源 = 顶栏高 98，无新增像素魔法数）。B 出屏：**无**（仅顶部让位，列表 `width('100%')` / 左右 `Spacing.lg` 不变）。C 重叠：**有 1 处、已销**（本修复即为销 C 类重叠：关注的吧内容顶入透明顶栏；官方槽位与兜底两路径共用 `LikeTabContent`，一次修复两路径生效；`Header()` 几何未动，§4.11 红线「不改 Header」未违反）。D 手机回归：**无**（本修复即手机端行为修正、全宽度档一致生效，不引入任何形态/列数分支；`PostTabContent` / `Header` / 分段胶囊 / 底部 160 占位零改动；折叠屏展开↔折叠无新增面） |
+| 2026-09-14 | **§4.3 收藏页平板适配开工落地（改动一~七全部完成）**：① 改动一胶囊左对齐（槽位 + 兜底两处同步，多列档 `layoutWeight 0` + padding 22 + 行尾 `Blank()`）；② 改动二 `FolderListView` 加 `lanes(3/4)`，通栏项收 `ListItemGroup` header/footer；③ 改动三 `ForumThreadsView` 换 `WaterFlow`（3/4 列，让位 / 占位移出流、空态替换整流、无 sections、无 Grid 坑）；④ 改动四基础设施（`pageWidth/pageHeight` 首帧初值 + 根 Stack `onAreaChange`、`favColumns()` 竖 3 横 4、`forumColumnsTemplate()`）；⑤ 改动五搜索框内嵌返回钮（两处同步）+ `SearchResultView` 换 `WaterFlow`；⑥ 改动六拖拽回调抽共享方法（`catDragBegin/catDragMove/catDrop` + `prepend`/`Scroller` 参数化）+ `CategoryListView` 平板多列浏览分支（无拖拽）+ **方案四半屏排序面板**（`bindSheet` + `ImmMaterial.sheet()`，面板内单列复用拖拽，`prepend=1` + 独立 Scroller；壳由讨论时的 `CustomDialog` 更正为 `bindSheet`——§6.8 已实证半模态为官方 A 档槽位）+ `CategoryThreadsView` 多列 lanes 分支（拖拽保留、索引基准组内 0 起）；⑦ 改动七 `dialogCardWidth()` 封顶 400。`tools/build.ps1` → **BUILD SUCCESSFUL**（31s）；**lint 0**；**待真机验收** | A 错位：**有 2 处、已规避**（lanes 通栏项占 1 格 → `ListItemGroup` header/footer 收纳；`WaterFlow` 混排通栏项 → 让位 / 占位移出流 + 无 sections 天然规避段计数竞态）。B 出屏：**无**（列宽全 `1fr` / `lanes` 均分；弹窗 / 面板封顶）。C 重叠：**无**（`PostCard` 无宫格区；面板拖拽复用已验证手绘让位，主列表多列无拖拽）。D 手机回归：**无**（手机 360：`favColumns()` 闸门恒 1 → 所有新分支不生效、走原结构逐像素不变；弹窗 312<400 不封顶；不弹排序面板；必测回归路径 = 手机收藏夹列表 / 点开列表 / 搜索态 / 自定义分类长按拖拽 / 六处弹窗 / **折叠屏展开 3 列 ↔ 折叠回单列**） |
+| 2026-09-14 | **§4.3 容器二次更正（更新文档，不开工）**：用户复核发现**收藏夹点开后的列表卡片高度不一致**（`PostCard` 高度随文本行数可变）→ 改动三由 `lanes` **二次更正为 `WaterFlow` 瀑布流**（首拍「不用瀑布流」仅适用于等高的收藏夹列表）；收藏夹列表 `lanes` 维持不变，两列表容器**有意分叉**（等高 `lanes` / 可变高 `WaterFlow`）。改动三新增执行要点 4 条：① 顶部 98 让位与底部 90 占位**移出流**（通栏项严禁进 `WaterFlow`）；② 流内只有帖子一种格子 → **无需 `sections`**，§4.9/4.10 的段计数竞态坑天然规避；③ `PostCard` 无宫格区 → 无 Grid 高度坑；④ 无 scroller / 无 `onReachEnd` / 无分页 → 滚动与分页零牵动。状态汇总第 3 条、§三 第 3 项同步。**代码未改** | A 错位：**有 1 处、已规避**（`WaterFlow` 若混入通栏项会触发占 1 格错位 → 顶部 / 底部占位移出流、空态替换整流；`WaterFlow + sections` 段计数竞态因无混排天然规避）。B 出屏：**无**（列宽全 `1fr`；弹窗 / 面板封顶不变）。C 重叠：**无**（`PostCard` 无宫格区 → 无 Grid 自测量高度歧义；文本自然高即终值）。D 手机回归：**无**（手机 360：闸门恒 1 列 → 点开的列表仍走原 `List` 单列结构逐像素不变，`WaterFlow` 仅多列档生效；必测回归路径 = 手机收藏夹 / 点开列表 / 折叠屏展开 3 列 ↔ 折叠回单列） |
+| 2026-09-14 | **§4.3 收藏页全量拍板转「已确认」（更新文档，不开工）**：用户拍板 4 项——① **列数竖 3 / 横 4**（收藏夹列表 / 点开的帖子列表 / 搜索态同口径，原「竖 2 / 横 3」作废）；② **容器不采用瀑布流**，改动三定案 `List + lanes`（理由「宽度和高度都一致」，行内留白 ≤54vp 接受；选项 A `WaterFlow` 出局留档），通栏项收 `ListItemGroup` header/footer 口径不变；③ **拖拽采用方案四**（排序收进半屏 CustomDialog 面板：入口不变、面板内单列复用现有拖拽状态机 → 长按保留 + `ImmMaterial.dialog()` 沉浸光感 + 零重写；方案一 / 三出局留档）；④ **弹窗不拉伸**：六处 `dialogCardWidth()` 封顶 T-H 同款 `max(200, min(400, 屏宽−48))`，手机档 312 < 400 逐像素不变。§4.3 改动二 / 三 / 四 / 五列数与代码块、改动六候选状态、风险 6.1 / 7、状态区汇总、§三 第 3 项全部同步。**代码未改** | A 错位：**有 1 处、已规避**（`lanes` 行内高度差留白 ≤54vp——用户拍板**接受**，非缺陷；收藏夹卡等高 80 无此问题；通栏项收 `ListItemGroup` header/footer 防 lanes 占 1 格错位〔风险 1 沿用〕）。B 出屏：**无**（列宽全 `1fr` / `layoutWeight`，无像素列宽；弹窗封顶后无通栏）。C 重叠：**无**（方案四面板内单列拖拽复用已验证手绘逻辑，不引入网格让位；主列表多列纯浏览无拖拽）。D 手机回归：**无**（手机竖屏 360：`favColumns()` 闸门恒 1 列走原 `List` 结构；弹窗 312 < 400 封顶不生效；面板宽 312 < 520 不生效且手机不弹面板；`ListRowSkeleton` 默认 1 列红线已记录；必测回归路径 = 手机收藏夹列表 / 分类内长按拖拽 / 六处弹窗宽度 / 折叠屏展开 3 列 ↔ 折叠回单列） |
+| 2026-09-14 | **§4.3 收藏页增量讨论并入（更新文档，不开工）**：① 改动六拖拽候选新增**方案四**（排序收进半屏 CustomDialog 面板：入口不变、面板内单列复用现有拖拽状态机 → 长按触发保留 + `ImmMaterial.dialog()` 官方沉浸光感成立〔`bindSheet` 非官方槽位、自绘浮层 out of scope 均排除〕、拖拽零重写、主列表长按回归置顶语义），候选一 / 三 / 四留档待拍板；② 新增「2026-09-14 增量讨论」4 条：弹窗六处 `dialogCardWidth()` 封顶顺带项（T-H 同款，手机档零回归）/ 帖子卡多列容器补「列内独立堆叠 + 方案 B 分桶」备选（默认仍推 `lanes`）/ 骨架屏 `columns` 默认 1 红线 / 拖拽常数（80 / 92）脆弱点备忘；状态行候选数同步。**代码未改** | A 错位：**无**（纯方案留档，无几何改动；方案四面板为单列 `List`，与手机同款几何，无网格重排）。B 出屏：**无**（面板固定宽 `min(屏宽−48, 520)` + 高约 60% 屏，CustomDialog 自带遮罩边界）。C 重叠：**无**（面板拖拽复用已验证的手绘让位逻辑，不引入网格让位；多列浏览态不做拖拽）。D 手机回归：**无**（手机档不弹面板、走原「切模式 + 列表内拖拽」路径逐像素不变；弹窗封顶 `312 < 400` 不生效；面板宽 `312 < 520` 不生效；必测回归路径 = 手机自定义分类长按拖拽 + 六处弹窗宽度） |
 | 2026-09-13 | **§4.2 首页多列档「行等高 + 互动栏底对齐」二次修正**：用户真机验证发现 `Blank()` 与 `SpaceBetween` 在复杂卡内均失效（多宫格卡操作栏丢失、纯文本卡被 `Scroll` 无限高度异常拉长）→ 最终把 `ThreadCard` 改为「内容区 `.layoutWeight(1)` 占满剩余空间 + 根 `Column` `.constraintSize({ maxHeight: 560 })` 上限护栏」，保持行容器 `Flex(Stretch)` + 卡片调用点 `.height('100%')` 不变；§4.2 决策 11 / 落地清单 #7 / 风险自检 C 行 / §6.1 A6·A7 同步刷新；`tools/build.ps1` → **BUILD SUCCESSFUL**；**待真机复验** |
 | 2026-09-13 | **§4.10 楼中楼详情同步 §4.9 二次拍板（更新文档，不开工）**：用户指示「楼中楼一起改」→ 回复区改 `WaterFlow` 三列 / 宫格不拉伸左对齐 / 横屏左栏按内容宽；新增 **SP-G ~ SP-K**，一次方案「手写双列 / 4 : 6」作废。**与 §4.9 的三处不可照抄点**：① `sections` **段数 = 2**（本页无触底哨兵，省略段 2）；② 间距语言 = `Spacing.sm`(8)（非 `Spacing.md`12）；③ 卡内追加间距的**全局下标判定**需重算（多列后每列末条多留 8vp → 列底空洞；改法：挪到 `rowsGap` 或传列内下标）。`syncSections()` 挂点**多一处**：`locateNotifyTarget()` 追加 `commentsState` 时同步（漏了 `itemsCount` 不匹配 → **整页无法滚动**）。SP-H 锚点 `spc_` 随卡入 `FlowItem`；SP-J 本页 `ImageGrid` 独立实现需单独加 `maxWidth`；SP-K 沉浸层仅 `overlay` + `blendMode` 两项且遮罩为 `height('100%')` 整区形态，**两项同层同迁**后真机复验底部渐隐。待拍板点 5 / 6 / 7 沿用 §4.9 拍板值；状态行同步「§4.6 H-B 已非阻塞」。**代码未改** |
 | 2026-09-13 | **§4.9 帖子详情二次拍板（更新文档，不开工）**：用户同日二次拍板 → 竖屏「帖子内容不动 + **宫格图不拉伸不放大且左对齐** + 回复区改**首页 `WaterFlow` 瀑布流三列**」、横屏「左帖右回复、回复区**三列瀑布流**、**帖子区域宽度 = 帖子本身宽度**」。文档更新：§4.9 新增「二次拍板」块 + **DT-G ~ DT-J**（DT-G `WaterFlow`+`sections` 跨列〔含 5 条硬约束：`itemsCount` 累计和必须等于子节点数、哨兵须恒渲染、`sections` 是构造参数、不设 `onGetItemMainSizeByIndex`、`itemsCount` 不得为 0〕；DT-H 定位锚点随卡入 `FlowItem`；DT-I 横屏左栏固定宽取代 4 : 6；DT-J `ImageGrid` 加 `maxWidth` 实现不拉伸 + 自动左对齐，一改三处且手机档不生效），标注一次方案的「手写双列 / 4 : 6」作废；新增待拍板点 5 / 6 / 7；状态行更正「§4.6 H-B 已非阻塞（可照抄 §4.8 本地判据写法）」；§4.10 加同步提醒（本页是否沿用待确认，且无触底哨兵 → DT-G 段 2 应省略）。**代码未改**（用户明确不开工） |
