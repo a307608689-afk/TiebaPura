@@ -19,7 +19,7 @@
 import { AbilityConstant, UIAbility, Want, common, ConfigurationConstant, Configuration } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig } from '../common/Theme';
+import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig, isWideBarDevice } from '../common/Theme';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY } from '../common/Constants';
@@ -82,6 +82,16 @@ export default class EntryAbility extends UIAbility {
       try {
         const mainWindow: window.Window = await windowStage.getMainWindow();
         await mainWindow.setWindowLayoutFullScreen(true);
+        // 阔直屏：解锁自动旋转（docs/TiebaPura阔直屏适配.md §2.4）。
+        // module.json5 未锁方向（默认 unspecified 跟随系统自动旋转开关），而用户系统开关多半
+        // 是关的 → 阔直屏形态下永远竖屏、横 3 列不可达。AUTO_ROTATION = 跟随重力、
+        // 不受系统开关限制；非阔直屏设备（含 Pura X 折叠态）不进此分支，回归默认 unspecified 行为。
+        if (isWideBarDevice()) {
+          mainWindow.setPreferredOrientation(window.Orientation.AUTO_ROTATION).catch((err: Error) => {
+            hilog.error(0x0000, TAG, 'setPreferredOrientation(AUTO_ROTATION) failed: %{public}s',
+              JSON.stringify(err));
+          });
+        }
         // 缓存主窗口：Theme.setDarkMode 切换深色时要同步状态栏内容色，避免每次异步 getLastWindow
         AppStorage.setOrCreate<window.Window>('mainWindow', mainWindow);
         // 初始化持久化深色设置到 AppStorage + 同步模块变量 + 同步状态栏内容色。

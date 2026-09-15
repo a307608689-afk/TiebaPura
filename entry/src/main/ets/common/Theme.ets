@@ -992,6 +992,103 @@ export const Breakpoint: BreakpointToken = {
   lg: 1440,
 };
 
+// ========== 阔直屏形态判定（docs/TiebaPura阔直屏适配.md §二）==========
+
+/** 阔直屏型号兜底（只做兜底、不做主判据：同设备有 AL00/TN00/TL00 等市场变体，硬编码每出新机都要发版） */
+const WIDE_BAR_MODEL: string = 'VOL-AL00';
+
+/**
+ * Pura X 折叠屏展开态按阔直屏档的型号清单（2026-09-15 用户指定）：
+ * VDE-AL00 / VDE-AL10，展开 6.3" 16:10（2120×1320）。
+ * 折叠态外屏 ~21:9 窄屏，**不**按阔直屏（竖 2 列会拥挤）——展开按阔直屏档、折叠回落手机档
+ * （isWideFormDevice 对折叠屏恒 true → 各页宽度闸门把折叠态拦回 1 列，与既有平板路径一致）。
+ */
+const WIDE_BAR_FOLD_MODELS: string[] = ['VDE-AL00', 'VDE-AL10'];
+
+function isPuraXFoldModel(): boolean {
+  return WIDE_BAR_FOLD_MODELS.indexOf(deviceInfo.productModel) >= 0;
+}
+
+/** 判定探针日志只打一次（isWideBarDevice 在渲染路径被高频调用，不能刷屏） */
+let _wideBarProbeLogged: boolean = false;
+
+/**
+ * 阔直屏判定（§2.1）：Pura X 展开态 → 直板非折叠闸门 → 型号兜底 → 物理长宽比带。
+ * - 主判据 = 能力带：deviceType==='phone' && !isFoldable && 长边/短边 ∈ (1.4, 1.85)
+ *   （16:9.5 ≈ 1.684 居中；普通手机 ≥ 2.1、平板 1.33~1.6 被 deviceType 挡）
+ * - Pura X（VDE-AL00/AL10）：**展开态**按阔直屏档（16:10 大屏），折叠态返回 false 回落手机档
+ *   —— 本函数在渲染路径被实时调用，折叠/展开切换后由各页 onAreaChange / display.on('change')
+ *   触发重渲染自动翻档；非展开的 HALF_FOLDED 不算（用户指定仅展开态）
+ * - 比例用物理像素（密度无关，旋转不变）；异常一律返回 false（安全方向 = 手机档）
+ * - 历史注：曾附「forceWideBar 调试开关」（无真机期验证用），2026-09-15 随云调试真机验证
+ *   通过后移除（设置页开关 + 持久化恢复 + 本函数开关段一并拆除）
+ */
+export function isWideBarDevice(): boolean {
+  try {
+    if (display.isFoldable()) {
+      // 折叠屏只认 Pura X 展开态；其它折叠设备维持既有平板档（isWideFormDevice 闸门）不变
+      const hit: boolean = isPuraXFoldModel()
+        && display.getFoldStatus() === display.FoldStatus.FOLD_STATUS_EXPANDED;
+      logWideBarProbe(0, hit);
+      return hit;
+    }
+    if (deviceInfo.deviceType !== 'phone') {
+      return false;
+    }
+    if (isPuraXFoldModel() || deviceInfo.productModel === WIDE_BAR_MODEL) {
+      // Pura X 折叠态已在上一个分支返回 false，这里兜上报异常的非折叠变体
+      logWideBarProbe(0, true);
+      return true;
+    }
+    const d: display.Display = display.getDefaultDisplaySync();
+    const w: number = d.width;
+    const h: number = d.height;
+    if (w <= 0 || h <= 0) {
+      return false;
+    }
+    const ratio: number = Math.max(w, h) / Math.min(w, h);
+    const hit: boolean = ratio > 1.4 && ratio < 1.85;
+    logWideBarProbe(ratio, hit);
+    return hit;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 首次判定时打一条探针日志：真机到手第一时间核对 productModel / 比例，校准阈值（阔直屏文档 §2.4-2） */
+function logWideBarProbe(ratio: number, hit: boolean): void {
+  if (_wideBarProbeLogged) {
+    return;
+  }
+  _wideBarProbeLogged = true;
+  try {
+    const d: display.Display = display.getDefaultDisplaySync();
+    const r: string = ratio > 0 ? ratio.toFixed(3) : 'model-override';
+    console.info(`[WIDEBAR] model=${deviceInfo.productModel} type=${deviceInfo.deviceType} `
+      + `foldable=${display.isFoldable()} px=${d.width}x${d.height} ratio=${r} hit=${hit}`);
+  } catch (e) {
+    // 日志失败不影响判定
+  }
+}
+
+/**
+ * 大屏形态设备（平板 / 2in1 / 折叠屏 / 阔直屏）单一来源（阔直屏文档 §2.2 收口）：
+ * 各页原 `deviceType==='tablet' || '2in1' || isFoldable()` 三行重复表达式统一改调本函数。
+ * 折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别；阔直屏为直板机，靠 isWideBarDevice 识别。
+ */
+export function isWideFormDevice(): boolean {
+  try {
+    if (deviceInfo.deviceType === 'tablet'
+      || deviceInfo.deviceType === '2in1'
+      || display.isFoldable()) {
+      return true;
+    }
+  } catch (e) {
+    // 取值失败继续走阔直屏判定（其内部自带 try/catch）
+  }
+  return isWideBarDevice();
+}
+
 /**
  * 顶部满宽渐显带的平板收窄比例（2026-09-13，用户反馈平板竖屏下各页渐显覆盖到第一个卡片中部）：
  * 平板 / 大屏形态下渐显只覆盖顶部按钮与标题（`coverVp` = 该页顶部固定区高度，一般为顶栏 98），
@@ -1000,9 +1097,7 @@ export const Breakpoint: BreakpointToken = {
  * 用法：各页 `BottomFadeOverlay` 的中间渐变 stop 写 `tabletTopFadeStop(该页顶部固定区高度)`。
  */
 export function tabletTopFadeStop(coverVp: number): number {
-  const wide: boolean = deviceInfo.deviceType === 'tablet'
-    || deviceInfo.deviceType === '2in1'
-    || display.isFoldable();
+  const wide: boolean = isWideFormDevice();
   if (!wide) {
     return 0.15;
   }

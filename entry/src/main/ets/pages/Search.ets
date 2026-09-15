@@ -31,7 +31,7 @@
 import { curves } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager } from '../common/Theme';
+import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { TiebaService } from '../service/TiebaService';
 import {
   GlobalForumResult, GlobalForumSearchData, GlobalPostResult, GlobalPostSearchData,
@@ -66,10 +66,7 @@ struct GlobalQueryPage {
 
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.7，2026-09-15 用户拍板重定）=====
   /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别（§4.8 T-B 同款） */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   /** 窗口宽 / 高（vp）：aboutToAppear 同步取首帧初值，onAreaChange 兜底 */
   @State pageWidth: number = 0;
   @State pageHeight: number = 0;
@@ -144,6 +141,10 @@ struct GlobalQueryPage {
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
   private searchColumns(): number {
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 2;
+    }
     if (!this.isWideFormDevice) {
       return 1;
     }

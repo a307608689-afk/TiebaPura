@@ -26,7 +26,7 @@ import { AutoSignNotifier } from '../service/AutoSignNotifier';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { Haptic } from '../common/Haptic';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { compareByName } from '../common/Pinyin';
@@ -372,10 +372,7 @@ export struct ForumsTab {
    * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 15% 渐显覆盖到第一个卡片中部，
    * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98vp，手机维持原比例。
    */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   @State loggedIn: boolean = false;
   @State forumState: LoadState = LoadState.Loading;
   @State follows: FollowItem[] = [];
@@ -1371,6 +1368,10 @@ export struct ForumsTab {
    * 「最小单列宽保护」按用户拍板**不启用**（先用主方案看真机）；「创建吧」卡片随流、不独占。
    */
   private forumColumns(): number {
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3（竖屏与手机档同值）
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 2;
+    }
     if (!this.isWideFormDevice) {
       return 2;
     }

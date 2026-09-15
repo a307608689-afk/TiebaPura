@@ -18,7 +18,7 @@
 
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { TiebaService, BlacklistPermOptions } from '../service/TiebaService';
@@ -140,10 +140,7 @@ struct UserProfile {
 
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.11，2026-09-15 用户重定：瀑布流竖 3 / 横 4 + 弹窗不拉伸）=====
   /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别（§4.8 T-B 同款） */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   /** 窗口宽 / 高（vp）：aboutToAppear 首帧 + onAreaChange 兜底 */
   @State pageWidth: number = 0;
   @State pageHeight: number = 0;
@@ -619,6 +616,10 @@ struct UserProfile {
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
   private profileColumns(): number {
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 2;
+    }
     if (!this.isWideFormDevice) {
       return 1;
     }

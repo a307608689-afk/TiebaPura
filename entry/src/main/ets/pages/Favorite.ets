@@ -27,7 +27,7 @@ import { CategoryMapping, FavCategory, FolderItem, PostCardItem, PersonalContent
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { FavoriteStore, CATEGORY_DEFAULT_ID, BackupFolder, BackupImportSummary, BackupPayload } from '../service/FavoriteStore';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ListRowSkeleton } from '../components/Skeleton';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
@@ -664,10 +664,7 @@ export struct FavoriteTab {
    * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 20% 渐显覆盖到第一个卡片中部，
    * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98 + 分段切换区（至 132），手机维持 20%。
    */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.3 改动四）=====
   /** 窗口宽 / 高（vp）：aboutToAppear 取首帧初值（fadeCoverVp 同源），根 Stack.onAreaChange 实时兜底 */
   @State pageWidth: number = 0;
@@ -683,6 +680,10 @@ export struct FavoriteTab {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
    */
   private favColumns(): number {
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
+    if (isWideBarDevice()) {
+      return this.isLandscape() ? 3 : 2;
+    }
     if (!this.isWideFormDevice) {
       return 1;
     }

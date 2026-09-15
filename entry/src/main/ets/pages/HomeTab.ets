@@ -26,7 +26,7 @@ import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 
@@ -254,10 +254,7 @@ export struct HomeTab {
   @State columns: number = 3;
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.2）=====
   /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别 */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   /** 窗口宽 / 高（vp）：aboutToAppear 同步取首帧初值，onAreaChange 实时兜底 */
   @State pageWidth: number = 0;
   @State pageHeight: number = 0;
@@ -398,13 +395,14 @@ export struct HomeTab {
     this.syncSource(this.folDataSource, this.folThreads);
   }
 
-  /** 竖屏 3 列 / 横屏 4 列（§4.2 决策 12）：同步 AppStorage 让 ThreadCard 内部图片封顶/摘要行数跟随 */
+  /** 大屏竖 3 / 横 4（§4.2 决策 12）；阔直屏竖 2 / 横 3（阔直屏文档 §4.2）：同步 AppStorage 让 ThreadCard 内部图片封顶/摘要行数跟随 */
   private updateColumns(): void {
     try {
       const d: display.Display = display.getDefaultDisplaySync();
       const w: number = this.getUIContext().px2vp(d.width);
       const h: number = this.getUIContext().px2vp(d.height);
-      this.columns = w > h ? 4 : 3;
+      // 阔直屏不依赖宽度阈值（横屏 ~830 < 840 过不了 md 档），列数只看横竖屏
+      this.columns = isWideBarDevice() ? (w > h ? 3 : 2) : (w > h ? 4 : 3);
       AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.columns);
     } catch (e) {
       // 窗口未 attach 时取宽高失败，保持默认 3 列
@@ -416,10 +414,14 @@ export struct HomeTab {
   };
 
   /**
-   * 列数：大屏竖屏 3 / 大屏横屏 4（§4.2 决策 12）；手机（含横屏 / 分屏 / 自由多窗）与窄窗维持现状单列。
+   * 列数：大屏竖屏 3 / 大屏横屏 4（§4.2 决策 12）；阔直屏竖 2 / 横 3；手机（含横屏 / 分屏 / 自由多窗）与窄窗维持现状单列。
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
    */
   private homeColumns(): number {
+    // 阔直屏分支必须在宽度检查之前（竖屏宽 ~500 < 600 会被拦回手机档）
+    if (isWideBarDevice()) {
+      return this.columns;
+    }
     if (!this.isWideFormDevice) {
       return 1;
     }
@@ -1774,7 +1776,7 @@ export struct HomeTab {
                 }
               }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
             }
-            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : '1fr 1fr 1fr')
+            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : this.columns === 2 ? '1fr 1fr' : '1fr 1fr 1fr')
             .columnsGap(Spacing.md)
             .rowsGap(Spacing.md)
             .padding({ left: Spacing.lg, right: Spacing.lg })
@@ -1941,7 +1943,7 @@ export struct HomeTab {
                 }
               }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
             }
-            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : '1fr 1fr 1fr')
+            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : this.columns === 2 ? '1fr 1fr' : '1fr 1fr 1fr')
             .columnsGap(Spacing.md)
             .rowsGap(Spacing.md)
             .padding({ left: Spacing.lg, right: Spacing.lg })

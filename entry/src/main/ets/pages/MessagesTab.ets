@@ -22,7 +22,7 @@ import { display } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { NotifyMessage } from '../model/DataModel';
-import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial } from '../common/Theme';
+import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { formatTime } from '../common/Constants';
 
@@ -84,10 +84,7 @@ export struct MessagesTab {
    * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 15% 渐显覆盖到第一个卡片中部，
    * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98vp，手机维持原比例。
    */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.4，2026-09-14 用户拍板：回复/提到我的采用首页同款
   // 瀑布流观感，竖 3 / 横 4；按 floor-vanish 教训以「Scroll + 列内独立堆叠」实现，禁止回归虚拟滚动容器）=====
   /** 窗口宽 / 高（vp）：aboutToAppear 首帧初值 + NotifyContent 根 Column onAreaChange 兜底 */
@@ -101,6 +98,10 @@ export struct MessagesTab {
 
   /** 列数：大屏竖 3 / 横 4；窄窗与手机 1 列（形态闸门放首行，防手机横屏误命中） */
   private notifyColumns(): number {
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
+    if (isWideBarDevice()) {
+      return this.isLandscape() ? 3 : 2;
+    }
     if (!this.isWideFormDevice) {
       return 1;
     }

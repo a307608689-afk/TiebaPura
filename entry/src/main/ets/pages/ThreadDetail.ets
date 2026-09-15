@@ -29,7 +29,7 @@ import { CACHE_KEY } from '../common/Constants';
 import { FavoriteStore } from '../service/FavoriteStore';
 import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType } from '../model/DataModel';
 import { ThreadDetailResult } from '../service/TiebaService';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadDetailSkeleton } from '../components/Skeleton';
 import { EmojiLoader } from '../network/EmojiLoader';
@@ -546,10 +546,7 @@ struct ThreadDetail {
   @State currentWidth: number = 360;
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.9）=====
   /** 大屏形态设备（平板 / 2in1 / 折叠屏）：静态判定一次。折叠屏 deviceType 为 'phone'，必须单独用 isFoldable 识别 */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   /** 窗口高（vp）：与 currentWidth 配对做横竖屏判定；aboutToAppear 取首帧初值，onAreaChange 兜底 */
   @State pageHeight: number = 800;
   // 从消息页带过来的目标楼层 pid，加载后自动滚动并高亮
@@ -1198,6 +1195,11 @@ struct ThreadDetail {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
    */
   private replyColumns(): number {
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.4，2026-09-15 用户二次改定）：回复区恒 1 列
+    // （竖屏单列；横屏分栏保留、右栏回复单列），平板维持 3 列不动
+    if (isWideBarDevice()) {
+      return 1;
+    }
     if (!this.isWideFormDevice) {
       return 1;
     }
@@ -3099,15 +3101,17 @@ struct ThreadDetail {
   }
 
   /**
-   * 弹窗卡片宽度（vp）= 屏幕宽 - 48vp，等价于改造前自绘浮层的 `calc(100% - 48vp)`。
+   * 弹窗卡片宽度（vp）= min(屏幕宽 − 48vp, 400)，T-H 同款封顶——**弹窗不拉伸**（2026-09-15 用户拍板）。
+   * 原实现只有下限 200 无封顶：平板屏宽 vp 下弹窗拉成通栏（系统默认 400 上限未兜住）。
    * ArkTS 的 Dimension 只接受数值 / 百分比 / 资源，不接受 calc 字符串，故换算成数值。
-   * 取屏幕宽（display）而非窗口宽：弹窗容器宽度本身还受系统上限（默认 400vp）约束，
-   * 分屏 / 折叠态由该上限兜底（与 ThreadList / Favorite 同源实现）。
+   * 手机档「屏宽 − 48」= 312 < 400，逐像素不变；取屏幕宽（display）而非窗口宽。
    */
   private dialogCardWidth(): number {
     const info: display.Display = display.getDefaultDisplaySync();
     const widthVp: number = info.width / info.densityPixels;
-    return Math.max(200, widthVp - 48);
+    const w: number = widthVp - 48;
+    const capped: number = w > 400 ? 400 : w;
+    return Math.max(200, capped);
   }
 
   /**

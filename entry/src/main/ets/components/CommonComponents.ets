@@ -18,6 +18,7 @@
 
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
 import { ImageCache } from '../cache/ImageCache';
+import { display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const LOG_DOMAIN: number = 0x0A01;
@@ -266,6 +267,31 @@ export struct ThreadCard {
   onComment: (tid: string) => void = () => {};
   // 头像点击回调：由父组件(Index/ThreadList)注入实现，跳转用户主页
   onAvatarTap: (authorId: string, author: string) => void = () => {};
+
+  /**
+   * 操作栏收紧判定（docs/TiebaPura阔直屏适配.md，2026-09-15 用户云调试反馈：阔直屏竖 2 列
+   * 窄卡下分享/评论/点赞三胶囊「文字图标比按钮大」溢出）。
+   * 根因：胶囊 layoutWeight(1) 均分、内容（图标 18 + 内距 6 + 文字 13 号）恒占 ~50vp，
+   * 卡宽 < 240 时胶囊被压到 ~55vp 以下内容必溢出（Row 不裁剪、直接画出界）。
+   * 触发档位 = 阔直屏竖 2 列（卡 ~210）；平板竖 2 列卡 ~370 / 平板横 3 列 ~408 /
+   * 阔直屏横 3 列 ~258 / 手机单列均 > 240 不收紧，平板与手机观感零变化。
+   * 卡宽按「屏宽 − 页面左右边距(Spacing.lg×2) − 列间距((列数−1)×Spacing.md)」÷ 列数估算
+   * （不求像素准只求相对准，同 PersonalContent 分桶估算口径）。
+   */
+  private actionCompact(): boolean {
+    if (this.cardColumns <= 1) {
+      return false;
+    }
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      const screenW: number = this.getUIContext().px2vp(d.width);
+      const cardW: number =
+        (screenW - Spacing.lg * 2 - Spacing.md * (this.cardColumns - 1)) / this.cardColumns;
+      return cardW < 240;
+    } catch (e) {
+      return false;
+    }
+  }
   /**
    * 图片加载失败标记：任一图加载失败时降级为作者头像缩略 + 失败提示，
    * 避免大图区域显示占位（看起来像"图片没出来"）。
@@ -571,20 +597,22 @@ export struct ThreadCard {
       })
 
       // ========== 操作栏（独立区域）：分享/评论/点赞三胶囊，完全不在跳转详情的点击区域内 ==========
-      Row({ space: 12 }) {
+      // 窄卡收紧模式（actionCompact）：图标 15/文字 11/内距 4/高 30/圆角 15/外距 8——
+      // 阔直屏竖 2 列卡 ~210vp 时胶囊 ~50vp，原尺寸内容 ~50vp 必溢出（Row 不裁剪直接画出界）
+      Row({ space: this.actionCompact() ? 8 : 12 }) {
         // 分享按钮 - 圆角胶囊（玻璃光感背景不变）+ 简约黑色分享图标（与帖子详情页右上角同款 sys.symbol.share）
-        Row({ space: 6 }) {
+        Row({ space: this.actionCompact() ? 4 : 6 }) {
           SymbolGlyph($r('sys.symbol.share'))
-            .fontSize(fs(18, this.fontScale))
+            .fontSize(fs(this.actionCompact() ? 15 : 18, this.fontScale))
             .fontColor([Theme.textPrimary(isDarkMode())])
           Text('分享')
-            .fontSize(fs(13, this.fontScale))
+            .fontSize(fs(this.actionCompact() ? 11 : 13, this.fontScale))
             .fontColor(Theme.textPrimary(isDarkMode()))
         }
         .layoutWeight(1)
-        .height(36)
+        .height(this.actionCompact() ? 30 : 36)
         .justifyContent(FlexAlign.Center)
-        .borderRadius(18)
+        .borderRadius(this.actionCompact() ? 15 : 18)
         .backgroundColor(Theme.sheetGlass(isDarkMode()))
         .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
@@ -603,18 +631,18 @@ export struct ThreadCard {
         })
         
         // 评论按钮 - 玻璃胶囊背景不变 + 实心气泡三点图标 ellipsis_message_fill（与分享 sys.symbol.share 同为填充风格，避免描边图标过细）
-        Row({ space: 6 }) {
+        Row({ space: this.actionCompact() ? 4 : 6 }) {
           SymbolGlyph($r('sys.symbol.ellipsis_message_fill'))
-            .fontSize(fs(18, this.fontScale))
+            .fontSize(fs(this.actionCompact() ? 15 : 18, this.fontScale))
             .fontColor([Theme.textPrimary(isDarkMode())])
           Text(`${this.getItem().replyNum}`)
-            .fontSize(fs(13, this.fontScale))
+            .fontSize(fs(this.actionCompact() ? 11 : 13, this.fontScale))
             .fontColor(Theme.textPrimary(isDarkMode()))
         }
         .layoutWeight(1)
-        .height(36)
+        .height(this.actionCompact() ? 30 : 36)
         .justifyContent(FlexAlign.Center)
-        .borderRadius(18)
+        .borderRadius(this.actionCompact() ? 15 : 18)
         .backgroundColor(Theme.sheetGlass(isDarkMode()))
         .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
@@ -628,24 +656,24 @@ export struct ThreadCard {
         })
         
         // 点赞按钮 - 玻璃胶囊背景不变 + 简约心形轮廓/实心SymbolGlyph（匹配参考图一）
-        Row({ space: 6 }) {
+        Row({ space: this.actionCompact() ? 4 : 6 }) {
           if (this.getItem().isLiked) {
             SymbolGlyph($r('sys.symbol.heart_fill'))
-              .fontSize(fs(19, this.fontScale))
+              .fontSize(fs(this.actionCompact() ? 16 : 19, this.fontScale))
               .fontColor([Theme.textPrimary(isDarkMode())])
           } else {
             SymbolGlyph($r('sys.symbol.heart'))
-              .fontSize(fs(19, this.fontScale))
+              .fontSize(fs(this.actionCompact() ? 16 : 19, this.fontScale))
               .fontColor([Theme.textPrimary(isDarkMode())])
           }
           Text(`${this.getItem().likeCount ?? 0}`)
-            .fontSize(fs(13, this.fontScale))
+            .fontSize(fs(this.actionCompact() ? 11 : 13, this.fontScale))
             .fontColor(Theme.textPrimary(isDarkMode()))
         }
         .layoutWeight(1)
-        .height(36)
+        .height(this.actionCompact() ? 30 : 36)
         .justifyContent(FlexAlign.Center)
-        .borderRadius(18)
+        .borderRadius(this.actionCompact() ? 15 : 18)
         .backgroundColor(Theme.sheetGlass(isDarkMode()))
         .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })

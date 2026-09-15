@@ -20,7 +20,7 @@ import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { UserStats, FollowItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, fs, isDarkMode, setDarkMode, ImmBlur, ImmMaterial } from '../common/Theme';
+import { Theme, Spacing, Radius, fs, isDarkMode, setDarkMode, ImmBlur, ImmMaterial, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 
 /** 官方标题栏开关：true = 「我的」标题行（含右上角深色切换圆钮）走 Navigation title 槽位吃官方材质（§6.10 模板，与首页/进吧/收藏同机制）；
@@ -47,10 +47,7 @@ export struct MineTab {
    * 顶部渐显带收窄（2026-09-13 用户反馈）：平板竖屏下原 15% 渐显覆盖到第一个卡片中部，
    * 要求「只覆盖顶部按钮与标题」→ 平板档覆盖高度 = 顶栏 98vp，手机维持原比例。
    */
-  private readonly isWideFormDevice: boolean =
-    deviceInfo.deviceType === 'tablet'
-      || deviceInfo.deviceType === '2in1'
-      || display.isFoldable();
+  private readonly isWideFormDevice: boolean = detectWideFormDevice();
   /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
   @State fadeCoverVp: number = 0;
   @Link loggedIn: boolean;

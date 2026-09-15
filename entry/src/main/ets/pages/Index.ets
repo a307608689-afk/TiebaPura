@@ -26,6 +26,7 @@ import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL, PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION } from '../common/Constants';
 import { FollowItem, UserInfo, UserStats } from '../model/DataModel';
 import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager } from '../common/Theme';
+import { FrameRateBoost } from '../common/FrameRateBoost';
 import { FavoriteTab } from './Favorite';
 import { MessagesTab } from './MessagesTab';
 import { MineTab } from './MineTab';
@@ -125,6 +126,9 @@ struct Index {
     // 深色态必须先算：否则系统深色下占位底会先闪一帧浅色再切黑。
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported();
+    // 高刷拉档：常驻 displaySync 120 帧率请求，把窗口 vsync 抬到 120Hz 档，
+    // 解决折叠屏展开/平板多列瀑布流被 RenderService 降档锁 60 的问题（沉浸光感零改动）
+    FrameRateBoost.acquire('Index');
     // 先初始化 UsageHabitsManager：恢复「跟随系统深色 / 手动深色」持久化值。
     // 必须在读 config.colorMode 之前完成，否则冷启动会按 v1.x 「永远跟随系统」语义兜底，
     // 旧用户启过深色模式再重启仍会被打回浅色。
@@ -144,6 +148,10 @@ struct Index {
     }
     this.privacyPhase = 2;
     await this.initApp();
+  }
+
+  aboutToDisappear(): void {
+    FrameRateBoost.release('Index');
   }
 
   /**
