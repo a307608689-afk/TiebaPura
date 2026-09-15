@@ -818,9 +818,23 @@ export struct HomeTab {
     });
   }
 
+  /** 单页关注列表请求 + 失败重试一次（避免单页抖动静默丢掉 50 个吧） */
+  private async fetchFollowPageOnce(page: number): Promise<PagedResult<FollowItem>> {
+    try {
+      return await TiebaService.getInstance().fetchFollowList(page);
+    } catch (e) {
+      try {
+        return await TiebaService.getInstance().fetchFollowList(page);
+      } catch (e2) {
+        return { list: [], hasMore: false, page };
+      }
+    }
+  }
+
   /**
    * 拉取关注吧 ID / 吧名集合（会话内缓存；失败返回 null 表示"未知"，调用方退化为正常推荐避免空白）。
-   * 最多拉 3 页（每页 50），覆盖绝大多数账号的关注量。
+   * 全量翻页：每轮 4 页并发、翻到 hasMore=false 为止，上限 10 页（500 个吧）防极端账号无限翻；
+   * 任一页拿到过数据即算成功，全页皆败返回 null。
    * 注：现代 API 推荐流 forumName 取自 fname/forum_name，关注列表取自 forum.name，字段不同源，
    * 吧名字符串匹配常常全空——必须用 forumId（数字 ID 跨接口稳定）作为主匹配键，吧名仅作 forumId 缺失时的兜底。
    */
@@ -831,20 +845,47 @@ export struct HomeTab {
     const ids: Set<string> = new Set<string>();
     const names: Set<string> = new Set<string>();
     try {
-      // 3 页并发拉取（替代串行 for），首轮等待从 3 个串行请求降到 1 个并发批次；
-      // 单页失败返回空结果，不拖累其余页（任一页可用即正常过滤）
-      const results: PagedResult<FollowItem>[] = await Promise.all([1, 2, 3].map((p: number): Promise<PagedResult<FollowItem>> =>
-        TiebaService.getInstance().fetchFollowList(p)
-          .catch((): PagedResult<FollowItem> => ({ list: [], hasMore: false, page: p }))));
-      for (const r of results) {
-        for (const f of r.list) {
-          if (f.forumId && f.forumId.length > 0) {
-            ids.add(f.forumId);
+      const maxPage: number = 10;   // 上限 10 页 × 50 = 500 个吧
+      const batch: number = 4;      // 每轮并发 4 页
+      let pn: number = 1;
+      let hasMore: boolean = true;
+      let gotAny: boolean = false;
+      while (pn <= maxPage && hasMore) {
+        const pageNums: number[] = [];
+        for (let i: number = 0; i < batch && pn <= maxPage; i++) {
+          pageNums.push(pn);
+          pn++;
+        }
+        const results: PagedResult<FollowItem>[] = await Promise.all(pageNums.map((p: number): Promise<PagedResult<FollowItem>> =>
+          this.fetchFollowPageOnce(p)));
+        for (const r of results) {
+          if (r.list.length > 0) {
+            gotAny = true;
           }
-          if (f.forumName && f.forumName.length > 0) {
-            names.add(f.forumName);
+          for (const f of r.list) {
+            if (f.forumId && f.forumId.length > 0) {
+              ids.add(f.forumId);
+            }
+            if (f.forumName && f.forumName.length > 0) {
+              names.add(f.forumName);
+            }
           }
         }
+        if (!gotAny) {
+          break;
+        }
+        // 本轮所有页均未报 hasMore → 到底
+        let anyMore: boolean = false;
+        for (const r of results) {
+          if (r.hasMore) {
+            anyMore = true;
+          }
+        }
+        hasMore = anyMore;
+      }
+      if (!gotAny) {
+        // 全页皆败：视为"未知"，调用方退化正常推荐，下次触发重试
+        return null;
       }
       this.followForumIds = ids;
       this.followForumNames = names;
@@ -859,8 +900,9 @@ export struct HomeTab {
   /**
    * 首页推荐页获取统一入口：
    * - 正常模式：单页请求（15 条），保持原有行为
-   * - 仅关注吧模式：单次放大条数 + 按关注吧名过滤，不足目标数量时继续翻页补齐，
-   *   保证推荐数量与正常模式相当；返回 page 为最后实际请求到的页码（供加载更多续接）。
+   * - 仅关注吧模式：单次放大条数 + 按关注吧名/ID过滤，不足目标数量时继续翻页补齐；
+   *   收集阶段同时排除会话级 shownTids（已看过的不再进列表，刷新出来的全是真新内容），
+   *   返回 page 为最后实际请求到的页码（供加载更多续接）。
    */
   private async fetchHomePage(page: number): Promise<PagedResult<ThreadItem>> {
     if (!this.shouldOnlyFollow()) {
@@ -871,7 +913,7 @@ export struct HomeTab {
       // 关注列表不可用：退化为正常推荐，避免首页空白
       return TiebaService.getInstance().fetchHomeThreads(page, false);
     }
-    const targetCount: number = 15;   // 目标条数：与正常推荐一页相当
+    const targetCount: number = 20;   // 目标条数：仅关注吧模式一屏 20 条
     const pageCount: number = 60;     // 单次放大请求条数，减少翻页次数
     const maxPages: number = 5;       // 兜底上限：最多连续请求页数，避免极端情况下长时间加载
     const collected: ThreadItem[] = [];
@@ -879,7 +921,7 @@ export struct HomeTab {
     let p: number = page;
     let hasMore: boolean = true;
     let lastReqPage: number = page;
-    // 首批 2 页并发（大幅缩短首轮等待；60 条×2 通常已足够过滤出 15 条），不足时后续单页串行补齐
+    // 首批 2 页并发（大幅缩短首轮等待；60 条×2 通常已足够过滤出目标条数），不足时后续单页串行补齐
     let batch: number = 2;
     while (p < page + maxPages) {
       const pageNums: number[] = [];
@@ -897,7 +939,7 @@ export struct HomeTab {
           return { list: collected, hasMore, page: lastReqPage };
         }
         for (const item of result.list) {
-          if (!seen.has(item.tid)) {
+          if (!seen.has(item.tid) && !this.shownTids.has(item.tid)) {
             seen.add(item.tid);
             // 优先按 forumId 匹配（跨接口稳定）；仅在 forumId 缺失时回退到吧名匹配
             const hit: boolean = (item.forumId !== undefined && item.forumId.length > 0 && sets.ids.has(item.forumId))
@@ -957,8 +999,10 @@ export struct HomeTab {
     this.homePage = 1;
     this.homeHasMore = true;
     this.homeStalledPages = 0;
-    // 「仅推荐关注的吧」补采：重拉第一页即视为一次刷新——①清会话级去重与补采游标，旧帖允许自然回归
-    this.clearSessionDedup();
+    // 「仅推荐关注的吧」补采：刷新只清"本轮采样过哪些吧"的池子；
+    // shownTids/补采游标跨刷新保留（配合 fetchHomePage 收集排除），刷新出来的全是真新内容。
+    // 全清（shownTids+游标）仅发生在换号/切开关（clearSessionDedup）。
+    this.backfillSampledForums.clear();
     // 仅在当前列表为空时切骨架屏（首次加载/切换 feed）；已有内容刷新时保留列表原地更新，避免闪屏
     if (this.threads.length === 0) {
       this.loadState = LoadState.Loading;
@@ -984,13 +1028,13 @@ export struct HomeTab {
       // 方案A：请求 + 立即渲染，昵称校准后台执行不阻塞首屏；8s 刷新超时兜底，弱网/接口挂起不无限转圈
       const result = await this.withFeedRefreshTimeout(this.fetchHomePage(1));
       let list: ThreadItem[] = result.list;
-      if (this.shouldOnlyFollow() && list.length < 15) {
-        // 推荐流过滤不足目标数量：触发关注吧补采，补齐到一屏再渲染，避免“不满一屏反复自动翻页”
+      if (this.shouldOnlyFollow() && list.length < 20) {
+        // 推荐流过滤不足目标数量：触发关注吧补采，补齐到一屏再渲染
         const exclude: Set<string> = new Set<string>();
         for (const item of list) {
           exclude.add(item.tid);
         }
-        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(15 - list.length, exclude), 5000);
+        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(20 - list.length, exclude), 8000);
         if (backfill.length > 0) {
           list = list.concat(backfill);
           // 合并后统一半随机时间排序（仅关注吧模式）
@@ -1003,10 +1047,8 @@ export struct HomeTab {
       this.recommendLoaded = true;
       this.homePage = result.page;
       this.homeHasMore = list.length > 0;
-      if (this.shouldOnlyFollow() && list.length < 15) {
-        // 关注吧补采仍不足一屏：直接到底，避免不满一屏时 onAreaChange 反复触发自动加载
-        this.homeHasMore = false;
-      }
+      // 不再因"不足一屏"硬性禁止加载更多：交给 homeStalledPages 连续空轮保护，
+      // 补采深挖游标可在加载更多时继续翻出库存
       this.homeStalledPages = 0;
       this.loadState = list.length > 0 ? LoadState.Success : LoadState.Empty;
       if (list.length > 0) {
@@ -1026,23 +1068,37 @@ export struct HomeTab {
     }
   }
 
-  /** 缓存命中后的后台静默刷新：更新列表并回写缓存，失败保留缓存内容 */
-  private refreshHomeSilently(): void {
-    this.fetchHomePage(1).then((result) => {
-      if (result.list.length === 0) {
+  /** 缓存命中后的后台静默刷新：更新列表并回写缓存，失败保留缓存内容。
+   *  仅关注吧模式下收集阶段已排除 shownTids（缓存内容在列），故与主动刷新同样走补采补齐。 */
+  private async refreshHomeSilently(): Promise<void> {
+    try {
+      const result = await this.fetchHomePage(1);
+      let list: ThreadItem[] = result.list;
+      if (this.shouldOnlyFollow() && list.length > 0 && list.length < 20) {
+        const exclude: Set<string> = new Set<string>();
+        for (const item of list) {
+          exclude.add(item.tid);
+        }
+        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(20 - list.length, exclude), 8000);
+        if (backfill.length > 0) {
+          list = list.concat(backfill);
+          list = sortSemiRandomByTime(list);
+        }
+      }
+      if (list.length === 0) {
         return;
       }
       this.homePage = result.page;
-      this.threads = this.dedupeByTid(result.list);
+      this.threads = this.dedupeByTid(list);
       this.rememberShown(this.threads);
-      this.homeHasMore = result.list.length > 0;
+      this.homeHasMore = this.threads.length > 0;
       this.homeStalledPages = 0;
-      this.enrichHomeInBackground(result.list);
-      CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, result.list, CACHE_TTL.THREAD_LIST);
-    }).catch((e: Error) => {
+      this.enrichHomeInBackground(this.threads);
+      CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, this.threads, CACHE_TTL.THREAD_LIST);
+    } catch (e) {
       // 静默刷新失败保留缓存内容展示，仅记录日志
-      console.info(`[HomeTab] home silent refresh fail: ${e.message}`);
-    });
+      console.info(`[HomeTab] home silent refresh fail: ${(e as Error).message}`);
+    }
   }
 
   /** 占位名判断：吧友XXXX / 贴吧用户_xxx / 贴吧用户（推荐页 JSON 缺 name_show 时的兜底名） */
@@ -1142,7 +1198,7 @@ export struct HomeTab {
       let appended: ThreadItem[] = [];
       if (this.shouldOnlyFollow()) {
         // 仅关注吧模式：推荐流已翻尽，直接补采一轮（双槽采样、会话级跳过已展示）
-        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(15, exclude), 5000);
+        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(20, exclude), 8000);
         if (myToken !== this.homeLoadToken) {
           return;
         }
