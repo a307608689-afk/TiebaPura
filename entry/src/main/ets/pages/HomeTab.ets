@@ -26,7 +26,7 @@ import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 
@@ -401,8 +401,9 @@ export struct HomeTab {
       const d: display.Display = display.getDefaultDisplaySync();
       const w: number = this.getUIContext().px2vp(d.width);
       const h: number = this.getUIContext().px2vp(d.height);
-      // 阔直屏不依赖宽度阈值（横屏 ~830 < 840 过不了 md 档），列数只看横竖屏
-      this.columns = isWideBarDevice() ? (w > h ? 3 : 2) : (w > h ? 4 : 3);
+      // 阔直屏不依赖宽度阈值（横屏 ~830 < 840 过不了 md 档），列数只看横竖屏；大折叠展开态竖横屏均 3 列（大折叠文档 §4.2）
+      this.columns = isWideBarDevice() ? (w > h ? 3 : 2)
+        : (isLargeFoldDevice() ? 3 : (w > h ? 4 : 3));
       AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.columns);
     } catch (e) {
       // 窗口未 attach 时取宽高失败，保持默认 3 列
@@ -420,6 +421,11 @@ export struct HomeTab {
   private homeColumns(): number {
     // 阔直屏分支必须在宽度检查之前（竖屏宽 ~500 < 600 会被拦回手机档）
     if (isWideBarDevice()) {
+      return this.columns;
+    }
+    // 大折叠展开态（大折叠文档 §4.2）：竖横屏均 3 列（updateColumns 已按形态写 this.columns），
+    // 折叠态为 false 落后续宽度闸门回 1 列
+    if (isLargeFoldDevice()) {
       return this.columns;
     }
     if (!this.isWideFormDevice) {

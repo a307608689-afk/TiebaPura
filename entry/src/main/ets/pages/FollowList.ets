@@ -17,7 +17,7 @@
  */
 
 import { LengthMetrics } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop, overlayCardWidth } from '../common/Theme';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { TiebaService } from '../service/TiebaService';
@@ -1164,7 +1164,7 @@ struct FollowList {
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       }
-      .width('calc(100% - 48vp)')
+      .width(overlayCardWidth())
       .margin({ bottom: 110 })
       .padding({ top: Spacing.md })
       .backgroundColor(Theme.sheetBg(this.isDark))

@@ -27,7 +27,7 @@ import { CategoryMapping, FavCategory, FolderItem, PostCardItem, PersonalContent
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { FavoriteStore, CATEGORY_DEFAULT_ID, BackupFolder, BackupImportSummary, BackupPayload } from '../service/FavoriteStore';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ListRowSkeleton } from '../components/Skeleton';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
@@ -680,6 +680,10 @@ export struct FavoriteTab {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
    */
   private favColumns(): number {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（吧分类 / 自定义分类 / 打开列表 / 搜索态共用本函数）
+    if (isLargeFoldDevice()) {
+      return 3;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
     if (isWideBarDevice()) {
       return this.isLandscape() ? 3 : 2;

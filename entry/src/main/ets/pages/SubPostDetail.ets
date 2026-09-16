@@ -21,7 +21,7 @@ import { common, Want } from '@kit.AbilityKit';
 import { display } from '@kit.ArkUI';
 import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { TiebaService } from '../service/TiebaService';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, tabletTopFadeStop, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, tabletTopFadeStop, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { EmojiLoader } from '../network/EmojiLoader';
 import image from '@ohos.multimedia.image';
@@ -143,6 +143,11 @@ struct SubPostDetail {
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.5，2026-09-15 用户二次改定）：回复区恒 1 列
     // （竖屏单列；横屏分栏保留、右栏回复单列），平板维持 3 列不动
     if (isWideBarDevice()) {
+      return 1;
+    }
+    // 大折叠（docs/TiebaPura大折叠适配.md §5）：回复区恒 1 列；平板方案几何保留
+    // （横屏左右分栏走 splitMode 既有判据，竖屏单列），仅回复列数与阔直屏同口径
+    if (isLargeFoldDevice()) {
       return 1;
     }
     if (!this.isWideFormDevice) {
@@ -1234,7 +1239,7 @@ struct SubPostDetail {
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       }
-      .width('calc(100% - 48vp)')
+      .width(overlayCardWidth())
       .padding({ top: Spacing.md })
       .backgroundColor(Theme.sheetBg(this.isDark))
       .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.control())

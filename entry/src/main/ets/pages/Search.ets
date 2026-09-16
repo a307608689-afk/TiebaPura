@@ -31,7 +31,7 @@
 import { curves } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { TiebaService } from '../service/TiebaService';
 import {
   GlobalForumResult, GlobalForumSearchData, GlobalPostResult, GlobalPostSearchData,
@@ -141,6 +141,10 @@ struct GlobalQueryPage {
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
   private searchColumns(): number {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（搜吧 / 搜贴 / 搜人共用）
+    if (isLargeFoldDevice()) {
+      return 3;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
     if (isWideBarDevice()) {
       return this.isLandscape ? 3 : 2;

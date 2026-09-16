@@ -25,7 +25,7 @@ import { image } from '@kit.ImageKit';
 import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { ForumSignStore } from '../service/ForumSignStore';
 import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail } from '../model/DataModel';
-import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { LoadingView, EmptyView, ErrorView, ThreadCard, ThreadItemData, ThreadSharePayload, PinnedThreadItem } from '../components/CommonComponents';
@@ -3412,7 +3412,10 @@ struct ThreadList {
                 .backgroundColor(Theme.textPrimary(this.isDark))
                 .borderRadius(3)
             }
-            .width('100%')
+            // 大折叠（2026-09-16 用户要求经验条不拉伸）：显式定宽锁死 220，不走 100% 引用
+            // 父列宽的测量路径（Column 在 weight/约束组合下的解析歧义可能让 100% 跟随可用宽）；
+            // 其它形态维持 100% 逐像素不变
+            .width(this.isLargeFoldHeaderRow() ? THREAD_LIST_EXP_BAR_MAX_WIDTH : '100%')
 
             // 经验值显示
             if (this.forumInfo && this.forumInfo.curScore > 0) {
@@ -3421,9 +3424,15 @@ struct ThreadList {
                 .fontColor(Theme.textTertiary(this.isDark))
             }
           }
-          .layoutWeight(1)
+          // 大折叠（2026-09-16 用户要求签到钮右对齐，仅动签到钮）：进度条定宽 220 + 既有 Blank
+          // 弹性推右——layoutWeight(1)+maxWidth 组合下被钳掉的剩余空间不回流给 Blank，
+          // 签到钮只能贴进度条右缘；其它形态（含平板多列档）维持 weight 分配行为逐像素不变
+          .layoutWeight(this.isLargeFoldHeaderRow() ? 0 : 1)
           // §4.8 T-F：多列档经验条不随屏宽拉伸（手机档取大值 = 不限）
-          .constraintSize({ maxWidth: this.threadColumns() > 1 ? THREAD_LIST_EXP_BAR_MAX_WIDTH : 99999 })
+          .constraintSize({
+            minWidth: this.isLargeFoldHeaderRow() ? THREAD_LIST_EXP_BAR_MAX_WIDTH : 0,
+            maxWidth: this.threadColumns() > 1 ? THREAD_LIST_EXP_BAR_MAX_WIDTH : 99999
+          })
           .alignItems(HorizontalAlign.Start)
 
           // §4.8 T-F：多列档经验条限宽后补弹性空白，让签到钮仍贴信息列右缘
@@ -3515,6 +3524,10 @@ struct ThreadList {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
    */
   private threadColumns(): number {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（吧主页与吧搜索态共用）
+    if (isLargeFoldDevice()) {
+      return 3;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
     if (isWideBarDevice()) {
       return this.isLandscape ? 3 : 2;
@@ -3933,6 +3946,11 @@ struct ThreadList {
    */
   private forumUnfollowed(): boolean {
     return this.forumInfo !== null && !this.forumInfo.isLike;
+  }
+
+  /** 大折叠吧头行（2026-09-16）：进度条定宽、Blank 弹性推右，签到钮贴信息列右缘；其它形态 false 维持现状 */
+  private isLargeFoldHeaderRow(): boolean {
+    return isLargeFoldDevice() && this.threadColumns() > 1;
   }
 
   /** 签到钮文案：未关注 → 「未关注」；已关注 → 已签N天 / 未签到 */

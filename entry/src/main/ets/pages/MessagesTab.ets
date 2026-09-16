@@ -22,7 +22,7 @@ import { display } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { NotifyMessage } from '../model/DataModel';
-import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { formatTime } from '../common/Constants';
 
@@ -98,6 +98,10 @@ export struct MessagesTab {
 
   /** 列数：大屏竖 3 / 横 4；窄窗与手机 1 列（形态闸门放首行，防手机横屏误命中） */
   private notifyColumns(): number {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列
+    if (isLargeFoldDevice()) {
+      return 3;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
     if (isWideBarDevice()) {
       return this.isLandscape() ? 3 : 2;

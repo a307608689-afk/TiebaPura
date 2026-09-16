@@ -867,6 +867,8 @@ export function resetConfigurationToFollowSystem(): void {
         navigationBarContentColor: sysDark ? '#FFFFFF' : '#1A1A1A',
       }).catch(() => {
       });
+      // 窗口底色跟档：从手动档切回跟随系统后按系统档复位（取值与 Theme.bg 一致；同步 void 签名）
+      mainWindow.setWindowBackgroundColor(sysDark ? '#101114' : '#F2F4F7');
     }
     console.info('Theme', 'resetConfigurationToFollowSystem: current sysDark=' + (sysDark ? '1' : '0'));
   } catch (systemError) {
@@ -926,6 +928,10 @@ export function setDarkMode(isDark: boolean): void {
         navigationBarContentColor: isDark ? '#FFFFFF' : '#1A1A1A',
       }).catch(() => {
       });
+      // 窗口底色跟档：冷启动兜底（EntryAbility）把主窗底色设过档，这里随应用内手动切换同步
+      // 复位，避免切回浅色后窗口透出深底。取值与 Theme.bg 一致；同步 void 签名，异常由外层
+      // try/catch 兜底。
+      mainWindow.setWindowBackgroundColor(isDark ? '#101114' : '#F2F4F7');
     }
   } catch (systemError) {
     // 系统侧同步失败不影响应用内主题切换；回退标记以便下次重试
@@ -1068,6 +1074,82 @@ function logWideBarProbe(ratio: number, hit: boolean): void {
       + `foldable=${display.isFoldable()} px=${d.width}x${d.height} ratio=${r} hit=${hit}`);
   } catch (e) {
     // 日志失败不影响判定
+  }
+}
+
+// ========== 大折叠形态判定（docs/TiebaPura大折叠适配.md §二，2026-09-15）==========
+
+/** 大折叠判定探针日志只打一次（isLargeFoldDevice 在渲染路径被高频调用） */
+let _largeFoldProbeLogged: boolean = false;
+
+/**
+ * 大折叠判定（Mate X 系列大折叠展开态，2026-09-15 用户立项）：折叠屏 + 展开态 + 非 Pura X + 近方形比例带。
+ * - 主判据 = 比例带：Mate X7 展开 2416×2210（≈8:7.3），长宽比 ≈1.093，比例带取 (1.0, 1.25)；
+ *   与阔直屏比例带 (1.4, 1.85)、普通手机 (≥2.1) 均隔出 ≥0.3 余量；不硬编码型号（同阔直屏教训：
+ *   同设备有 AL00/TL00 等变体，硬编码每出新机都要发版），真机到手按 [LARGEFOLD] 探针校准后可补型号兜底
+ * - 折叠态：外屏 ~21:9（比例 ≥2.1 不命中比例带）且**非展开态直接 false** → 自动回落手机档（既有闸门拦回 1 列）；
+ *   HALF_FOLDED 不算（仅展开态，与 Pura X 阔直屏档同口径）
+ * - 本函数在渲染路径被实时调用，折叠/展开切换后由各页 onAreaChange / display.on('change') 触发重渲染自动翻档；
+ *   异常一律返回 false（安全方向 = 既有平板档，isWideFormDevice 对折叠屏恒 true 兜底）
+ */
+export function isLargeFoldDevice(): boolean {
+  try {
+    if (!display.isFoldable() || isPuraXFoldModel()) {
+      return false;
+    }
+    if (display.getFoldStatus() !== display.FoldStatus.FOLD_STATUS_EXPANDED) {
+      return false;
+    }
+    const d: display.Display = display.getDefaultDisplaySync();
+    const w: number = d.width;
+    const h: number = d.height;
+    if (w <= 0 || h <= 0) {
+      return false;
+    }
+    const ratio: number = Math.max(w, h) / Math.min(w, h);
+    const hit: boolean = ratio > 1.0 && ratio < 1.25;
+    logLargeFoldProbe(ratio, hit);
+    return hit;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 首次判定时打一条探针日志：真机到手第一时间核对 productModel / 实测比例，校准比例带（阔直屏 §2.4-2 同款） */
+function logLargeFoldProbe(ratio: number, hit: boolean): void {
+  if (_largeFoldProbeLogged) {
+    return;
+  }
+  _largeFoldProbeLogged = true;
+  try {
+    const d: display.Display = display.getDefaultDisplaySync();
+    console.info(`[LARGEFOLD] model=${deviceInfo.productModel} type=${deviceInfo.deviceType} `
+      + `px=${d.width}x${d.height} ratio=${ratio.toFixed(3)} hit=${hit}`);
+  } catch (e) {
+    // 日志失败不影响判定
+  }
+}
+
+/**
+ * 自绘弹窗浮层卡片限宽（2026-09-15 用户拍板「弹窗不拉伸」）：
+ * - 大折叠展开态下，页面主体自绘确认卡从「通栏 calc(100% - 48vp)」收到 **400vp 封顶**
+ *   （与各页 CustomDialog dialogCardWidth 同口径，屏宽不足 448 时按 屏宽−48 取值、下限 200）；
+ * - 其它形态（手机 / 平板 / 2in1 / 阔直屏 / 大折叠折叠态）原样返回 calc 字符串，逐像素不变。
+ * 调用点：各页自绘浮层确认卡（ThreadDetail / SubPostDetail / ForumsTab / FollowList / BlacklistManager）。
+ * 注：bindSheet 半模态 SheetOptions 无 width 字段，宽度由系统按设备规格决定，不在本函数管辖内。
+ */
+export function overlayCardWidth(): string | number {
+  if (!isLargeFoldDevice()) {
+    return 'calc(100% - 48vp)';
+  }
+  try {
+    const d: display.Display = display.getDefaultDisplaySync();
+    const w: number = d.densityPixels > 0
+      ? Math.min(d.width, d.height) / d.densityPixels - 48
+      : 400;
+    return w > 400 ? 400 : (w > 200 ? w : 200);
+  } catch (e) {
+    return 400;
   }
 }
 

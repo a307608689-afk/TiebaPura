@@ -26,7 +26,7 @@ import { AutoSignNotifier } from '../service/AutoSignNotifier';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { Haptic } from '../common/Haptic';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { compareByName } from '../common/Pinyin';
@@ -1368,6 +1368,10 @@ export struct ForumsTab {
    * 「最小单列宽保护」按用户拍板**不启用**（先用主方案看真机）；「创建吧」卡片随流、不独占。
    */
   private forumColumns(): number {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（2026-09-15 用户拍板）
+    if (isLargeFoldDevice()) {
+      return 3;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3（竖屏与手机档同值）
     if (isWideBarDevice()) {
       return this.isLandscape ? 3 : 2;
@@ -1508,7 +1512,7 @@ export struct ForumsTab {
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       }
-      .width('calc(100% - 48vp)')
+      .width(overlayCardWidth())
       .margin({ bottom: 110 })
       .padding({ top: Spacing.md })
       // 真模糊磨砂：低不透明发透底 + 0.5 白描边 + backgroundBlurStyle（页面主体 systemMaterial 不在槽位，渲染无效；2026-09-07 probe 实证 API26 自绘弹窗浮层挂材质亦 out of scope，见指南 §10.3）

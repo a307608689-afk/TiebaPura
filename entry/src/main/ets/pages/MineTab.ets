@@ -161,7 +161,7 @@ export struct MineTab {
         Text('我的')
           .fontSize(fs(22, this.fontScale))
           .fontWeight(FontWeight.Bold)
-          .fontColor($r('sys.color.font_primary'))
+          .fontColor(Theme.textPrimary(this.isDark))
       }
       .alignItems(HorizontalAlign.Start)
 
@@ -171,7 +171,7 @@ export struct MineTab {
         SymbolGlyph(this.isDark
           ? $r('sys.symbol.sun_max_fill')
           : $r('sys.symbol.moon_fill'))
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([Theme.iconPrimary(this.isDark)])
           .fontSize(fs(20, this.fontScale))
       }
       .width(44)
@@ -213,7 +213,7 @@ export struct MineTab {
         Text('我的')
           .fontSize(fs(22, this.fontScale))
           .fontWeight(FontWeight.Bold)
-          .fontColor($r('sys.color.font_primary'))
+          .fontColor(Theme.textPrimary(this.isDark))
       }
       .alignItems(HorizontalAlign.Start)
 
@@ -223,7 +223,7 @@ export struct MineTab {
         SymbolGlyph(this.isDark
           ? $r('sys.symbol.sun_max_fill')
           : $r('sys.symbol.moon_fill'))
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([Theme.iconPrimary(this.isDark)])
           .fontSize(fs(20, this.fontScale))
       }
       .width(44)
@@ -314,21 +314,21 @@ export struct MineTab {
     Row({ space: Spacing.md }) {
       SymbolGlyph(icon)
         .fontSize(fs(20, this.fontScale))
-        .fontColor([$r('sys.color.icon_primary')])
+        .fontColor([Theme.iconPrimary(this.isDark)])
         .width(28)
       Column({ space: 4 }) {
         Text(title)
           .fontSize(fs(15, this.fontScale))
-          .fontColor($r('sys.color.font_primary'))
+          .fontColor(Theme.textPrimary(this.isDark))
         Text(subtitle)
           .fontSize(fs(11, this.fontScale))
-          .fontColor($r('sys.color.font_secondary'))
+          .fontColor(Theme.textSecondary(this.isDark))
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       SymbolGlyph($r('sys.symbol.chevron_right'))
         .fontSize(fs(18, this.fontScale))
-        .fontColor([$r('sys.color.icon_tertiary')])
+        .fontColor([Theme.textTertiary(this.isDark)])
     }
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 13, bottom: 13 })

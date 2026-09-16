@@ -18,7 +18,7 @@
 
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { TiebaService, BlacklistPermOptions } from '../service/TiebaService';
@@ -616,6 +616,10 @@ struct UserProfile {
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
   private profileColumns(): number {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列
+    if (isLargeFoldDevice()) {
+      return 3;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
     if (isWideBarDevice()) {
       return this.isLandscape ? 3 : 2;
@@ -776,10 +780,11 @@ struct UserProfile {
     return this.materialSupported && MaterialManager.getApiLevel() >= 26;
   }
 
-  /** 悬浮胶囊宽度：与首页底栏一致（宽屏 480；窄屏 屏宽-48，下限 240 防极端异常） */
+  /** 悬浮胶囊宽度：宽屏（含平板 / 大折叠展开）**400**（2026-09-16 用户拍板「底栏 = 黑名单弹窗宽度」，横竖屏同值）；
+   *  窄屏 屏宽-48，下限 240 防极端异常（手机档逐像素不变） */
   private pillWidth(): number {
-    if (this.isWideScreen) {
-      return 480;
+    if (this.isWideScreen || isLargeFoldDevice()) {
+      return 400;
     }
     const w: number = this.currentWidth > 0 ? this.currentWidth - 48 : 312;
     return w > 240 ? w : 240;

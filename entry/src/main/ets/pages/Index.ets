@@ -25,7 +25,7 @@ import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL, PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION } from '../common/Constants';
 import { FollowItem, UserInfo, UserStats } from '../model/DataModel';
-import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager } from '../common/Theme';
+import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager, isLargeFoldDevice } from '../common/Theme';
 import { FrameRateBoost } from '../common/FrameRateBoost';
 import { FavoriteTab } from './Favorite';
 import { MessagesTab } from './MessagesTab';
@@ -62,6 +62,14 @@ const BAR_RADIUS_WIDE_LAND = 31; // = 62/2
 const ITEM_H_WIDE_LAND = 50;     // 横屏单条目高（竖屏 58）
 const ITEM_RADIUS_WIDE_LAND = 25;// = 50/2
 const PAD_V_WIDE_LAND = 4;       // 横屏条目行上下内边距（竖屏 6）
+// 大折叠展开**竖屏**档（2026-09-15 用户反馈底栏内部偏高、图标文字上下留空偏多 → 收一档；
+// 横屏维持横屏档不动、平板竖屏 74 不动）。取值 = 手机档 / 平板横屏档同款 66/54/4（上下留白 10）。
+// 同口诀：栏高改 n 则圆角改 n/2；条目高改 m 则条目圆角改 m/2。
+const BAR_H_LFOLD_PORTRAIT = 66;
+const BAR_RADIUS_LFOLD_PORTRAIT = 33;  // = 66/2
+const ITEM_H_LFOLD_PORTRAIT = 54;
+const ITEM_RADIUS_LFOLD_PORTRAIT = 27; // = 54/2
+const PAD_V_LFOLD_PORTRAIT = 4;
 
 @Entry
 @Component
@@ -471,7 +479,9 @@ struct Index {
       const width = newValue.width as number;
       this.currentWidth = width;
       this.currentHeight = newValue.height as number;
-      this.isWideScreen = width >= 840;
+      // 大折叠展开态（2026-09-15 用户拍板「底栏限宽不拉伸」）：并入平板档，底栏 480 居中 + 平板档几何；
+      // 折叠态 isLargeFoldDevice 为 false，回落手机档不受影响
+      this.isWideScreen = width >= 840 || isLargeFoldDevice();
     })
   }
 
@@ -634,7 +644,9 @@ struct Index {
 
   private pillWidth(): number {
     if (this.isWideScreen) {
-      return 480;
+      // 宽屏（平板 + 大折叠展开）统一定稿（2026-09-16 用户拍板）：与置顶弹窗（dialogCardWidth 400 封顶）同宽，
+      // 横竖屏同值
+      return 400;
     }
     const w: number = this.currentWidth > 0 ? this.currentWidth - 48 : 312;
     return w > 240 ? w : 240;
@@ -645,10 +657,18 @@ struct Index {
     return this.isWideScreen && this.currentWidth > this.currentHeight;
   }
 
-  /** 底栏几何取值：手机档 / 平板竖屏档 / 平板横屏档（isWideScreen 冷启动首帧可能短暂按手机档渲染，onAreaChange 后纠正） */
+  /** 底栏几何取值：手机档 / 平板竖屏档 / 平板横屏档 / 大折叠竖屏档（isWideScreen 冷启动首帧可能短暂按手机档渲染，onAreaChange 后纠正） */
+  /** 大折叠展开竖屏档（2026-09-15 用户反馈底栏内部偏高）：仅大折叠竖屏命中；横屏与平板竖屏不进 */
+  private isLargeFoldPortrait(): boolean {
+    return isLargeFoldDevice() && !this.isWideLandscape();
+  }
+
   private barHeightVal(): number {
     if (!this.isWideScreen) {
       return BAR_H_PHONE;
+    }
+    if (this.isLargeFoldPortrait()) {
+      return BAR_H_LFOLD_PORTRAIT;
     }
     return this.isWideLandscape() ? BAR_H_WIDE_LAND : BAR_H_WIDE;
   }
@@ -657,12 +677,18 @@ struct Index {
     if (!this.isWideScreen) {
       return BAR_RADIUS_PHONE;
     }
+    if (this.isLargeFoldPortrait()) {
+      return BAR_RADIUS_LFOLD_PORTRAIT;
+    }
     return this.isWideLandscape() ? BAR_RADIUS_WIDE_LAND : BAR_RADIUS_WIDE;
   }
 
   private itemHeightVal(): number {
     if (!this.isWideScreen) {
       return ITEM_H_PHONE;
+    }
+    if (this.isLargeFoldPortrait()) {
+      return ITEM_H_LFOLD_PORTRAIT;
     }
     return this.isWideLandscape() ? ITEM_H_WIDE_LAND : ITEM_H_WIDE;
   }
@@ -671,12 +697,18 @@ struct Index {
     if (!this.isWideScreen) {
       return ITEM_RADIUS_PHONE;
     }
+    if (this.isLargeFoldPortrait()) {
+      return ITEM_RADIUS_LFOLD_PORTRAIT;
+    }
     return this.isWideLandscape() ? ITEM_RADIUS_WIDE_LAND : ITEM_RADIUS_WIDE;
   }
 
   private padVVal(): number {
     if (!this.isWideScreen) {
       return PAD_V_PHONE;
+    }
+    if (this.isLargeFoldPortrait()) {
+      return PAD_V_LFOLD_PORTRAIT;
     }
     return this.isWideLandscape() ? PAD_V_WIDE_LAND : PAD_V_WIDE;
   }
@@ -813,7 +845,7 @@ struct Index {
       .height('100%')
       .padding({ left: 8, right: 8, top: this.padVVal(), bottom: this.padVVal() })
     }
-    .width(this.isWideScreen ? 480 : 'calc(100% - 48vp)')
+    .width(this.isWideScreen ? 400 : 'calc(100% - 48vp)')
     .height(this.barHeightVal())
     // 本分支仅 API<26 执行（26+ 走 FloatingTabsShell 槽位材质），此时 manualGlass 即兜底视觉
     .backgroundColor(MaterialManager.isSupported() ? Color.Transparent : Theme.manualGlass(this.isDark))

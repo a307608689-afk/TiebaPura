@@ -21,7 +21,7 @@ import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const TAG: string = 'CacheManager';
-const STORE_NAME: string = 'tieba_cache';
+export const STORE_NAME: string = 'tieba_cache';
 
 interface TtlWrapper<T> {
   data: T;

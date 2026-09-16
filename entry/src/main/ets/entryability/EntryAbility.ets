@@ -18,10 +18,11 @@
 
 import { AbilityConstant, UIAbility, Want, common, ConfigurationConstant, Configuration } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
+import { preferences } from '@kit.ArkData';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig, isWideBarDevice } from '../common/Theme';
+import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig, isWideBarDevice, isLargeFoldDevice } from '../common/Theme';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
-import { CacheManager } from '../cache/CacheManager';
+import { CacheManager, STORE_NAME } from '../cache/CacheManager';
 import { CACHE_KEY } from '../common/Constants';
 
 const TAG: string = 'EntryAbility';
@@ -81,12 +82,29 @@ export default class EntryAbility extends UIAbility {
       }
       try {
         const mainWindow: window.Window = await windowStage.getMainWindow();
+        // 启动遮罩深色兜底（方案 B）：startWindow 由系统在应用进程外绘制，只能靠 resources/dark
+        // 资源限定符跟随系统档（方案 A）；「应用内手动深色 + 系统浅色」场景系统无从得知，个别
+        // 系统版本启动窗也可能不翻档。这里在窗口就绪后第一时间按持久化深色设置同步设主窗底色
+        // （Theme.bg 深色档 #101114 / 浅色档 #F2F4F7），压缩遮罩消失→页面首帧之间的色差闪。
+        // 注意：官方约束 setWindowBackgroundColor 必须在 loadContent 生效后调用，且为同步 void
+        // 签名（无 Promise），故放在回调内 try/catch 兜底。同进度同步读 preferences（getPreferencesSync）。
+        try {
+          const prefs: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: STORE_NAME });
+          const splashFollowSys: boolean = prefs.getSync(CACHE_KEY.FOLLOW_SYSTEM_DARK, '1') !== '0';
+          const splashManualDark: boolean = prefs.getSync(CACHE_KEY.DARK_MODE, '0') === '1';
+          const splashSysDark: boolean =
+            this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+          mainWindow.setWindowBackgroundColor((splashFollowSys ? splashSysDark : splashManualDark)
+            ? '#101114' : '#F2F4F7');
+        } catch (splashError) {
+          hilog.error(0x0000, TAG, 'Splash window bg setup failed: %{public}s', JSON.stringify(splashError));
+        }
         await mainWindow.setWindowLayoutFullScreen(true);
-        // 阔直屏：解锁自动旋转（docs/TiebaPura阔直屏适配.md §2.4）。
+        // 阔直屏 / 大折叠展开态：解锁自动旋转（docs/TiebaPura阔直屏适配.md §2.4、docs/TiebaPura大折叠适配.md §三）。
         // module.json5 未锁方向（默认 unspecified 跟随系统自动旋转开关），而用户系统开关多半
-        // 是关的 → 阔直屏形态下永远竖屏、横 3 列不可达。AUTO_ROTATION = 跟随重力、
-        // 不受系统开关限制；非阔直屏设备（含 Pura X 折叠态）不进此分支，回归默认 unspecified 行为。
-        if (isWideBarDevice()) {
+        // 是关的 → 大屏形态下永远竖屏、横屏列数不可达。AUTO_ROTATION = 跟随重力、
+        // 不受系统开关限制；非大屏设备（含折叠态）不进此分支，回归默认 unspecified 行为。
+        if (isWideBarDevice() || isLargeFoldDevice()) {
           mainWindow.setPreferredOrientation(window.Orientation.AUTO_ROTATION).catch((err: Error) => {
             hilog.error(0x0000, TAG, 'setPreferredOrientation(AUTO_ROTATION) failed: %{public}s',
               JSON.stringify(err));
@@ -166,6 +184,25 @@ export default class EntryAbility extends UIAbility {
     try {
       const followSys: boolean = AppStorage.get<boolean>('appFollowSystemDark') ?? true;
       if (!followSys) {
+        // 手动档对账自愈：系统上报的 colorMode 为明确的 LIGHT/DARK 且与持久化手动档矛盾时，
+        // 说明系统侧把应用级 colorMode 冲回了系统档（概率性，某些配置事件触发——表现为手动深色下
+        // $r('sys.color.font_primary') 等系统反色资源突然变浅色档黑字）。重新下发手动档纠正。
+        // 目标值取持久化手动档（固定值、不从 newConfig 推导），不存在「反向拉回」；纠正触发的
+        // 下一次回调里两者已一致，幂等收敛。_globalIsDark 不动（应用内状态本来就没变，darkTick 不发）。
+        const rawCfg: number | undefined = newConfig.colorMode;
+        const cfgDark: boolean | null =
+          rawCfg === ConfigurationConstant.ColorMode.COLOR_MODE_DARK ? true :
+            (rawCfg === ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT ? false : null);
+        if (cfgDark !== null) {
+          const manualDark: boolean = UsageHabitsManager.getInstance().isDarkModeManual();
+          if (cfgDark !== manualDark) {
+            this.context.getApplicationContext().setColorMode(manualDark
+              ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+              : ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT);
+            hilog.info(0x0000, TAG, 'Reassert manual colorMode=%{public}s (system reverted it)',
+              manualDark ? 'DARK' : 'LIGHT');
+          }
+        }
         hilog.info(0x0000, TAG, 'Configuration update ignored: followSys=OFF (locked to manual)');
         return;
       }
@@ -206,6 +243,10 @@ export default class EntryAbility extends UIAbility {
           hilog.error(0x0000, TAG, 'setWindowSystemBarProperties in onConfigurationUpdate failed: %{public}s',
             JSON.stringify(err));
         });
+        // 窗口底色跟档：setWindowBackgroundColor 显式设过底色后不再自动跟随资源翻档，
+        // 系统切色时这里按系统档重设（手动档切换由 Theme.setDarkMode 负责，不走此处）。
+        // 同步 void 签名，异常由外层 try/catch 兜底
+        mainWindow.setWindowBackgroundColor(sysDark ? '#101114' : '#F2F4F7');
       }
       // 3. 递增 darkTick 触发所有监听 darkTick 的页面 @StorageLink('darkTick') watch 翻 @State isDark
       AppStorage.setOrCreate<number>('darkTick', (AppStorage.get<number>('darkTick') ?? 0) + 1);

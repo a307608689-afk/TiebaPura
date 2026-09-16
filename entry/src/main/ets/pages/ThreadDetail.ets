@@ -29,7 +29,7 @@ import { CACHE_KEY } from '../common/Constants';
 import { FavoriteStore } from '../service/FavoriteStore';
 import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType } from '../model/DataModel';
 import { ThreadDetailResult } from '../service/TiebaService';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadDetailSkeleton } from '../components/Skeleton';
 import { EmojiLoader } from '../network/EmojiLoader';
@@ -95,14 +95,15 @@ const DETAIL_MAIN_WIDTH: number = 420;
  */
 const DETAIL_IMAGE_GRID_MAX_WIDTH: number = 336;
 /**
- * 底部悬浮栏（评论输入条）平板档宽度（vp）= **现有基础宽一倍**：296 × 2 = **592**（2026-09-14 用户要求
- * 「底栏在现有基础宽一倍，里面跳转框也一起跟着拉伸」）。
+ * 底部悬浮栏（评论输入条）平板档宽度（vp）= **400**（2026-09-16 用户拍板「底栏 = 跳转官方弹窗宽度」，
+ * 横竖屏同值；原 592「现有基础宽一倍」作废；与首页 / 他人信息页底栏 400 统一口径）。
  * ⚠️ 教训：不可把这个量级的值当成「所有手机的屏宽基线」对手机封顶 —— 393vp 等机型手机档
  * 「屏宽 − 64」= 329，若误用平板档封顶会把手机底栏实实在在收窄（用户真机已驳回一次）；
  * 手机档必须保持原「屏宽 − 64」公式（见 `dockPillWidth()` 分档）。
  * 跳转框（原回复框）在岛内为 `layoutWeight(1)`，随岛宽自动拉伸，无需单独处理。
+ * 排序壳左缘公式引用 dockPillWidth() 自动跟随（-40 微调值可能需真机复核）。
  */
-const DETAIL_DOCK_TABLET_WIDTH: number = 592;
+const DETAIL_DOCK_TABLET_WIDTH: number = 400;
 /**
  * 回复区多列「列均衡」阈值（vp，方案 B 滞回，2026-09-14）：
  * 轮转目标列与最短列的估算高差超过该值时，本卡改投最短列（补位）；否则照常轮转（保序）。
@@ -1191,14 +1192,20 @@ struct ThreadDetail {
   }
 
   /**
-   * 回复区列数（§4.9 DT-G）：手机（含横屏 / 分屏 / 窄窗）恒 1；大屏恒 3。
+   * 回复区列数（§4.9 DT-G）：手机（含横屏 / 分屏 / 窄窗）恒 1；大屏（平板）**横竖屏均 2 列**
+   * （2026-09-16 用户拍板「竖屏和横屏回复区域都改成两列」，原恒 3 作废）。
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
    */
   private replyColumns(): number {
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.4，2026-09-15 用户二次改定）：回复区恒 1 列
-    // （竖屏单列；横屏分栏保留、右栏回复单列），平板维持 3 列不动
+    // （竖屏单列；横屏分栏保留、右栏回复单列）
     if (isWideBarDevice()) {
       return 1;
+    }
+    // 大折叠（docs/TiebaPura大折叠适配.md §5，2026-09-16 用户改定）：横竖屏回复区均 2 列瀑布流
+    // （分栏左右两侧 2 列）——与本轮平板拍板同值，分支保留（判据独立）
+    if (isLargeFoldDevice()) {
+      return 2;
     }
     if (!this.isWideFormDevice) {
       return 1;
@@ -1206,11 +1213,31 @@ struct ThreadDetail {
     if (this.currentWidth < Breakpoint.sm) {
       return 1;
     }
-    return 3;
+    return 2;
   }
 
-  /** 是否左右分栏（§4.9 DT-I，仅大屏横屏）：主楼独占左栏、回复独占右栏 */
+  /**
+   * 是否左右分栏（§4.9 DT-I，大屏横屏）：主楼独占左栏、回复独占右栏。
+   * 大折叠（2026-09-16 用户拍板）：横竖屏**均**分栏——展开态近方形、竖屏宽 ≥600 与横屏同级，
+   * 左栏固定 420（DETAIL_MAIN_WIDTH 与横屏同款）、右栏回复单列；折叠态外屏窄走原路径单列。
+   */
+  /**
+   * 分栏左栏宽度（vp）：平板 / 大屏固定 420（DETAIL_MAIN_WIDTH，§4.9 DT-I）。
+   * 大折叠（2026-09-16 用户拍板「帖子区域的卡片宽度要跟回复区域卡片一致」）= **屏宽 / 3**——
+   * 推导：主楼卡宽 = L − 24（左 16/右 8 内距）；回复每列 = (R − 24 − 12)/2，R = W − L − 12（分栏缝 12），
+   * 两者相等 ⇔ L = W/3（回复列缝 12 恰好凑平）。横竖屏同口径；currentWidth 未就绪时回退 420。
+   */
+  private splitMainWidth(): number {
+    if (isLargeFoldDevice() && this.currentWidth > 0) {
+      return Math.round(this.currentWidth / 3);
+    }
+    return DETAIL_MAIN_WIDTH;
+  }
+
   private splitMode(): boolean {
+    if (isLargeFoldDevice()) {
+      return this.currentWidth >= Breakpoint.sm;
+    }
     return this.isWideFormDevice && this.currentWidth >= Breakpoint.sm && this.isLandscape();
   }
 
@@ -1263,6 +1290,12 @@ struct ThreadDetail {
     if (!this.isWideFormDevice) {
       return w > 240 ? w : 240;
     }
+    // 大折叠（docs/TiebaPura大折叠适配.md §5，2026-09-15 用户拍板）：底栏与「跳转到贴吧官方」
+    // 弹窗同宽（dialogCardWidth 口径，400 封顶），横竖屏同值；平板维持 592 档；
+    // SortPillShell 定位公式与 ReplyControls 宽度均经本单点，自动跟随。
+    if (isLargeFoldDevice()) {
+      return this.dialogCardWidth();
+    }
     const capped: number = w > DETAIL_DOCK_TABLET_WIDTH ? DETAIL_DOCK_TABLET_WIDTH : w;
     return capped > 240 ? capped : 240;
   }
@@ -1272,9 +1305,13 @@ struct ThreadDetail {
     return 30;
   }
 
-  /** 官方悬浮岛总高（vp）：仅包裹评论条(66)；排序切换行已移出为独立悬浮胶囊层 */
+  /**
+   * 官方悬浮岛总高（vp）：仅包裹评论条；排序切换行已移出为独立悬浮胶囊层。
+   * 大折叠（2026-09-15 用户反馈横竖屏均「岛内部偏高、图标文字上下留空偏多」）收一档 66 → 62，
+   * CommentBar 岛内 height/padding 联动收 4（内容区不变、整体更紧凑）；平板 / 手机维持 66。
+   */
   private dockPillHeight(): number {
-    return 66;
+    return isLargeFoldDevice() ? 62 : 66;
   }
 
   /**
@@ -1421,12 +1458,17 @@ struct ThreadDetail {
     // 横屏分栏真机微调：底栏加宽到 592 后实测胶囊仍偏右 → 左移量 16 → 28 → 40（2026-09-14 两轮校准，偏差变化时只调这一个值）；
     // 竖屏 / 手机维持公式（手机 (393 − 329) / 2 = 32 逐像素不变）。
     .padding({
-      left: Math.max(0, (this.currentWidth - this.dockPillWidth()) / 2 - (this.splitMode() ? 40 : 0))
+      // 大折叠（2026-09-15 真机反馈）：不套用 −40 平板分栏修正——那是平板 592 底栏的系统偏差校准值，
+      // 大折叠底栏 400（dialogCardWidth 口径），纯公式定位已对齐底栏左缘，再减 40 会把排序壳推出底栏外
+      left: Math.max(0, (this.currentWidth - this.dockPillWidth()) / 2
+        - (this.splitMode() && !isLargeFoldDevice() ? 40 : 0))
     })
     .hitTestBehavior(HitTestMode.None)
     // 底距沿用原壳上的 margin（岛底余量 30 + 岛高 66），margin 已移交外层 Row，壳自身不再设；
-    // 横屏分栏追加 14vp 呼吸（真机反馈横屏下排序行与底栏贴住）
-    .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight() + (this.splitMode() ? 14 : 0) })
+    // 横屏分栏追加 14vp 呼吸（真机反馈横屏下排序行与底栏贴住）——大折叠不套用（2026-09-15
+    // 真机反馈大折叠横屏排序胶囊离底栏太远，其底栏 400 较矮，与竖屏同距即可）
+    .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight()
+      + (this.splitMode() && !isLargeFoldDevice() ? 14 : 0) })
   }
 
   /** 排序行（官方槽位版）：外层 Column 撑满壳宽，内层 Row 塞满 Column，几何与 SortRowOverlay 内
@@ -1662,7 +1704,7 @@ struct ThreadDetail {
                   // 主楼短于视口时顶对齐（Scroll 对小内容默认垂直居中）
                   .constraintSize({ minHeight: '100%' })
                 }
-                .width(DETAIL_MAIN_WIDTH)
+                .width(this.splitMainWidth())
                 .scrollBar(BarState.Off)
                 .clip(false)
                 .edgeEffect(EdgeEffect.Spring)
@@ -2695,8 +2737,10 @@ struct ThreadDetail {
       this.RichTextContent(floor.fragments ?? [], floor.contentText, fs(16), Theme.textPrimary(this.isDark), 26)
 
       if (floor.images.length > 0) {
-        // 列内楼层卡：capMaxWidth=false（跟随列宽，杜绝交叉轴测量歧义）
-        this.ImageGrid(floor.images, false)
+        // 列内楼层卡：capMaxWidth=true（2026-09-16 拍板「宫格图片不要拉伸」——平板 2 列后列宽 ≈494 > 336，
+        // 跟随列宽会把宫格拉宽、格宽 164 vs 格高 120 横向拉伸；封顶 336 后格宽 108/格高 120 ≈ 手机档比例。
+        // 3 列 / 单列档列宽 ≤ 336 封顶不生效逐像素不变；楼层卡根 Column 已 alignItems Start → 限宽后靠左）
+        this.ImageGrid(floor.images, true)
       }
       if ((floor.comments ?? []).length > 0 || (floor.commentsTotal ?? 0) > 0) {
         this.CommentList(floor.comments ?? [], floor.commentsTotal ?? (floor.comments ?? []).length, floor.commentsHasMore === true, floor.floorId, floor.floor)
@@ -2773,7 +2817,8 @@ struct ThreadDetail {
                 // 正文
                 this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
                 if ((comment.images ?? []).length > 0) {
-                  this.ImageGrid(comment.images ?? [], false)
+                  // 同楼层卡：宫格 336 封顶防平板 2 列列宽拉伸（容器已 alignItems Start）
+                  this.ImageGrid(comment.images ?? [], true)
                 }
               }
               .alignItems(HorizontalAlign.Start)
@@ -2949,6 +2994,16 @@ struct ThreadDetail {
    * `capMaxWidth`：仅**通栏卡**（主楼）传 true（336 封顶防通栏拉伸）；列内卡（楼层 / 楼中楼）传 false
    * —— 窄列下列宽本就 < 336，写死 336 上限没有意义，跟随列宽（'100%'）杜绝交叉轴测量歧义。
    */
+  /**
+   * 宫格单格高（vp）：大折叠（2026-09-16 用户反馈竖横屏宫格图片拉伸）分栏后格宽骤降——
+   * 三分屏下主楼/楼层卡内容宽 ~150-240，3 列每格仅 ~50-75vp，格高恒 120 会把图拉成细条；
+   * 收至 72（竖屏 55/72≈0.76、横屏 75/72≈1.04，与手机档 94.7/120≈0.79 比例同档）。
+   * 其它形态维持 120 逐像素不变。微调点唯一（此常量）。
+   */
+  private gridCellHeight(): number {
+    return isLargeFoldDevice() ? 72 : 120;
+  }
+
   @Builder
   ImageGrid(images: string[], capMaxWidth: boolean = true) {
     Grid() {
@@ -2979,7 +3034,7 @@ struct ThreadDetail {
     .rowsGap(6)
     .width('100%')
     // 显式总高（错位修复）：行数 × 格高 + 行间隙，消除 FlowItem 内 Grid 自测量的不确定性
-    .height(Math.ceil(images.length / 3) * 120 + (Math.ceil(images.length / 3) - 1) * 6)
+    .height(Math.ceil(images.length / 3) * this.gridCellHeight() + (Math.ceil(images.length / 3) - 1) * 6)
     // §4.9 DT-J：通栏卡限宽 336 防三列被均分到 1000+vp（每格 ≈ 320vp）而格高恒 120 → 图片横向拉伸。
     // 列内卡（capMaxWidth=false）跟随列宽 '100%'；手机档通栏可用宽 ≈ 296vp < 336 → 封顶不生效（逐像素不变）。
     .constraintSize({ maxWidth: capMaxWidth ? DETAIL_IMAGE_GRID_MAX_WIDTH : '100%' })
@@ -3442,7 +3497,7 @@ struct ThreadDetail {
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.lg })
       }
-      .width('calc(100% - 48vp)')
+      .width(overlayCardWidth())
       .padding({ top: Spacing.md })
       .backgroundColor(Theme.sheetBg(this.isDark))
       .shadow(Theme.glassShadowStyle()).backgroundEffect(ImmBlur.control())
@@ -3475,7 +3530,8 @@ struct ThreadDetail {
       // 岛内内容宽度（2026-09-13 回退）：曾改为 `dockPillWidth() − 16` 试图解决平板裁切，但 `dockPillWidth()`
       // 在手机档 = 296 → 减 16 后手机底栏内容宽从「全屏 100%」变成 280，**破坏了手机零回归**（用户已驳回，回退）。
       .width('100%')
-      .height(66)
+      // 岛内高度跟随岛总高（单点 dockPillHeight：大折叠 62 / 平板手机 66），避免双 66 漂移
+      .height(this.dockPillHeight())
       // 底栏内部居中（2026-09-13）：点赞 / 收藏 / 发送钮固定宽，「跳转」胶囊 layoutWeight(1)
       // 撑满剩余 → 内容填满岛宽；显式声明居中对齐作为意图表达。
       .justifyContent(FlexAlign.Center)
@@ -3484,7 +3540,11 @@ struct ThreadDetail {
       // 同一系统组件），无补偿时内容整体偏上 —— 平板档曾按「仅平板移除补偿」归零，真机随即复现
       // 「点赞 / 收藏 / 跳转 / 发送整体偏上、看似不齐」（各元素高 42/46/42，偏移量随高度略异）。
       // 故补偿恢复**两端统一** bottom 8（内容区上移 4vp 贴合官方岛视觉中心）；手机档本就是 8，零变化。
-      .padding({ left: 0, right: 0, top: 0, bottom: 8 })
+      // 大折叠（2026-09-15 真机反馈横竖屏均「上面留空多于下面」）：官方岛留白差在该形态更大，
+      // 补偿加大到 16（再上移 4vp）拉平上下留空；同日随后岛高收 4（66→62），补偿同步 16→12
+      // 使内容区 62−12=50 与改前 66−16=50 完全一致（元素相对位置零变化，仅岛更紧凑）；
+      // 手机 / 平板维持 8 不变。微调点唯一（此常量）。
+      .padding({ left: 0, right: 0, top: 0, bottom: isLargeFoldDevice() ? 12 : 8 })
     } else {
       Row({ space: 8 }) {
         this.CommentBarBody()
@@ -3503,6 +3563,16 @@ struct ThreadDetail {
       .borderRadius(33)
       .margin({ bottom: 30 })
     }
+  }
+
+  /**
+   * 岛内跳转胶囊 / 发送钮垂直微调（vp）：仅大折叠生效，平板 / 手机 / 其它形态恒 0 逐像素不变。
+   * 历史：66 岛时代两元素偏上 → 拨 +4；岛高收 62（2026-09-15）后官方系统留白同步收、
+   * 两元素转为偏下 → 拨正量归 0 回归纯公式居中。微调点唯一（此常量），观感偏差变化时只调该值。
+   */
+  private islandNudge(): number {
+    // 当前 = 0（62 岛下两元素纯公式即居中）；如真机再报偏差，按方向改此值（偏上为正、偏下为负）
+    return 0;
   }
 
   /** 评论条内容（点赞/收藏 + 输入区 + 发送钮）：由 CommentBar 的两种外壳共用 */
@@ -3566,6 +3636,7 @@ struct ThreadDetail {
       .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.9 })
       .borderRadius(33)
       .alignItems(VerticalAlign.Center)
+      .offset({ y: this.islandNudge() })
       .accessibilityText('跳转到官方贴吧')
       .onClick(() => { this.openJumpDialog(); })
 
@@ -3579,6 +3650,7 @@ struct ThreadDetail {
       .width(42)
       .height(42)
       .margin({ right: 4 })
+      .offset({ y: this.islandNudge() })
       .backgroundColor(Theme.glassAccent())
       .shadow({ radius: 10, color: this.isDark ? '#733173FF' : '#403173FF', offsetY: 2 })
       .borderRadius(Radius.full)
