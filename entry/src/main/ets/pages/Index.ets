@@ -25,7 +25,7 @@ import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL, PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION } from '../common/Constants';
 import { FollowItem, UserInfo, UserStats } from '../model/DataModel';
-import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager, isLargeFoldDevice } from '../common/Theme';
+import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager, isLargeFoldDevice, isPuraXMaxDevice, Breakpoint } from '../common/Theme';
 import { FrameRateBoost } from '../common/FrameRateBoost';
 import { FavoriteTab } from './Favorite';
 import { MessagesTab } from './MessagesTab';
@@ -480,8 +480,11 @@ struct Index {
       this.currentWidth = width;
       this.currentHeight = newValue.height as number;
       // 大折叠展开态（2026-09-15 用户拍板「底栏限宽不拉伸」）：并入平板档，底栏 480 居中 + 平板档几何；
-      // 折叠态 isLargeFoldDevice 为 false，回落手机档不受影响
-      this.isWideScreen = width >= 840 || isLargeFoldDevice();
+      // 折叠态 isLargeFoldDevice 为 false，回落手机档不受影响。
+      // Pura X Max（阔折叠展开 ~860vp）同口径并入：底栏 400 不拉伸（2026-09-17 立项）
+      // 小窗 / 分屏窄窗（2026-09-17）：窗口宽 <600 时不吃大折叠 / Pura X Max 设备恒值档，回落手机底栏
+      this.isWideScreen = width >= 840
+        || ((isLargeFoldDevice() || isPuraXMaxDevice()) && width >= Breakpoint.sm);
     })
   }
 

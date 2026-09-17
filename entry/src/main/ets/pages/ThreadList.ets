@@ -1837,7 +1837,7 @@ struct ThreadList {
       }
       // 首次成功展示后后台预热其它两个排序，使后续切换首次即命中缓存（一次性，失败静默）
       this.warmupSortCaches();
-      const header = TiebaService.getInstance().getCachedForumHeader();
+      const header = TiebaService.getInstance().getCachedForumHeader(this.forumName);
       if (header) {
         this.forumInfo = header;
       }
@@ -1882,7 +1882,7 @@ struct ThreadList {
       this.threads = result.list;
       this.hasMore = result.list.length > 0;
       this.stalledPages = 0;
-      const header = TiebaService.getInstance().getCachedForumHeader();
+      const header = TiebaService.getInstance().getCachedForumHeader(this.forumName);
       if (header) {
         this.forumInfo = header;
       }
@@ -2939,7 +2939,8 @@ struct ThreadList {
     // 同点追加形态变化挂点（§4.8 T-B）：窗口尺寸变化时回填宽高 + 横竖屏 + 列数标记
     .onAreaChange((_old: Area, n: Area) => {
       this.currentWidth = n.width as number;
-      this.onListFormAreaChange();
+      // 窗口实值优先（2026-09-17 小窗 / 分屏适配：自由多窗下 display ≠ 窗口）
+      this.onListFormAreaChange(n.width as number, n.height as number);
     })
   }
 
@@ -3497,26 +3498,32 @@ struct ThreadList {
 
   /** 形态变化唯一挂点：回填窗口宽高 + 横竖屏 + 列数标记（**不包任何过渡动画**，
    *  列数模板不可补间，§4.6 H-G）。窗口尺寸未变则直接返回，避免 onAreaChange 高频回调重排。 */
-  private onListFormAreaChange(): void {
-    try {
-      const d = display.getDefaultDisplaySync();
-      const w: number = this.getUIContext().px2vp(d.width);
-      const h: number = this.getUIContext().px2vp(d.height);
-      if (w <= 0 || h <= 0) {
+  private onListFormAreaChange(winW?: number, winH?: number): void {
+    // 窗口实值优先（2026-09-17 小窗 / 分屏适配：自由多窗下 display ≠ 窗口）；未就绪退 display 首帧口径
+    let w: number = winW ?? 0;
+    let h: number = winH ?? 0;
+    if (w <= 0 || h <= 0) {
+      try {
+        const d = display.getDefaultDisplaySync();
+        w = this.getUIContext().px2vp(d.width);
+        h = this.getUIContext().px2vp(d.height);
+      } catch (e) {
+        // 忽略：窗口未 attach 时取宽会失败
         return;
       }
-      if (w === this.pageWidth && h === this.pageHeight) {
-        return;
-      }
-      this.pageWidth = w;
-      this.pageHeight = h;
-      this.isLandscape = w > h;
-      this.syncCardColumns();
-      // 列数变化 → 主体 section 的 crossCount 必须同步（横竖屏切换：竖 3 / 横 4）
-      this.syncSections();
-    } catch (e) {
-      // 忽略：窗口未 attach 时取宽会失败
     }
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    if (w === this.pageWidth && h === this.pageHeight) {
+      return;
+    }
+    this.pageWidth = w;
+    this.pageHeight = h;
+    this.isLandscape = w > h;
+    this.syncCardColumns();
+    // 列数变化 → 主体 section 的 crossCount 必须同步（横竖屏切换：竖 3 / 横 4）
+    this.syncSections();
   }
 
   /**
@@ -3524,13 +3531,19 @@ struct ThreadList {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
    */
   private threadColumns(): number {
-    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（吧主页与吧搜索态共用）
-    if (isLargeFoldDevice()) {
-      return 3;
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
+    // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
+    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
+      return 1;
     }
-    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
-    if (isWideBarDevice()) {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径；吧主页与吧搜索态共用）
+    if (isLargeFoldDevice()) {
       return this.isLandscape ? 3 : 2;
+    }
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2，2026-09-17 用户改定）：不依赖宽度阈值（竖屏宽 <600），
+    // 竖 1 / 横 3（竖屏回落手机单列档；初版竖 2 作废）
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 1;
     }
     if (!this.isWideFormDevice) {
       return 1;
@@ -3538,7 +3551,8 @@ struct ThreadList {
     if (this.pageWidth < Breakpoint.sm) {
       return 1;
     }
-    return this.isLandscape ? 4 : 3;
+    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
+    return this.pageWidth >= Breakpoint.md ? 3 : 2;
   }
 
   /**
@@ -3899,7 +3913,7 @@ struct ThreadList {
       if (this.loadState === LoadState.Loading || this.loadState === LoadState.Error) {
         this.loadState = result.list.length > 0 ? LoadState.Success : LoadState.Empty;
       }
-      const header = TiebaService.getInstance().getCachedForumHeader();
+      const header = TiebaService.getInstance().getCachedForumHeader(this.forumName);
       if (header) {
         this.forumInfo = header;
       }
@@ -3985,7 +3999,7 @@ struct ThreadList {
         message: `签到成功！已连续签到${this.signDays}天${bonusMsg}`
       });
       // Refresh forum header to get updated score
-      const header = TiebaService.getInstance().getCachedForumHeader();
+      const header = TiebaService.getInstance().getCachedForumHeader(this.forumName);
       if (header) {
         this.forumInfo = header;
       }

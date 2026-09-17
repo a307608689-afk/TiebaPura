@@ -119,21 +119,27 @@ struct GlobalQueryPage {
     this.refreshFormMetrics();
   }
 
-  /** 形态度量回填（display 实时值）：aboutToAppear 首帧 + 根容器 onAreaChange 兜底共用（§4.11/§4.12 同款） */
-  private refreshFormMetrics(): void {
-    try {
-      const d = display.getDefaultDisplaySync();
-      const w: number = this.getUIContext().px2vp(d.width);
-      const h: number = this.getUIContext().px2vp(d.height);
-      if (w <= 0 || h <= 0) {
+  /** 形态度量回填：aboutToAppear 首帧（display 兜底猜测）+ 根容器 onAreaChange（窗口实值）共用。
+   *  2026-09-17 小窗 / 分屏适配：传入窗口宽高时以窗口为准（自由多窗下 display ≠ 窗口）。 */
+  private refreshFormMetrics(winW?: number, winH?: number): void {
+    let w: number = winW ?? 0;
+    let h: number = winH ?? 0;
+    if (w <= 0 || h <= 0) {
+      try {
+        const d = display.getDefaultDisplaySync();
+        w = this.getUIContext().px2vp(d.width);
+        h = this.getUIContext().px2vp(d.height);
+      } catch (e) {
+        // 忽略：窗口未 attach 时取宽会失败
         return;
       }
-      this.pageWidth = w;
-      this.pageHeight = h;
-      this.isLandscape = w > h;
-    } catch (e) {
-      // 忽略：窗口未 attach 时取宽会失败
     }
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    this.pageWidth = w;
+    this.pageHeight = h;
+    this.isLandscape = w > h;
   }
 
   /**
@@ -141,13 +147,19 @@ struct GlobalQueryPage {
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
   private searchColumns(): number {
-    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（搜吧 / 搜贴 / 搜人共用）
-    if (isLargeFoldDevice()) {
-      return 3;
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
+    // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
+    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
+      return 1;
     }
-    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
-    if (isWideBarDevice()) {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径；搜吧 / 搜贴 / 搜人共用）
+    if (isLargeFoldDevice()) {
       return this.isLandscape ? 3 : 2;
+    }
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2，2026-09-17 用户改定）：不依赖宽度阈值（竖屏宽 <600），
+    // 竖 1 / 横 3（竖屏回落手机单列档；初版竖 2 作废）
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 1;
     }
     if (!this.isWideFormDevice) {
       return 1;
@@ -155,7 +167,8 @@ struct GlobalQueryPage {
     if (this.pageWidth < Breakpoint.sm) {
       return 1;
     }
-    return this.isLandscape ? 4 : 3;
+    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
+    return this.pageWidth >= Breakpoint.md ? 3 : 2;
   }
 
   /** 列索引数组 [0..列数-1]：外层 ForEach 只遍历索引（key 稳定 → 列容器复用，收藏页五轮教训） */
@@ -1611,8 +1624,8 @@ struct GlobalQueryPage {
       if (width > 0) {
         this.currentWidth = width;
       }
-      // 形态变化兜底（横竖屏 / 分屏拖宽：§4.7，与 §4.8 T-B 同款同点追加）
-      this.refreshFormMetrics();
+      // 形态变化兜底（横竖屏 / 分屏拖宽：§4.7，与 §4.8 T-B 同款同点追加）；窗口实值优先（小窗 display ≠ 窗口）
+      this.refreshFormMetrics(width, newValue.height as number);
     })
   }
 }

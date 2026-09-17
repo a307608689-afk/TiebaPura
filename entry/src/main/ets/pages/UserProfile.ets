@@ -18,7 +18,7 @@
 
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isPuraXMaxDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { TiebaService, BlacklistPermOptions } from '../service/TiebaService';
@@ -594,21 +594,27 @@ struct UserProfile {
     return this.currentWidth > 0 ? this.currentWidth : 360;
   }
 
-  /** 首帧形态初值 + onAreaChange 兜底共用（§4.11/§4.12 同款） */
-  private refreshFormMetrics(): void {
-    try {
-      const d = display.getDefaultDisplaySync();
-      const w: number = this.getUIContext().px2vp(d.width);
-      const h: number = this.getUIContext().px2vp(d.height);
-      if (w <= 0 || h <= 0) {
+  /** 形态度量回填：aboutToAppear 首帧（display 兜底猜测）+ onAreaChange（窗口实值）共用。
+   *  2026-09-17 小窗 / 分屏适配：传入窗口宽高时以窗口为准（自由多窗下 display ≠ 窗口）。 */
+  private refreshFormMetrics(winW?: number, winH?: number): void {
+    let w: number = winW ?? 0;
+    let h: number = winH ?? 0;
+    if (w <= 0 || h <= 0) {
+      try {
+        const d = display.getDefaultDisplaySync();
+        w = this.getUIContext().px2vp(d.width);
+        h = this.getUIContext().px2vp(d.height);
+      } catch (e) {
+        // 忽略：窗口未 attach 时取宽会失败
         return;
       }
-      this.pageWidth = w;
-      this.pageHeight = h;
-      this.isLandscape = w > h;
-    } catch (e) {
-      // 忽略：窗口未 attach 时取宽会失败
     }
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    this.pageWidth = w;
+    this.pageHeight = h;
+    this.isLandscape = w > h;
   }
 
   /**
@@ -616,13 +622,19 @@ struct UserProfile {
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
   private profileColumns(): number {
-    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列
-    if (isLargeFoldDevice()) {
-      return 3;
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
+    // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
+    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
+      return 1;
     }
-    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3
-    if (isWideBarDevice()) {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径）
+    if (isLargeFoldDevice()) {
       return this.isLandscape ? 3 : 2;
+    }
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2，2026-09-17 用户改定）：不依赖宽度阈值（竖屏宽 <600），
+    // 竖 1 / 横 3（竖屏回落手机单列档；初版竖 2 作废）
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 1;
     }
     if (!this.isWideFormDevice) {
       return 1;
@@ -630,7 +642,8 @@ struct UserProfile {
     if (this.pageWidth < Breakpoint.sm) {
       return 1;
     }
-    return this.isLandscape ? 4 : 3;
+    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
+    return this.pageWidth >= Breakpoint.md ? 3 : 2;
   }
 
   /** 列索引数组：外层 ForEach 只遍历索引（key 稳定 → 列容器复用，收藏页五轮教训） */
@@ -783,7 +796,8 @@ struct UserProfile {
   /** 悬浮胶囊宽度：宽屏（含平板 / 大折叠展开）**400**（2026-09-16 用户拍板「底栏 = 黑名单弹窗宽度」，横竖屏同值）；
    *  窄屏 屏宽-48，下限 240 防极端异常（手机档逐像素不变） */
   private pillWidth(): number {
-    if (this.isWideScreen || isLargeFoldDevice()) {
+    // 大折叠设备恒值项补窗口宽度条件（2026-09-17 小窗 / 分屏适配）：窄窗不吃 400 档，回落手机档
+    if (this.isWideScreen || (isLargeFoldDevice() && this.currentWidth >= Breakpoint.sm)) {
       return 400;
     }
     const w: number = this.currentWidth > 0 ? this.currentWidth - 48 : 312;
@@ -809,9 +823,11 @@ struct UserProfile {
     .onAreaChange((oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
       this.currentWidth = width;
-      this.isWideScreen = width >= 840;
-      // 形态变化兜底（横竖屏 / 分屏拖宽：§4.11，列数模板不可补间）
-      this.refreshFormMetrics();
+      // Pura X Max（阔折叠展开 ~860vp）与大折叠同口径并入宽屏：底栏/黑名单弹窗 400 不拉伸（2026-09-17 立项）；
+      // 小窗 / 分屏窄窗（2026-09-17）：窗口宽 <600 不吃 Pura X Max 设备档，回落手机档
+      this.isWideScreen = width >= 840 || (isPuraXMaxDevice() && width >= Breakpoint.sm);
+      // 形态变化兜底（横竖屏 / 分屏拖宽：§4.11，列数模板不可补间）；窗口实值优先（小窗 display ≠ 窗口）
+      this.refreshFormMetrics(width, newValue.height as number);
     })
   }
 

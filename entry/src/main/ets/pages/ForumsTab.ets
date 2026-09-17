@@ -1368,13 +1368,19 @@ export struct ForumsTab {
    * 「最小单列宽保护」按用户拍板**不启用**（先用主方案看真机）；「创建吧」卡片随流、不独占。
    */
   private forumColumns(): number {
-    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：展开态近方形，竖横屏均 3 列（2026-09-15 用户拍板）
-    if (isLargeFoldDevice()) {
-      return 3;
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
+    // 手机档——本页手机档 2 列、阔直屏手机档 1 列；须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
+    if (this.pageWidth > 0 && this.pageWidth < 600) {
+      return isWideBarDevice() ? 1 : 2;
     }
-    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2）：不依赖宽度阈值（竖屏宽 <600），竖 2 / 横 3（竖屏与手机档同值）
-    if (isWideBarDevice()) {
+    // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径）
+    if (isLargeFoldDevice()) {
       return this.isLandscape ? 3 : 2;
+    }
+    // 阔直屏（docs/TiebaPura阔直屏适配.md §4.2，2026-09-17 用户改定）：不依赖宽度阈值（竖屏宽 <600），
+    // 竖 1 / 横 3（竖屏回落手机单列档；初版竖 2 作废）
+    if (isWideBarDevice()) {
+      return this.isLandscape ? 3 : 1;
     }
     if (!this.isWideFormDevice) {
       return 2;
@@ -1382,10 +1388,11 @@ export struct ForumsTab {
     if (this.pageWidth < 600) {
       return 2;
     }
-    return this.isLandscape ? 4 : 3;
+    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
+    return this.pageWidth >= 840 ? 3 : 2;
   }
 
-  /** 列数 → Grid 列模板（手机 2 / 平板竖 3 / 平板横 4） */
+  /** 列数 → Grid 列模板（手机 2 / 平板竖 2 / 平板横 3） */
   private columnsTemplateOf(n: number): string {
     if (n >= 4) {
       return '1fr 1fr 1fr 1fr';

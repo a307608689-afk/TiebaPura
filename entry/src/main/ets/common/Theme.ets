@@ -1032,8 +1032,10 @@ let _wideBarProbeLogged: boolean = false;
 export function isWideBarDevice(): boolean {
   try {
     if (display.isFoldable()) {
-      // 折叠屏只认 Pura X 展开态；其它折叠设备维持既有平板档（isWideFormDevice 闸门）不变
-      const hit: boolean = isPuraXFoldModel()
+      // 折叠屏只认 Pura X 展开态与 Pura X Max（阔折叠）展开态；其它折叠设备维持既有平板档不变。
+      // Pura X Max 展开态按阔直屏基础档（7.7" √2 屏，竖 1 / 横 3 同口径），差异点（回复 2 列、
+      // 宫格 72、底栏/弹窗 400）由调用方以 isPuraXMaxDevice() 前置分支单独拨档。
+      const hit: boolean = (isPuraXFoldModel() || isPuraXMaxDevice())
         && display.getFoldStatus() === display.FoldStatus.FOLD_STATUS_EXPANDED;
       logWideBarProbe(0, hit);
       return hit;
@@ -1072,6 +1074,59 @@ function logWideBarProbe(ratio: number, hit: boolean): void {
     const r: string = ratio > 0 ? ratio.toFixed(3) : 'model-override';
     console.info(`[WIDEBAR] model=${deviceInfo.productModel} type=${deviceInfo.deviceType} `
       + `foldable=${display.isFoldable()} px=${d.width}x${d.height} ratio=${r} hit=${hit}`);
+  } catch (e) {
+    // 日志失败不影响判定
+  }
+}
+
+// ========== Pura X Max 阔折叠判定（2026-09-17 用户立项）==========
+
+/** Pura X Max 判定探针日志只打一次（isPuraXMaxDevice 在渲染路径被高频调用） */
+let _puraXMaxProbeLogged: boolean = false;
+
+/**
+ * Pura X Max（阔折叠）展开态判定：7.7" 内屏 2584×1828，比例 √2 ≈ 1.414（类 A4 纸黄金比例）。
+ * - 主判据 = 比例带 (1.36, 1.48)：居中 √2；与 Mate X3/X5 展开内屏（≈1.34）隔 ≥0.02、
+ *   与 Mate X 大折叠带 (1.0,1.25)、Pura X（VDE 展开 2120×1320 ≈ 1.606）天然隔离，
+ *   且仅折叠屏 + 展开态命中（折叠态外屏 1848×1264 ≈ 1.462 虽落带内，但非 EXPANDED 直接 false）
+ * - 不硬编码型号（同阔直屏教训：变体型号每出新机都要发版）；真机到手按 [PURAXMAX] 探针
+ *   核对 productModel / 实测比例，必要时补型号兜底
+ * - 折叠态 / HALF_FOLDED / 异常一律 false（安全方向 = 手机档）；
+ *   展开↔折叠切换由各页 onAreaChange / display.on('change') 触发重渲染自动翻档
+ */
+export function isPuraXMaxDevice(): boolean {
+  try {
+    if (!display.isFoldable()) {
+      return false;
+    }
+    if (display.getFoldStatus() !== display.FoldStatus.FOLD_STATUS_EXPANDED) {
+      return false;
+    }
+    const d: display.Display = display.getDefaultDisplaySync();
+    const w: number = d.width;
+    const h: number = d.height;
+    if (w <= 0 || h <= 0) {
+      return false;
+    }
+    const ratio: number = Math.max(w, h) / Math.min(w, h);
+    const hit: boolean = ratio > 1.36 && ratio < 1.48;
+    logPuraXMaxProbe(ratio, hit);
+    return hit;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 首次判定时打一条探针日志：真机到手第一时间核对 productModel / 实测比例，校准比例带 */
+function logPuraXMaxProbe(ratio: number, hit: boolean): void {
+  if (_puraXMaxProbeLogged) {
+    return;
+  }
+  _puraXMaxProbeLogged = true;
+  try {
+    const d: display.Display = display.getDefaultDisplaySync();
+    console.info(`[PURAXMAX] model=${deviceInfo.productModel} type=${deviceInfo.deviceType} `
+      + `foldable=${display.isFoldable()} px=${d.width}x${d.height} ratio=${ratio.toFixed(3)} hit=${hit}`);
   } catch (e) {
     // 日志失败不影响判定
   }
@@ -1139,7 +1194,8 @@ function logLargeFoldProbe(ratio: number, hit: boolean): void {
  * 注：bindSheet 半模态 SheetOptions 无 width 字段，宽度由系统按设备规格决定，不在本函数管辖内。
  */
 export function overlayCardWidth(): string | number {
-  if (!isLargeFoldDevice()) {
+  // Pura X Max（阔折叠展开 ~860vp 宽）与底栏同口径：400 封顶不拉伸（同大折叠 2026-09-15 拍板）
+  if (!isLargeFoldDevice() && !isPuraXMaxDevice()) {
     return 'calc(100% - 48vp)';
   }
   try {

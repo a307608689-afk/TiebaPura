@@ -395,16 +395,18 @@ export struct HomeTab {
     this.syncSource(this.folDataSource, this.folThreads);
   }
 
-  /** 大屏竖 3 / 横 4（§4.2 决策 12）；阔直屏竖 2 / 横 3（阔直屏文档 §4.2）：同步 AppStorage 让 ThreadCard 内部图片封顶/摘要行数跟随 */
+  /** 大屏竖 3 / 横 4（§4.2 决策 12）；阔直屏竖 1 / 横 3（阔直屏文档 §4.2，2026-09-17 用户改定）：同步 AppStorage 让 ThreadCard 内部图片封顶/摘要行数跟随 */
   private updateColumns(): void {
     try {
       const d: display.Display = display.getDefaultDisplaySync();
       const w: number = this.getUIContext().px2vp(d.width);
       const h: number = this.getUIContext().px2vp(d.height);
-      // 阔直屏不依赖宽度阈值（横屏 ~830 < 840 过不了 md 档），列数只看横竖屏；大折叠展开态竖横屏均 3 列（大折叠文档 §4.2）
-      this.columns = isWideBarDevice() ? (w > h ? 3 : 2)
-        : (isLargeFoldDevice() ? 3 : (w > h ? 4 : 3));
-      AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.columns);
+      // 阔直屏不依赖宽度阈值（横屏 ~830 < 840 过不了 md 档），列数只看横竖屏，竖屏回落手机单列档；
+      // 大折叠竖 2 / 横 3（2026-09-17 用户改定，与平板同口径）；平板竖 2 / 横 3（原竖 3 / 横 4 作废）
+      this.columns = isWideBarDevice() ? (w > h ? 3 : 1)
+        : (w > h ? 3 : 2);
+      // 经 homeColumns() 的窗口闸门下发（小窗 / 分屏窄窗写 1），不能裸写 this.columns 绕过闸门
+      this.syncCardColumns();
     } catch (e) {
       // 窗口未 attach 时取宽高失败，保持默认 3 列
     }
@@ -415,15 +417,21 @@ export struct HomeTab {
   };
 
   /**
-   * 列数：大屏竖屏 3 / 大屏横屏 4（§4.2 决策 12）；阔直屏竖 2 / 横 3；手机（含横屏 / 分屏 / 自由多窗）与窄窗维持现状单列。
+   * 列数：大屏竖屏 3 / 大屏横屏 4（§4.2 决策 12）；阔直屏竖 1 / 横 3（2026-09-17 用户改定）；手机（含横屏 / 分屏 / 自由多窗）与窄窗维持现状单列。
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
    */
   private homeColumns(): number {
-    // 阔直屏分支必须在宽度检查之前（竖屏宽 ~500 < 600 会被拦回手机档）
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
+    // 手机单列档——必须放在设备恒值分支（阔直屏 / 大折叠直接 return this.columns）之前，
+    // 否则设备恒值分支会绕过宽度兜底（小窗里 display 仍是横屏大屏 → 旧逻辑恒 3 列）
+    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
+      return 1;
+    }
+    // 阔直屏分支紧随其后（竖屏窗口宽 ~500 < 600 已被上面的窗口闸门回落 1 列，语义不变）
     if (isWideBarDevice()) {
       return this.columns;
     }
-    // 大折叠展开态（大折叠文档 §4.2）：竖横屏均 3 列（updateColumns 已按形态写 this.columns），
+    // 大折叠展开态（大折叠文档 §4.2）：竖 2 / 横 3（updateColumns 已按横竖屏写 this.columns），
     // 折叠态为 false 落后续宽度闸门回 1 列
     if (isLargeFoldDevice()) {
       return this.columns;
@@ -434,7 +442,9 @@ export struct HomeTab {
     if (this.pageWidth < Breakpoint.sm) {
       return 1;
     }
-    return this.columns;
+    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列——不再吃 display 横竖屏
+    // 推导的 this.columns（小窗下 display 恒横屏会把中间档顶成 3 列挤爆）
+    return this.pageWidth >= Breakpoint.md ? 3 : 2;
   }
 
   /**
@@ -444,6 +454,17 @@ export struct HomeTab {
    */
   private syncCardColumns(): void {
     AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.homeColumns());
+  }
+
+  /**
+   * 列模板：**必须与 homeColumns() 单点同源**（2026-09-17 小窗修复）。
+   * WaterFlow 的 columnsTemplate 曾直接绑 this.columns（display 推导值，小窗下恒 3）——
+   * 分支入口 `homeColumns() > 1` 放行了中间档（600~840 → 2 列），模板却按 this.columns=3 铺 3 列，
+   * 造成「中档小窗还是三列」。列数消费方一律走本函数 / homeColumns()，禁止直绑 this.columns。
+   */
+  private homeColumnsTemplate(): string {
+    const n: number = this.homeColumns();
+    return n === 4 ? '1fr 1fr 1fr 1fr' : n === 2 ? '1fr 1fr' : '1fr 1fr 1fr';
   }
 
   /**
@@ -1600,24 +1621,34 @@ export struct HomeTab {
     } else {
       this.homeViewportH = newValue.height as number;
     }
-    this.checkFormChange();
+    // 窗口实宽 / 实高（Area 已是 vp）：小窗 / 分屏 / 自由多窗下 display ≠ 窗口，必须以窗口为准
+    this.checkFormChange(Number(newValue.width), Number(newValue.height));
   }
 
-  /** 形态变化兜底：真实屏幕宽高变化（分屏 / 自由窗口 / 折叠展开）时刷新列数标记 */
-  private checkFormChange(): void {
-    try {
-      const d: display.Display = display.getDefaultDisplaySync();
-      const w: number = this.getUIContext().px2vp(d.width);
-      const h: number = this.getUIContext().px2vp(d.height);
-      if (w !== this.pageWidth || h !== this.pageHeight) {
-        this.pageWidth = w;
-        this.pageHeight = h;
-        this.updateFadeStop(h);
-        this.updateColumns();
-        this.syncCardColumns();
+  /** 形态变化兜底：窗口宽高变化（分屏 / 自由窗口 / 折叠展开 / 小窗拖拽）时刷新列数标记；
+   *  窗口值拿不到时退回 display 首帧口径（全屏下两者等价）。 */
+  private checkFormChange(winW: number, winH: number): void {
+    let w: number = winW;
+    let h: number = winH;
+    if (w <= 0 || h <= 0) {
+      try {
+        const d: display.Display = display.getDefaultDisplaySync();
+        w = this.getUIContext().px2vp(d.width);
+        h = this.getUIContext().px2vp(d.height);
+      } catch (e) {
+        // 忽略：窗口未 attach 时取宽会失败
+        return;
       }
-    } catch (e) {
-      // 忽略：窗口未 attach 时取宽会失败
+    }
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    if (w !== this.pageWidth || h !== this.pageHeight) {
+      this.pageWidth = w;
+      this.pageHeight = h;
+      this.updateFadeStop(h);
+      this.updateColumns();
+      this.syncCardColumns();
     }
   }
 
@@ -1782,7 +1813,7 @@ export struct HomeTab {
                 }
               }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
             }
-            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : this.columns === 2 ? '1fr 1fr' : '1fr 1fr 1fr')
+            .columnsTemplate(this.homeColumnsTemplate())
             .columnsGap(Spacing.md)
             .rowsGap(Spacing.md)
             .padding({ left: Spacing.lg, right: Spacing.lg })
@@ -1949,7 +1980,7 @@ export struct HomeTab {
                 }
               }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
             }
-            .columnsTemplate(this.columns === 4 ? '1fr 1fr 1fr 1fr' : this.columns === 2 ? '1fr 1fr' : '1fr 1fr 1fr')
+            .columnsTemplate(this.homeColumnsTemplate())
             .columnsGap(Spacing.md)
             .rowsGap(Spacing.md)
             .padding({ left: Spacing.lg, right: Spacing.lg })

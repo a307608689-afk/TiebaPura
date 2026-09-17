@@ -151,6 +151,17 @@ interface ModernForumInfo {
   name?: string;
   id?: string;
   avatar?: string;
+  /** 吧头补全字段（modern JSON 吧对象，值多为字符串数字，读取时统一 Number 归一化） */
+  slogan?: string;
+  member_num?: string | number;
+  thread_num?: string | number;
+  post_num?: string | number;
+  user_level?: string | number;
+  level_name?: string;
+  cur_score?: string | number;
+  levelup_score?: string | number;
+  is_like?: string | number;
+  has_frs_star?: string | number;
 }
 
 interface ModernForumGroup {
@@ -337,6 +348,8 @@ export class TiebaService {
   /** 服务器时间 - 本地时间 的偏移（毫秒），由 /c/s/login 响应的 time 字段校准 */
   private static serverTimeOffsetMs: number = 0;
   private cachedForumHeader: ForumHeaderInfo | null = null;
+  /** cachedForumHeader 所属吧名（kw 原样记录）：ThreadList 取头时校验，防止上一个吧的头串显 */
+  private cachedForumHeaderKw: string = '';
   /**
    * proto（protobuf）列表接口连续失败次数：接口返回异常/风控/挂起超时时递增。
    * 达到 2 次后本会话内跳过 proto 直接走 modern JSON 接口——被风控时每次都会挂满超时
@@ -362,8 +375,49 @@ export class TiebaService {
     return TiebaService.instance;
   }
 
-  getCachedForumHeader(): ForumHeaderInfo | null {
+  /**
+   * 取最近的吧头缓存。传入发起请求的吧名做归属校验：
+   * proto/JSON 只在对应吧的列表请求里写入头信息，若缓存属于其它吧（如连续降级会话里
+   * 先后进了两个吧）必须返回 null，让页面按「头信息缺失」处理，避免把 A 吧的关注态、
+   * 成员数、等级串到 B 吧头上。
+   */
+  getCachedForumHeader(forumName: string): ForumHeaderInfo | null {
+    if (this.cachedForumHeader === null) {
+      return null;
+    }
+    if (forumName.length > 0 && this.cachedForumHeaderKw.length > 0 && this.cachedForumHeaderKw !== forumName) {
+      return null;
+    }
     return this.cachedForumHeader;
+  }
+
+  /** modern JSON 吧对象 → 吧头缓存（值多为字符串数字，统一 Number 归一化；缺字段安全回落 0/空串） */
+  private cacheForumHeaderFromModern(forum: ModernForumInfo | undefined, requestKw: string): void {
+    if (!forum) {
+      return;
+    }
+    const toNum = (v?: string | number): number => {
+      const n = Number(v ?? 0);
+      return isNaN(n) ? 0 : n;
+    };
+    const name = (forum.name ?? '').toString().trim();
+    this.cachedForumHeader = {
+      forumId: `${forum.id ?? ''}`,
+      forumName: name.length > 0 ? name : requestKw,
+      avatar: this.normalizeForumAvatar((forum.avatar ?? '').toString()),
+      bannerUrl: '',
+      slogan: (forum.slogan ?? '').toString(),
+      memberCount: toNum(forum.member_num),
+      threadCount: toNum(forum.thread_num),
+      postCount: toNum(forum.post_num),
+      userLevel: toNum(forum.user_level),
+      levelName: (forum.level_name ?? '').toString(),
+      curScore: toNum(forum.cur_score),
+      levelupScore: toNum(forum.levelup_score),
+      isLike: toNum(forum.is_like) === 1,
+      hasFrsStar: toNum(forum.has_frs_star) === 1,
+    };
+    this.cachedForumHeaderKw = requestKw;
   }
 
   /**
@@ -992,6 +1046,9 @@ export class TiebaService {
         scr_h: '800',
         scr_w: '360',
       });
+      // modern JSON 同样带 forum 对象（含 is_like/成员数/等级）：proto 被风控降级到本路径时
+      // 若不提取，页面 forumInfo 恒 null → 签到钮永远显「未签到」且点不了关注
+      this.cacheForumHeaderFromModern(payload.forum, forumName);
       const modernList = this.parseModernThreads(payload, page, forumName);
       if (modernList.list.length > 0) {
         if (isGoodMode) {
@@ -1106,6 +1163,7 @@ export class TiebaService {
       throw new Error(decoded.error?.userMsg ?? decoded.error?.errorMsg ?? `贴吧列表接口错误 ${errorCode}`);
     }
     this.cachedForumHeader = this.extractForumHeaderInfo(decoded, forumName);
+    this.cachedForumHeaderKw = forumName;
     const threadList = decoded.data?.threadList ?? [];
     const userList = decoded.data?.userList ?? [];
     const globalForumAvatar: string = decoded.data?.forum?.avatar ?? '';

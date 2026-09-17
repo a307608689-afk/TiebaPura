@@ -29,7 +29,7 @@ import { CACHE_KEY } from '../common/Constants';
 import { FavoriteStore } from '../service/FavoriteStore';
 import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType } from '../model/DataModel';
 import { ThreadDetailResult } from '../service/TiebaService';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isLargeFoldDevice, isPuraXMaxDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadDetailSkeleton } from '../components/Skeleton';
 import { EmojiLoader } from '../network/EmojiLoader';
@@ -1197,6 +1197,16 @@ struct ThreadDetail {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
    */
   private replyColumns(): number {
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律单列
+    // ——须在设备恒值分支（Pura X Max / 大折叠恒 2）之前，防小窗误命中
+    if (this.currentWidth > 0 && this.currentWidth < Breakpoint.sm) {
+      return 1;
+    }
+    // Pura X Max（阔折叠展开 7.7"，2026-09-17 立项）：右栏回复 2 列瀑布流——屏幅与大折叠
+    // （Mate X 8"）同量级，恒 1 列（阔直屏 Pura X 6.3" 口径）会拉出 ~560vp 超长行，按大折叠 2 列
+    if (isPuraXMaxDevice()) {
+      return 2;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.4，2026-09-15 用户二次改定）：回复区恒 1 列
     // （竖屏单列；横屏分栏保留、右栏回复单列）
     if (isWideBarDevice()) {
@@ -1213,6 +1223,7 @@ struct ThreadDetail {
     if (this.currentWidth < Breakpoint.sm) {
       return 1;
     }
+    // 2026-09-17 用户二次拍板：平板横竖屏均 2 列（横 3 只活了半天即回调；与 09-16 首拍同值）
     return 2;
   }
 
@@ -1222,13 +1233,13 @@ struct ThreadDetail {
    * 左栏固定 420（DETAIL_MAIN_WIDTH 与横屏同款）、右栏回复单列；折叠态外屏窄走原路径单列。
    */
   /**
-   * 分栏左栏宽度（vp）：平板 / 大屏固定 420（DETAIL_MAIN_WIDTH，§4.9 DT-I）。
-   * 大折叠（2026-09-16 用户拍板「帖子区域的卡片宽度要跟回复区域卡片一致」）= **屏宽 / 3**——
-   * 推导：主楼卡宽 = L − 24（左 16/右 8 内距）；回复每列 = (R − 24 − 12)/2，R = W − L − 12（分栏缝 12），
-   * 两者相等 ⇔ L = W/3（回复列缝 12 恰好凑平）。横竖屏同口径；currentWidth 未就绪时回退 420。
+   * 分栏左栏宽度（vp）= **屏宽 / 3**（2026-09-17 用户拍板「帖子卡片跟回复卡片等宽」推广到平板，
+   * 大折叠 2026-09-16 同款先例）——推导：主楼卡宽 = L − 24（左 16/右 8 内距）；
+   * 回复每列 = (R − 24 − 12)/2，R = W − L − 12（分栏缝 12），两者相等 ⇔ L = W/3（列缝 12 恰好凑平）。
+   * currentWidth 未就绪时回退 420。
    */
   private splitMainWidth(): number {
-    if (isLargeFoldDevice() && this.currentWidth > 0) {
+    if (this.currentWidth > 0) {
       return Math.round(this.currentWidth / 3);
     }
     return DETAIL_MAIN_WIDTH;
@@ -1459,16 +1470,18 @@ struct ThreadDetail {
     // 竖屏 / 手机维持公式（手机 (393 − 329) / 2 = 32 逐像素不变）。
     .padding({
       // 大折叠（2026-09-15 真机反馈）：不套用 −40 平板分栏修正——那是平板 592 底栏的系统偏差校准值，
-      // 大折叠底栏 400（dialogCardWidth 口径），纯公式定位已对齐底栏左缘，再减 40 会把排序壳推出底栏外
+      // 大折叠底栏 400（dialogCardWidth 口径），纯公式定位已对齐底栏左缘，再减 40 会把排序壳推出底栏外。
+      // 阔直屏（2026-09-17 用户云调试反馈横屏排序钮偏左 + 离底栏远）同理排除：纯公式即与底栏左缘对齐
       left: Math.max(0, (this.currentWidth - this.dockPillWidth()) / 2
-        - (this.splitMode() && !isLargeFoldDevice() ? 40 : 0))
+        - (this.splitMode() && !isLargeFoldDevice() && !isPuraXMaxDevice() && !isWideBarDevice() ? 40 : 0))
     })
     .hitTestBehavior(HitTestMode.None)
     // 底距沿用原壳上的 margin（岛底余量 30 + 岛高 66），margin 已移交外层 Row，壳自身不再设；
     // 横屏分栏追加 14vp 呼吸（真机反馈横屏下排序行与底栏贴住）——大折叠不套用（2026-09-15
-    // 真机反馈大折叠横屏排序胶囊离底栏太远，其底栏 400 较矮，与竖屏同距即可）
+    // 真机反馈大折叠横屏排序胶囊离底栏太远，其底栏 400 较矮，与竖屏同距即可）；阔直屏同理不套用
+    // （2026-09-17 用户反馈横屏排序钮离底栏远，回落与竖屏同距）
     .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight()
-      + (this.splitMode() && !isLargeFoldDevice() ? 14 : 0) })
+      + (this.splitMode() && !isLargeFoldDevice() && !isPuraXMaxDevice() && !isWideBarDevice() ? 14 : 0) })
   }
 
   /** 排序行（官方槽位版）：外层 Column 撑满壳宽，内层 Row 塞满 Column，几何与 SortRowOverlay 内
@@ -1756,6 +1769,7 @@ struct ThreadDetail {
             Column({ space: Spacing.md }) {
               // 预留顶栏高度作为初始间距
               Column().width('100%').height(98)
+              // 主楼通栏满宽（2026-09-17 二次拍板：等宽仅横屏分栏生效，竖屏不用）
               this.PostHeader()
               this.ReplySectionHeader()
               this.FloorColumnsBlock()
@@ -3001,7 +3015,8 @@ struct ThreadDetail {
    * 其它形态维持 120 逐像素不变。微调点唯一（此常量）。
    */
   private gridCellHeight(): number {
-    return isLargeFoldDevice() ? 72 : 120;
+    // Pura X Max（阔折叠展开）与大折叠同口径：分栏 W/3 + 回复 2 列后格宽骤降，72 防拉伸
+    return (isLargeFoldDevice() || isPuraXMaxDevice()) ? 72 : 120;
   }
 
   @Builder
@@ -3159,11 +3174,22 @@ struct ThreadDetail {
    * 弹窗卡片宽度（vp）= min(屏幕宽 − 48vp, 400)，T-H 同款封顶——**弹窗不拉伸**（2026-09-15 用户拍板）。
    * 原实现只有下限 200 无封顶：平板屏宽 vp 下弹窗拉成通栏（系统默认 400 上限未兜住）。
    * ArkTS 的 Dimension 只接受数值 / 百分比 / 资源，不接受 calc 字符串，故换算成数值。
-   * 手机档「屏宽 − 48」= 312 < 400，逐像素不变；取屏幕宽（display）而非窗口宽。
+   * 手机档「屏宽 − 48」= 312 < 400，逐像素不变；窗口实宽优先（小窗 display ≠ 窗口），未就绪退 display。
    */
   private dialogCardWidth(): number {
-    const info: display.Display = display.getDefaultDisplaySync();
-    const widthVp: number = info.width / info.densityPixels;
+    // 窗口实宽优先（2026-09-17 小窗 / 分屏适配）：小窗下 display ≠ 窗口，按 display 算会溢出窗口；
+    // 全屏下两者等价。currentWidth 未就绪再退 display。
+    let widthVp: number = 0;
+    if (this.currentWidth > 0) {
+      widthVp = this.currentWidth;
+    } else {
+      try {
+        const info: display.Display = display.getDefaultDisplaySync();
+        widthVp = info.width / info.densityPixels;
+      } catch (e) {
+        widthVp = 0;
+      }
+    }
     const w: number = widthVp - 48;
     const capped: number = w > 400 ? 400 : w;
     return Math.max(200, capped);

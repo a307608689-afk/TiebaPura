@@ -97,14 +97,14 @@ isWideBarDevice():
 | # | 界面 | 文件 | 现状列数函数 | 平板档 | 阔直屏目标（竖/横） | 状态 |
 |---|---|---|---|---|---|---|
 | 0 | 判定收口 + 调试开关 | Theme.ets + ~12 文件 | — | — | — | 已落地（2026-09-15） |
-| 1 | 首页 | HomeTab.ets | `homeColumns()` | 竖2 / 横3 | **竖2 / 横3**（恰好同值，仅闸门放行） | 已落地（2026-09-15） |
-| 2 | 进吧 | ForumsTab.ets | `forumColumns()` | 竖3 / 横4（手机2） | **竖2 / 横3**（竖屏天然满足） | 已落地（2026-09-15） |
-| 3 | 收藏页（吧分类 / 自定义分类 / 打开列表 / 收藏搜索页） | Favorite.ets | `favColumns()` | 竖3 / 横4（手机1） | **竖2 / 横3** | 已落地（2026-09-15） |
-| 4 | 消息页 | MessagesTab.ets | `notifyColumns()` | 竖3 / 横4 | **竖2 / 横3** | 已落地（2026-09-15） |
-| 5 | 我的帖子 / 我的收藏 / 我的点赞 / 浏览历史 | PersonalContent.ets | `pcColumns()` | 竖3 / 横4 | **竖2 / 横3** | 已落地（2026-09-15） |
-| 6 | 他人信息页 | UserProfile.ets | §4.11 列数函数 | 竖3 / 横4 | **竖2 / 横3** | 已落地（2026-09-15） |
-| 7 | 吧主页（含吧内搜索） | ThreadList.ets | `threadColumns()` | 竖3 / 横4 | **竖2 / 横3** | 已落地（2026-09-15） |
-| 8 | 全局搜索页 | Search.ets | `searchColumns()` | 竖3 / 横4 | **竖2 / 横3** | 已落地（2026-09-15） |
+| 1 | 首页 | HomeTab.ets | `homeColumns()` | 竖2 / 横3 | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
+| 2 | 进吧 | ForumsTab.ets | `forumColumns()` | 竖3 / 横4（手机2） | **竖1 / 横3**（09-17 改定，竖屏不再沿用手机 2 列） | 已落地（09-17 同步） |
+| 3 | 收藏页（吧分类 / 自定义分类 / 打开列表 / 收藏搜索页） | Favorite.ets | `favColumns()` | 竖3 / 横4（手机1） | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
+| 4 | 消息页 | MessagesTab.ets | `notifyColumns()` | 竖3 / 横4 | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
+| 5 | 我的帖子 / 我的收藏 / 我的点赞 / 浏览历史 | PersonalContent.ets | `pcColumns()` | 竖3 / 横4 | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
+| 6 | 他人信息页 | UserProfile.ets | §4.11 列数函数 | 竖3 / 横4 | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
+| 7 | 吧主页（含吧内搜索） | ThreadList.ets | `threadColumns()` | 竖3 / 横4 | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
+| 8 | 全局搜索页 | Search.ets | `searchColumns()` | 竖3 / 横4 | **竖1 / 横3**（09-17 改定） | 已落地（09-17 同步） |
 | 9 | 帖子详情页 | ThreadDetail.ets | `splitMode()` + `replyColumns()` | 竖3回复 / 横屏分栏 | **竖屏：内容单列 + 回复2列；横屏：内容分栏** | 已落地（2026-09-15，§4.4） |
 | 10 | 楼中楼详情页 | SubPostDetail.ets | 同上（SP 系） | 同上 | 同上 | 已落地（2026-09-15，§4.5） |
 | 11 | 宿主壳 / 底栏 | Index.ets | — | — | **零改动**（§2.5） | 无需改动 |
@@ -133,15 +133,15 @@ isWideBarDevice():
 
 ```text
 if (isWideBarDevice()) {
-  return isLandscape ? 3 : 2;   // 各页取自己的横竖屏状态（isLandscape / isLandscape() 同源现状）
-}
+  return isLandscape ? 3 : 1;   // 2026-09-17 用户改定：竖屏回落手机单列档（初版竖 2 作废）
+}                               // 各页取自己的横竖屏状态（isLandscape / isLandscape() 同源现状）
 ```
 
 要点：
 - **插入位置红线**：必须在 `pageWidth < 600` 之前（§2.3-1）；
-- 进吧页竖屏：`forumColumns()` 手机档本来就返 2，竖屏天然满足，只需横 3 分支（文档留痕：竖屏不改是有意行为）；
-- 首页：`homeColumns()` 返回 `this.columns`（由 display.on('change') 维护的 2/3），闸门放行后天然正确——**确认 `this.columns` 更新链路不依赖 `isWideFormDevice` 即可，若依赖则随收口自动生效**；
-- 阔直屏竖屏卡宽推算 ~230~250vp，与平板 3 列卡宽（~250vp）相当，`ThreadCard` 几何已按多列档验证（图片 maxHeight 封顶等），无需新增卡片内改动；
+- 进吧页竖屏：`forumColumns()` 手机档为 2，阔直屏竖屏**有意改 1**（2026-09-17 用户指定全部页面竖屏单列）；
+- 首页：`homeColumns()` 返回 `this.columns`（`updateColumns()` 按形态写 1/3），闸门放行后天然正确；
+- 阔直屏竖屏单列后卡宽与手机一致，`ThreadCard` 几何 / 操作栏收紧（`actionCompact()`）在竖屏不再触发（保留作为横屏 3 列窄卡护栏）；
 - 骨架屏：`ThreadListSkeleton({ columns })` 等 `columns` 入参消费同一列数函数，自动跟随；UserProfile 两处骨架屏按平板文档 D3 红线**保持默认单列、不加 columns**（阔直屏同样遵守）。
 
 **风险自检（§6.2）**：
@@ -247,4 +247,6 @@ if (isWideBarDevice()) {
 | 2026-09-15 | **Pura X 展开态接入阔直屏档（用户指定）**：设备 VDE-AL00 / VDE-AL10，展开 6.3" 16:10（2120×1320）。Theme.ets 判定重排：`isFoldable()` 分支**前置**——折叠屏中仅 `WIDE_BAR_FOLD_MODELS(['VDE-AL00','VDE-AL10']) && getFoldStatus()===FOLD_STATUS_EXPANDED` 按阔直屏档，其余折叠设备维持平板档不变；折叠态返回 false 回落手机档（`isWideFormDevice` 对折叠屏恒 true → 各页宽度闸门把折叠态拦回 1 列，与既有路径一致；HALF_FOLDED 不算，仅展开态）。展开态列数口径与阔直屏完全一致（竖 2 / 横 3；详情页竖屏回复 1 列、横屏分栏右栏 2 列），无任何页面级新改动。运行时翻档：折叠↔展开由 display 变化触发各页 onAreaChange / display.on('change') 重渲染，`isWideBarDevice()` 实时求值自动切档。附带核实：HomeTab `syncCardColumns()` 写 `homeColumns()`（折叠态落 1），无多列标记泄漏。`tools/build.ps1` → **BUILD SUCCESSFUL**（49s） | A 错位：**无**（纯判定函数分支重排，零几何改动；展开态列数 2/3 均落在既有容器能力内）。B 出屏：**无**。C 重叠：**无**。D 手机回归：**无**（非折叠设备走原路径逐字节等价——isFoldable 分支对它们原本就 false；其它折叠设备（非 VDE 型号）行为与改动前完全一致；必测路径 = Pura X 展开↔折叠翻档（展开竖 2 / 横 3，折叠单列）/ 普通手机与平板回归） |
 | 2026-09-15 | **首页卡片操作栏三胶囊溢出修复（用户云调试阔直屏反馈：分享/评论/点赞「文字图标比按钮大」画出胶囊外）**：根因 = 胶囊 `layoutWeight(1)` 均分、内容（图标 18 + 内距 6 + 文字 13 号 ≈50vp）恒定，阔直屏竖 2 列卡宽 ~210vp 时胶囊被压到 ~50vp 内容必溢出（Row 不裁剪直接画出界）；平板竖 2 列卡 ~370 / 横 3 列 ~408、阔直屏横 3 列 ~258 均无此问题（平板文档「操作栏尺寸一律不动」红线不受影响）。修复 = ThreadCard 新增 `actionCompact()` 收紧判定：多列且估算卡宽（屏宽 − 页边距 lg×2 − 列间距 (列数−1)×md，÷列数，同分桶估算口径）< 240 时进入收紧模式——图标 15（心形 16）/ 文字 11 / 内距 4 / 外距 8 / 高 30 / 圆角 15；单列手机与所有宽卡走原尺寸逐像素不变。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m09s） | A 错位：**无**（收紧只缩胶囊自身尺寸，容器结构 / layoutWeight 均分不变）。B 出屏：**无**（收紧后内容 ~42vp < 胶囊 ~50vp，溢出消除即销本项）。C 重叠：**无**。D 手机回归：**无**（手机单列 `cardColumns<=1` 直接 return false、三胶囊原尺寸逐像素不变；平板 / 阔直屏横屏卡宽 > 240 不触发收紧；必测 = 手机首页卡片操作栏逐像素 / 阔直屏竖 2 列胶囊内容不再溢出 / 平板竖 2 列观感不变） |
 | 2026-09-15 | **移除「强制阔直屏形态（调试）」开关（用户确认可去）**：无真机期验证设施完成使命，云调试真机（VOL-AL00）自然判定已验证可用。拆除五处：① Settings「强制阔直屏形态」行 + Builder + @State + aboutToAppear 初始化 + 四项导入；② EntryAbility onCreate `getPreferencesSync/getSync` 冷启动恢复块 + preferences/STORE_NAME/FORCE_WIDE_BAR_KEY 导入；③ Constants `CACHE_KEY.FORCE_WIDE_BAR`；④ CacheManager `STORE_NAME` 恢复私有；⑤ Theme `FORCE_WIDE_BAR_KEY` 常量 + `isWideBarDevice()` 开关段（判定序列回归四段式）。**旋转解锁改挂 `isWideBarDevice()` 自然判定**（原挂 forceWideBar 标志，不改动则真机会失去自动旋转）。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m09s） | A 错位：**无**（纯设施拆除，零几何改动；判定结果对目标设备与开关时代完全一致——VOL-AL00 由型号兜底命中）。B 出屏：**无**。C 重叠：**无**。D 手机回归：**无**（普通手机 / 平板 / 折叠（非 VDE）判定路径与开关时代逐字节等价；必测 = 阔直屏云调试/实机竖 2 横 3 与旋转 / 普通手机回归） |
+| 2026-09-17 | **阔直屏竖屏列数 2 → 1（用户改定，横屏 3 列不动）**：8 个列数页（HomeTab / ForumsTab / Favorite / MessagesTab / PersonalContent / UserProfile / ThreadList / Search）阔直屏分支由 `isLandscape ? 3 : 2` 改为 `isLandscape ? 3 : 1`——竖屏全部回落手机单列结构逐像素（含进吧页，不再沿用手机档 2 列）；横屏维持 3 列；详情页回复区已恒单列无需改。附带发现：工作区已并入「大折叠」适配会话（HomeTab `isLargeFoldDevice()` 分支等），本次只动阔直屏分支、未触碰大折叠路径。竖屏单列后 `cardColumns=1` → `ThreadCard.actionCompact()` 竖屏不再触发（保留作为横屏 3 列护栏）；骨架屏 / 分桶 / lanes 全部经列数函数自动跟随。§三 清单 / §4.2 模板与要点同步（初版竖 2 作废留档）。`tools/build.ps1` → **BUILD SUCCESSFUL** | A 错位：**无**（竖屏回归原手机单列结构，无新增几何）。B 出屏：**无**。C 重叠：**无**。D 手机回归：**无**（改动全在 `isWideBarDevice()` 分支内，手机 / 平板 / 大折叠 / Pura X 折叠态路径零变化；必测 = 阔直屏竖屏各页单列 / 旋转横屏 3 列 / 手机平板回归） |
+| 2026-09-17 | **帖子详情页横屏排序壳定位修正（用户云调试反馈：只看全部 / 正序钮偏左、离底栏远；竖屏正常不动）**：根因 = `SortPillShell` 定位公式中的平板横屏专属微调（左移 40 + 底距 +14，2026-09-14 按平板 592 底栏系统偏差两轮校准）被阔直屏横屏误命中（`splitMode()` 为 true）。修法与 2026-09-15 大折叠、Pura X Max 同款：两处条件补 `&& !isWideBarDevice()` 排除——阔直屏横屏回落**纯公式定位**（左缘 = `(currentWidth − dockPillWidth())/2` = 底栏左缘天然对齐；底距 = 30 + 岛高 66 与竖屏同距）。竖屏 `splitMode()=false` 本就不吃微调，零变化；平板 / 大折叠 / Pura X Max 路径不变。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m42s） | A 错位：**无**（纯定位微调排除，无新增几何；若真机仍有系统级横向偏差，仿平板做法加阔直屏专属微调值即可，微调点唯一）。B 出屏：**无**。C 重叠：**无**。D 手机回归：**无**（竖屏与手机档条件不含本次改动；平板 / 大折叠 / Pura X Max 分支逐字节不变；必测 = 阔直屏横屏排序钮与底栏左对齐 / 底距贴近 / 竖屏逐像素不变） |
 | 2026-09-15 | **帖子详情页 / 楼中楼详情页阔直屏回复区横屏 2 列 → 1 列（用户二次改定）**：ThreadDetail / SubPostDetail 两处 `replyColumns()` 阔直屏分支由 `isLandscape() ? 2 : 1` 改为恒 `return 1`——竖横屏回复区均单列（原手机结构逐像素）；**横屏分栏（splitMode）保留**、右栏回复单列（右栏宽 ~500vp，单列卡更宽舒展）；平板 3 列不动；§4.4 目标形态表 / 改法 2、§4.5 同步（初版恒 2 / 二版竖 1 横 2 均作废留档）。`tools/build.ps1` → **BUILD SUCCESSFUL** | A 错位：**无**（单列回归原 ForEach 结构，分桶不入列）。B 出屏：**无**。C 重叠：**无**（W-C1/W-C2 挂门项随单列全面消解——竖横屏均为已验证的单列跳楼/定位路径，仅横屏分栏左右滚动的形态组合需真机核一次）。D 手机回归：**无**（改动全在 `isWideBarDevice()` 分支内，手机 / 平板 / 折叠路径零变化；必测 = 开关态下帖子页竖屏 / 横屏旋转） |

@@ -140,6 +140,10 @@ struct SubPostDetail {
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列。
    */
   private replyColumns(): number {
+    // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律单列
+    if (this.currentWidth > 0 && this.currentWidth < Breakpoint.sm) {
+      return 1;
+    }
     // 阔直屏（docs/TiebaPura阔直屏适配.md §4.5，2026-09-15 用户二次改定）：回复区恒 1 列
     // （竖屏单列；横屏分栏保留、右栏回复单列），平板维持 3 列不动
     if (isWideBarDevice()) {
@@ -156,7 +160,9 @@ struct SubPostDetail {
     if (this.currentWidth < Breakpoint.sm) {
       return 1;
     }
-    return 3;
+    // 2026-09-17 二次拍板：窗口 ≥840 维持平板 3 列 / 600~840 中间档小窗两列（原平板恒 3 作废；
+    // ThreadDetail 回复区因 09-16「平板横竖屏均 2 列」拍板本就恒 2，不受本档影响）
+    return this.currentWidth >= Breakpoint.md ? 3 : 2;
   }
 
   /** 是否左右分栏（§4.10 SP-I，仅大屏横屏）：父楼层卡独占左栏、回复独占右栏 */
