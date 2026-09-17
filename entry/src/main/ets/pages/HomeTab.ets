@@ -25,6 +25,7 @@ import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
+import { FollowFeedStore, POOL_HIGH, sortThreadsByTimeDesc } from '../service/FollowFeedStore';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
 import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
@@ -33,37 +34,6 @@ import { ThreadListSkeleton } from '../components/Skeleton';
 interface FollowSets {
   ids: Set<string>;
   names: Set<string>;
-}
-
-/** 半随机排序辅助条目：帖子 + 解析后时间戳 + 原顺序号（保证稳定排序） */
-interface TsItem {
-  ts: number;
-  seq: number;
-  item: ThreadItem;
-}
-
-/** 解析帖子时间字符串 → 毫秒时间戳（兼容秒级/毫秒级数字与格式化字符串） */
-function parseThreadTs(createTime: string): number {
-  if (!createTime) {
-    return 0;
-  }
-  const t: number = Number(createTime);
-  if (!isNaN(t) && t > 0) {
-    return t < 1e12 ? t * 1000 : t;
-  }
-  const d: number = new Date(createTime.replace(/-/g, '/')).getTime();
-  return isNaN(d) ? 0 : d;
-}
-
-/** Fisher-Yates 洗牌（就地打乱后返回原数组） */
-function shuffle<T>(arr: T[]): T[] {
-  for (let i: number = arr.length - 1; i > 0; i--) {
-    const j: number = Math.floor(Math.random() * (i + 1));
-    const tmp: T = arr[i];
-    arr[i] = arr[j];
-    arr[j] = tmp;
-  }
-  return arr;
 }
 
 /**
@@ -106,60 +76,6 @@ class ThreadDataSource implements IDataSource {
       listener.onDataAdd(start);
     });
   }
-}
-
-/**
- * 半随机时间排序：「仅推荐关注的吧」补采结果的展示顺序。
- * 先按时间分桶（24 小时内 / 7 天内 / 更早），桶间近期优先；桶内按 2 小时时间带细分并带内打乱，
- * 宏观保持“近期活跃优先”的观感，同批次顺序每次刷新又不同，产生真随机感。
- */
-function sortSemiRandomByTime(list: ThreadItem[]): ThreadItem[] {
-  const now: number = Date.now();
-  const dayMs: number = 86400000;
-  const bandMs: number = 2 * 3600000;
-  const tsList: TsItem[] = list.map((item: ThreadItem, idx: number): TsItem => {
-    const e: TsItem = { ts: parseThreadTs(item.createTime), seq: idx, item };
-    return e;
-  });
-  tsList.sort((a: TsItem, b: TsItem): number => (b.ts - a.ts) || (a.seq - b.seq));
-  const b24: ThreadItem[] = [];
-  const b7: ThreadItem[] = [];
-  const bOld: ThreadItem[] = [];
-  for (const e of tsList) {
-    if (e.ts >= now - dayMs) {
-      b24.push(e.item);
-    } else if (e.ts >= now - 7 * dayMs) {
-      b7.push(e.item);
-    } else {
-      bOld.push(e.item);
-    }
-  }
-  const jitter = (arr: ThreadItem[]): ThreadItem[] => {
-    const result: ThreadItem[] = [];
-    let band: ThreadItem[] = [];
-    let bandKey: number = -1;
-    for (const item of arr) {
-      const ts: number = parseThreadTs(item.createTime);
-      const key: number = ts === 0 ? -1 : Math.floor(ts / bandMs);
-      if (band.length > 0 && key !== bandKey) {
-        shuffle(band);
-        for (const b of band) {
-          result.push(b);
-        }
-        band = [];
-      }
-      band.push(item);
-      bandKey = key;
-    }
-    if (band.length > 0) {
-      shuffle(band);
-      for (const b of band) {
-        result.push(b);
-      }
-    }
-    return result;
-  };
-  return jitter(b24).concat(jitter(b7), bOld);
 }
 
 enum LoadState {
@@ -299,15 +215,12 @@ export struct HomeTab {
   private followForumIds: Set<string> = new Set<string>();
   private followForumNames: Set<string> = new Set<string>();
   private followForumNamesLoaded: boolean = false;
-  // 「仅推荐关注的吧」补采游标：已随机采样的吧名，避免连续多轮重复采样同一批吧
-  private backfillSampledForums: Set<string> = new Set<string>();
-  // ① 会话级全局去重：本会话已展示过的 tid（仅关注吧模式主用，正常模式也记录无害）。
-  // 用户主动刷新（下拉/retap/换号/开关切换）时清空——刷新后旧帖允许按时间自然回归。
+  // 「仅关注吧」聚合时间线引擎（游标式供给 + 本地待展示池 + 已消费记录，三件套持久化）
+  private followFeed: FollowFeedStore = new FollowFeedStore();
+  // ① 会话级去重：本会话已展示过的 tid（正常模式主用；仅关注模式的跨会话去重由引擎持久化接管）。
+  // 换号时清空；刷新/开关切换不再清空（看过的就是看过的，切口径不重置去重）。
   private shownTids: Set<string> = new Set<string>();
   private shownTidsQueue: string[] = [];   // FIFO 淘汰队列，封顶防内存膨胀
-  // ② 补采双槽状态：每吧递进页码游标（深挖槽用，封顶回卷）+ 每吧上次 sort_type（交替轮换）
-  private backfillNextPage: Map<string, number> = new Map<string, number>();
-  private backfillLastSort: Map<string, number> = new Map<string, number>();
   // 首页昵称补校准轮数（仅当仍有占位名作者时最多补 3 轮）
   private homeReEnrichAttempts: number = 0;
   // 首页初始化完成标志：冷启动恢复开关触发的首次 Watch 不强制刷新（由冷启动缓存直出接管）
@@ -515,6 +428,12 @@ export struct HomeTab {
     this.bootStarted = true;
     this.loggedIn = AuthManager.getInstance().isLogin();
     this.isDark = isDarkMode();
+    // 「仅关注吧」聚合时间线引擎：注入单吧拉取器（8 条/页 + 4s 超时）并恢复持久化三件套
+    // （游标/池/已消费，跨重启接着上次的供给位置；CacheManager 已在宿主 initApp 初始化）
+    this.followFeed.setFetcher((name: string, sortType: number, page: number): Promise<ThreadItem[]> => {
+      return this.withFeedTimeout(this.fetchForumFeedOnce(name, 8, sortType, page), 4000);
+    });
+    this.followFeed.load().catch((_e: Error): void => {});
     // 冷启动不自动刷新：有缓存直接展示（silentOnCache=false），无缓存时兜底走一次网络
     const homeLoad = this.loadHomeThreads(false, false);
     homeLoad.then(() => {
@@ -530,7 +449,9 @@ export struct HomeTab {
     this.loggedIn = AuthManager.getInstance().isLogin();
     // 登录账号变化：关注吧集合失效（仅推荐关注的吧 需按新账号重新拉取）
     this.followForumNamesLoaded = false;
-    // 换号即一次刷新语义：①会话级去重与补采游标一并清空
+    // 换号：引擎三件套（游标/池/已消费）全清落盘，下个账号从零供给
+    this.followFeed.resetAll().catch((_e: Error): void => {});
+    // 会话级去重（正常模式）一并清空
     this.clearSessionDedup();
     // 关注动态按账号隔离：换号/登出后失效，下次进入重新拉取，避免展示上一账号的关注帖
     this.folFeedLoaded = false;
@@ -721,13 +642,10 @@ export struct HomeTab {
     }
   }
 
-  /** ① 会话级去重清空：用户主动刷新/换号/开关切换时调用（shownTids + 补采游标一并重置） */
+  /** ① 会话级去重清空：仅换号时调用（正常模式 shownTids；仅关注模式的引擎三件套走 resetAll） */
   private clearSessionDedup(): void {
     this.shownTids.clear();
     this.shownTidsQueue = [];
-    this.backfillSampledForums.clear();
-    this.backfillNextPage.clear();
-    this.backfillLastSort.clear();
   }
 
   /** ⑤ 渲染前兜底去重：同 tid 只保留首个出现（防任何上游路径漏去重，成本 O(n)） */
@@ -747,78 +665,35 @@ export struct HomeTab {
   }
 
   /**
-   * 「仅推荐关注的吧」关注吧补采（方案A双槽采样）：
-   * 从未采样过的关注吧中随机取 N=8 个，拆成两类槽——
-   * - 新鲜槽×4：固定打第 1 页（sort_type 与该吧上次交替），保证新帖最迟下一轮补采即进入信息流；
-   * - 深挖槽×4：走每吧递进页码游标（1→2→…→5 回卷），翻出老库存提高产量、治重复。
-   * 合并去重（排除调用方集合 + 会话级 shownTids）后半随机时间排序，返回最多 targetCount 条。
-   * 采样游标本轮用尽后自动重置；下拉刷新/换号时 shownTids 与游标一并清空。
+   * 「仅关注吧」聚合时间线引擎就绪：持久化恢复（幂等）+ 关注吧集合注入。
+   * 未登录/无关注吧返回 false（调用方退化为推荐流过滤路径）。
    */
-  private async fetchFollowForumFeed(targetCount: number, excludeTids?: Set<string>): Promise<ThreadItem[]> {
+  private async ensureFollowEngine(): Promise<boolean> {
+    await this.followFeed.load();
     const sets: FollowSets | null = await this.getFollowSets();
     if (sets === null || sets.names.size === 0) {
-      return [];
+      return false;
     }
-    const allNames: string[] = [];
-    for (const n of sets.names) {
-      allNames.push(n);
+    this.followFeed.setBars(sets.names);
+    return true;
+  }
+
+  /**
+   * 水位线补货：池低于低位线时后台拉到高位线（不阻塞调用方，结果由下次出池消费）。
+   * 引擎内部有零进度熔断与并发锁，重复触发安全。
+   */
+  private kickPoolRefill(): void {
+    if (!this.shouldOnlyFollow() || !this.followFeed.poolLow()) {
+      return;
     }
-    let candidates: string[] = [];
-    for (const n of allNames) {
-      if (!this.backfillSampledForums.has(n)) {
-        candidates.push(n);
+    this.ensureFollowEngine().then((ok: boolean): Promise<void> => {
+      if (!ok) {
+        return Promise.resolve();
       }
-    }
-    if (candidates.length === 0) {
-      this.backfillSampledForums.clear();
-      candidates = allNames.slice();
-    }
-    shuffle(candidates);
-    const sampled: string[] = candidates.slice(0, 8);
-    for (const n of sampled) {
-      this.backfillSampledForums.add(n);
-    }
-    const tasks: Promise<ThreadItem[]>[] = [];
-    for (let i: number = 0; i < sampled.length; i++) {
-      const name: string = sampled[i];
-      // sort_type 与该吧上次交替，避免同一排序反复消费同一段内容池
-      const lastSort: number | undefined = this.backfillLastSort.get(name);
-      const sortType: number = lastSort === undefined ? (Math.random() < 0.5 ? 0 : 1) : (lastSort === 0 ? 1 : 0);
-      this.backfillLastSort.set(name, sortType);
-      let page: number = 1;
-      if (i >= 4) {
-        // 深挖槽：递进游标，封顶 5 页回卷（过深的老页大多为空/极旧，回卷后自然恢复新鲜度）
-        const cursor: number | undefined = this.backfillNextPage.get(name);
-        page = cursor === undefined ? 1 : cursor;
-        this.backfillNextPage.set(name, page >= 5 ? 1 : page + 1);
-      }
-      // 单吧请求 4s 超时包装：个别吧接口挂起不拖累整批补采（8 个吧仍并发）
-      tasks.push(this.withFeedTimeout(this.fetchForumFeedOnce(name, 6, sortType, page), 4000));
-    }
-    const chunks: ThreadItem[][] = await Promise.all(tasks);
-    // 去重池 = 调用方排除集 + 会话级已展示 tid（③：从"当前屏"扩到"本会话"）
-    const seen: Set<string> = new Set<string>();
-    for (const t of this.shownTids) {
-      seen.add(t);
-    }
-    if (excludeTids !== undefined) {
-      for (const t of excludeTids) {
-        seen.add(t);
-      }
-    }
-    const merged: ThreadItem[] = [];
-    for (const chunk of chunks) {
-      for (const item of chunk) {
-        if (item.tid.length > 0 && !seen.has(item.tid)) {
-          seen.add(item.tid);
-          merged.push(item);
-        }
-      }
-    }
-    if (merged.length === 0) {
-      return [];
-    }
-    return sortSemiRandomByTime(merged).slice(0, targetCount);
+      return this.followFeed.refill(POOL_HIGH);
+    }).catch((_e: Error): void => {
+      // 补货失败静默：下次出池/触底会再触发
+    });
   }
 
   /** 补采限时包装：最坏 ms 毫秒内返回（超时按空处理，避免个别吧挂起拖慢首屏/翻页） */
@@ -968,7 +843,8 @@ export struct HomeTab {
           return { list: collected, hasMore, page: lastReqPage };
         }
         for (const item of result.list) {
-          if (!seen.has(item.tid) && !this.shownTids.has(item.tid)) {
+          if (!seen.has(item.tid) && !this.shownTids.has(item.tid)
+            && !(this.shouldOnlyFollow() && this.followFeed.hasConsumed(item.tid))) {
             seen.add(item.tid);
             // 优先按 forumId 匹配（跨接口稳定）；仅在 forumId 缺失时回退到吧名匹配
             const hit: boolean = (item.forumId !== undefined && item.forumId.length > 0 && sets.ids.has(item.forumId))
@@ -997,8 +873,8 @@ export struct HomeTab {
     // 推荐流数据源已变化：切回推荐页时需重新加载（正停留在推荐页时下面立即重载）
     this.recommendLoaded = false;
     this.followForumNamesLoaded = false;
-    // 开关切换即一次刷新语义：①会话级去重与补采游标一并清空
-    this.clearSessionDedup();
+    // 切开关只换过滤口径，不清任何去重状态（shownTids/引擎池与已消费均保留）——
+    // 看过的就是看过的，切换后不应把刚刷过的帖当"新内容"再推一遍
     if (this.homeFeed === HomeFeed.Recommended) {
       this.homePage = 1;
       this.homeHasMore = true;
@@ -1028,10 +904,8 @@ export struct HomeTab {
     this.homePage = 1;
     this.homeHasMore = true;
     this.homeStalledPages = 0;
-    // 「仅推荐关注的吧」补采：刷新只清"本轮采样过哪些吧"的池子；
-    // shownTids/补采游标跨刷新保留（配合 fetchHomePage 收集排除），刷新出来的全是真新内容。
-    // 全清（shownTids+游标）仅发生在换号/切开关（clearSessionDedup）。
-    this.backfillSampledForums.clear();
+    // 「仅关注吧」刷新语义：不清任何去重状态（引擎游标/池/已消费跨刷新保留），
+    // 刷新只是重新取一批"已消费之外"的内容；全清仅发生在换号（onLoginTick）。
     // 仅在当前列表为空时切骨架屏（首次加载/切换 feed）；已有内容刷新时保留列表原地更新，避免闪屏
     if (this.threads.length === 0) {
       this.loadState = LoadState.Loading;
@@ -1042,12 +916,16 @@ export struct HomeTab {
         // 仅关注模式同样缓存直出（缓存内容即上次过滤加载的结果），避免冷启动重复网络加载
         const cached = await CacheManager.getInstance().getWithTtlAllowStale<ThreadItem[]>(CACHE_KEY.THREAD_LIST);
         if (cached && cached.data.length > 0) {
-          // 缓存直出的内容同样登记进会话级去重（后续补采/翻页不再重复这些 tid）
+          // 缓存直出的内容同样登记进会话级去重（后续翻页不再重复这些 tid）
           this.rememberShown(cached.data);
           this.threads = cached.data;
           this.loadState = LoadState.Success;
           this.recommendLoaded = true;
           this.homeRefreshing = false;
+          if (this.shouldOnlyFollow()) {
+            this.followFeed.markConsumed(cached.data);
+            this.kickPoolRefill();
+          }
           if (silentOnCache) {
             this.refreshHomeSilently();
           }
@@ -1057,33 +935,41 @@ export struct HomeTab {
       // 方案A：请求 + 立即渲染，昵称校准后台执行不阻塞首屏；8s 刷新超时兜底，弱网/接口挂起不无限转圈
       const result = await this.withFeedRefreshTimeout(this.fetchHomePage(1));
       let list: ThreadItem[] = result.list;
-      if (this.shouldOnlyFollow() && list.length < 20) {
-        // 推荐流过滤不足目标数量：触发关注吧补采，补齐到一屏再渲染
-        const exclude: Set<string> = new Set<string>();
-        for (const item of list) {
-          exclude.add(item.tid);
-        }
-        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(20 - list.length, exclude), 8000);
-        if (backfill.length > 0) {
-          list = list.concat(backfill);
-          // 合并后统一半随机时间排序（仅关注吧模式）
-          list = sortSemiRandomByTime(list);
+      if (this.shouldOnlyFollow()) {
+        // 聚合时间线：推荐流过滤做首屏加速，不足一屏从待展示池出补齐（确定性时间降序）；
+        // 首屏与池全空时同步等一轮补货（引擎内部零进度熔断，不会长时间挂起）
+        const engineReady: boolean = await this.ensureFollowEngine();
+        if (engineReady && list.length < 20) {
+          if (list.length === 0 && this.followFeed.poolSize() === 0) {
+            await this.followFeed.refill(POOL_HIGH);
+          }
+          const fromPool: ThreadItem[] = this.followFeed.take(20 - list.length);
+          if (fromPool.length > 0) {
+            for (const it of fromPool) {
+              list.push(it);
+            }
+            list = sortThreadsByTimeDesc(list);
+          }
         }
       }
-      // ⑤ 渲染前兜底去重 + ①会话级登记（backfill 已合并进 list，统一在此收口）
+      // ⑤ 渲染前兜底去重 + 去重登记（池补齐已合并进 list，统一在此收口）
       this.threads = this.dedupeByTid(list);
       this.rememberShown(this.threads);
+      if (this.shouldOnlyFollow()) {
+        this.followFeed.markConsumed(this.threads);
+      }
       this.recommendLoaded = true;
       this.homePage = result.page;
       this.homeHasMore = list.length > 0;
       // 不再因"不足一屏"硬性禁止加载更多：交给 homeStalledPages 连续空轮保护，
-      // 补采深挖游标可在加载更多时继续翻出库存
+      // 引擎游标可在补货时继续翻出库存
       this.homeStalledPages = 0;
       this.loadState = list.length > 0 ? LoadState.Success : LoadState.Empty;
       if (list.length > 0) {
         this.enrichHomeInBackground(list);
         await CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, list, CACHE_TTL.THREAD_LIST);
       }
+      this.kickPoolRefill();
     } catch (e) {
       if (this.threads.length === 0) {
         this.loadState = LoadState.Error;
@@ -1098,21 +984,24 @@ export struct HomeTab {
   }
 
   /** 缓存命中后的后台静默刷新：更新列表并回写缓存，失败保留缓存内容。
-   *  仅关注吧模式下收集阶段已排除 shownTids（缓存内容在列），故与主动刷新同样走补采补齐。 */
+   *  仅关注吧模式下收集阶段已排除 shownTids/引擎已消费（缓存内容在列），
+   *  不足一屏从待展示池出补齐，池低水位触发后台补货。 */
   private async refreshHomeSilently(): Promise<void> {
     try {
       const result = await this.fetchHomePage(1);
       let list: ThreadItem[] = result.list;
-      if (this.shouldOnlyFollow() && list.length > 0 && list.length < 20) {
-        const exclude: Set<string> = new Set<string>();
-        for (const item of list) {
-          exclude.add(item.tid);
+      if (this.shouldOnlyFollow()) {
+        const engineReady: boolean = await this.ensureFollowEngine();
+        if (engineReady && list.length < 20) {
+          const fromPool: ThreadItem[] = this.followFeed.take(20 - list.length);
+          if (fromPool.length > 0) {
+            for (const it of fromPool) {
+              list.push(it);
+            }
+            list = sortThreadsByTimeDesc(list);
+          }
         }
-        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(20 - list.length, exclude), 8000);
-        if (backfill.length > 0) {
-          list = list.concat(backfill);
-          list = sortSemiRandomByTime(list);
-        }
+        this.kickPoolRefill();
       }
       if (list.length === 0) {
         return;
@@ -1120,6 +1009,9 @@ export struct HomeTab {
       this.homePage = result.page;
       this.threads = this.dedupeByTid(list);
       this.rememberShown(this.threads);
+      if (this.shouldOnlyFollow()) {
+        this.followFeed.markConsumed(this.threads);
+      }
       this.homeHasMore = this.threads.length > 0;
       this.homeStalledPages = 0;
       this.enrichHomeInBackground(this.threads);
@@ -1226,12 +1118,18 @@ export struct HomeTab {
       }
       let appended: ThreadItem[] = [];
       if (this.shouldOnlyFollow()) {
-        // 仅关注吧模式：推荐流已翻尽，直接补采一轮（双槽采样、会话级跳过已展示）
-        const backfill: ThreadItem[] = await this.withFeedTimeout(this.fetchFollowForumFeed(20, exclude), 8000);
+        // 仅关注吧模式：加载更多 = 从待展示池纯出（池进池出已单点去重）；
+        // 池空时同步等一轮补货，仍空则交给空轮保护（stalledPages）停住
+        const engineReady: boolean = await this.ensureFollowEngine();
+        if (engineReady && this.followFeed.poolSize() === 0) {
+          await this.followFeed.refill(POOL_HIGH);
+        }
         if (myToken !== this.homeLoadToken) {
           return;
         }
-        appended = backfill;
+        if (engineReady) {
+          appended = this.followFeed.take(20);
+        }
       } else {
         const nextPage = this.homePage + 1;
         const result = await this.fetchHomePage(nextPage);
@@ -1249,15 +1147,22 @@ export struct HomeTab {
       }
       if (appended.length > 0) {
         this.rememberShown(appended);
+        if (this.shouldOnlyFollow()) {
+          // 出池即消费（take 内已登记，此处兜底补登记当前屏可见项）
+          this.followFeed.markConsumed(appended);
+        }
         this.threads = this.threads.concat(appended);
         this.homeStalledPages = 0;
         // 新增项的昵称后台校准，不阻塞翻页
         this.enrichHomeInBackground(appended);
         await CacheManager.getInstance().putWithTtl(CACHE_KEY.THREAD_LIST, this.threads, CACHE_TTL.THREAD_LIST);
       } else {
-        // 补采/翻页均无新内容：只允许少量连续空轮，随后保护性停止，
+        // 补货/翻页均无新内容：只允许少量连续空轮，随后保护性停止，
         // 避免无限请求（正常模式可能返回重复页；仅关注吧模式可能关注吧帖子已枯竭）。
         this.homeStalledPages += 1;
+      }
+      if (this.shouldOnlyFollow()) {
+        this.kickPoolRefill();
       }
       this.homeHasMore = this.homeStalledPages < 3;
     } catch (e) {
