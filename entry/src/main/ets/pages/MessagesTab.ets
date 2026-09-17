@@ -118,8 +118,8 @@ export struct MessagesTab {
     if (this.pageWidth < 600) {
       return 1;
     }
-    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
-    return this.pageWidth >= 840 ? 3 : 2;
+    // 2026-09-17 三次拍板：平板**竖屏 2 列**（≥840 竖屏 3 列作废）/ 横屏 3 列
+    return this.isLandscape() ? 3 : 2;
   }
   /** 屏幕长边（vp）：竖屏视口高的稳定来源（旋转取长边，渐显比例不漂移） */
   @State fadeCoverVp: number = 0;

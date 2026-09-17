@@ -160,9 +160,9 @@ struct SubPostDetail {
     if (this.currentWidth < Breakpoint.sm) {
       return 1;
     }
-    // 2026-09-17 二次拍板：窗口 ≥840 维持平板 3 列 / 600~840 中间档小窗两列（原平板恒 3 作废；
-    // ThreadDetail 回复区因 09-16「平板横竖屏均 2 列」拍板本就恒 2，不受本档影响）
-    return this.currentWidth >= Breakpoint.md ? 3 : 2;
+    // 2026-09-17 三次拍板：平板**竖屏 2 列**（≥840 竖屏 3 列作废）/ 横屏 3 列——与其余 8 个列数页
+    // 同口径；ThreadDetail 回复区因 09-16「平板横竖屏均 2 列」拍板本就恒 2，不受本档影响
+    return this.isLandscape() ? 3 : 2;
   }
 
   /** 是否左右分栏（§4.10 SP-I，仅大屏横屏）：父楼层卡独占左栏、回复独占右栏 */

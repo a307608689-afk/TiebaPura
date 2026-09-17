@@ -21,7 +21,20 @@ import { window } from '@kit.ArkUI';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { HttpClient } from '../network/HttpClient';
+import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
+import { FloorItem } from '../model/DataModel';
 import { Theme, Spacing, Radius, isDarkMode, MaterialManager, fs } from '../common/Theme';
+
+/**
+ * 图片流式补页一次触发的最大请求页数：楼层页里可能有整页无图（纯文字楼层），
+ * 需要连续翻页才能凑到新图；限 2 页既避免"滑一下拉十页"，也保证多数情况一次触发即出图。
+ */
+const MAX_STREAM_FETCH_PER_TRIGGER: number = 2;
+/**
+ * 流式补页的会话上限（相对打开浏览时的已加载页码）：防极端长帖（数百页）在浏览页
+ * 无限翻页拖垮流量；到达上限即视作"到底"，行为与改造前一致（停在已补齐的图片上）。
+ */
+const MAX_STREAM_PAGES: number = 20;
 
 @Entry
 @Component
@@ -32,6 +45,23 @@ struct ImagePreview {
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
+  // ===== 图片流式补页（2026-09-17）=====
+  // 由 ThreadDetail 打开浏览时随路由参数带入分页上下文，滑到已加载图片末尾就继续拉后续楼层页，
+  // 追加这些楼层（含其楼中楼）的图片，使用户不需先滚回列表加载楼层才能滑到那张图。
+  /** 正在补页（顶栏计数胶囊显示"加载中"，并作为并发防重） */
+  @State streamingMore: boolean = false;
+  /** 是否已无更多可补页（无上下文参数 / 已到总页 / 已到会话上限） */
+  @State streamEnded: boolean = true;
+  /** 帖子 id（空串=不带补页能力，例如非帖子详情页调用本页） */
+  private streamTid: string = '';
+  private streamSortType: number = 0;
+  private streamSeeLz: boolean = false;
+  private streamForumId: string = '';
+  private streamCommentRn: number = 3;
+  /** 下一个待补的楼层页码；streamEnded 为 true 时无意义 */
+  private nextStreamPage: number = 0;
+  /** 本次浏览允许补到的最大页码（totalPage 与会话上限取小） */
+  private maxStreamPage: number = 0;
 
   onPageShow(): void {
     this.fontSizeTick++;
@@ -76,6 +106,43 @@ struct ImagePreview {
       this.currentIndex = Number(params.index) || 0;
     }
     this.isDark = isDarkMode();
+    // 流式补页上下文：只有从帖子详情页带上下文进来才有补页能力，其它调用点（单图预览等）保持原行为
+    this.initImageStream(params);
+    // 缓冲①：打开即预取下一页，滑到最后一张时数据大概率已在路上
+    if (!this.streamEnded) {
+      TiebaService.getInstance().prefetchThreadNextPage(
+        this.streamTid, this.nextStreamPage - 1, this.streamSortType, this.streamSeeLz,
+        this.streamForumId, this.streamCommentRn);
+    }
+    // 缓冲②：初始位置已贴近已加载图片末尾（例如从中部楼层点开靠后的一张图）时立即补一页，
+    // 否则首屏就是"最后一张"、要等用户先滑动一次才触发
+    if (this.currentIndex >= this.urls.length - 3) {
+      this.appendStreamPage();
+    }
+  }
+
+  /**
+   * 解析路由带入的补页上下文（ThreadDetail.ImageGrid 跳转时携带）。
+   * 缺任一关键参数即判定"无补页能力"，streamEnded 保持 true，浏览行为与改造前完全一致。
+   */
+  private initImageStream(params: Record<string, Object> | undefined): void {
+    if (!params) {
+      return;
+    }
+    const tid: string = params.tid !== undefined ? `${params.tid}`.trim() : '';
+    const loadedPage: number = params.loadedPage !== undefined ? Number(params.loadedPage) || 0 : 0;
+    const totalPage: number = params.totalPage !== undefined ? Number(params.totalPage) || 0 : 0;
+    if (tid.length === 0 || loadedPage <= 0 || totalPage <= loadedPage) {
+      return;
+    }
+    this.streamTid = tid;
+    this.streamSortType = params.sortType !== undefined ? Number(params.sortType) || 0 : 0;
+    this.streamSeeLz = `${params.seeLz}` === 'true';
+    this.streamForumId = params.forumId !== undefined ? `${params.forumId}` : '';
+    this.streamCommentRn = params.commentRn !== undefined ? Number(params.commentRn) || 3 : 3;
+    this.nextStreamPage = loadedPage + 1;
+    this.maxStreamPage = Math.min(totalPage, loadedPage + MAX_STREAM_PAGES);
+    this.streamEnded = false;
   }
 
   aboutToDisappear(): void {
@@ -180,6 +247,10 @@ struct ImagePreview {
         .onChange((index: number) => {
           this.currentIndex = index;
           this.resetZoom();
+          // 流式补页触发：距已加载图片末尾还剩 3 张时开始拉下一页，尽量让用户滑到头时新图已就位
+          if (index >= this.urls.length - 3) {
+            this.appendStreamPage();
+          }
         })
         .width('100%')
         .height('100%')
@@ -189,7 +260,10 @@ struct ImagePreview {
         Column() {
           Row() {
             Stack() {
-              Text(`${this.currentIndex + 1} / ${this.urls.length}`)
+              // 补页中追加"加载中"后缀：长帖补页有网络耗时，需给出可见反馈（不新增胶囊、不改几何）
+              Text(this.streamingMore
+                ? `${this.currentIndex + 1} / ${this.urls.length} · 加载中`
+                : `${this.currentIndex + 1} / ${this.urls.length}`)
                 .fontSize(fs(14, this.fontScale))
                 .fontColor(Color.White)
             }
@@ -389,6 +463,78 @@ struct ImagePreview {
     this.panX = 0;
     this.panY = 0;
     this.dragReady = false;
+  }
+
+  /**
+   * 流式补页（2026-09-17）：拉取后续楼层页，把其中的图片追加到 `urls`。
+   * - 复用详情页同一套分页参数与同一份"下一页"缓存（`takeThreadNextPage`），顺序口径与
+   *   `ThreadDetail.collectAllImages()` 完全一致：逐楼层 images → 该楼 comments[].images。
+   *   刻意不含 `result.detail.images`：那是主楼（第 1 页）内容，打开浏览时已随 urls 带入，
+   *   若每页都收会造成主楼图片重复。
+   * - 单次触发最多翻 `MAX_STREAM_FETCH_PER_TRIGGER` 页：楼层页可能整页无图（纯文字楼层），
+   *   需连续翻页才能凑到新图；凑到即停，剩余交给下一次滑动触发，避免"滑一下就拉好几页"。
+   * - 失败静默：保持已加载图片可用，用户滑到末尾会再次触发（自然重试），不弹错误打断浏览。
+   */
+  private async appendStreamPage(): Promise<void> {
+    if (this.streamingMore || this.streamEnded) {
+      return;
+    }
+    this.streamingMore = true;
+    try {
+      let fetched: number = 0;
+      while (fetched < MAX_STREAM_FETCH_PER_TRIGGER && !this.streamEnded) {
+        fetched++;
+        const page: number = this.nextStreamPage;
+        const cached: ThreadDetailResult | undefined =
+          TiebaService.getInstance().takeThreadNextPage(this.streamTid, this.streamSortType, this.streamSeeLz, page);
+        const result: ThreadDetailResult = cached !== undefined
+          ? cached
+          : await TiebaService.getInstance().fetchThreadDetail(
+            this.streamTid, page, this.streamSortType, this.streamSeeLz, this.streamForumId, this.streamCommentRn, 0);
+        // 游标先行推进：本页即使无图也必须前进，否则会在纯文字页上原地打转
+        this.nextStreamPage = page + 1;
+        if (this.nextStreamPage > this.maxStreamPage) {
+          this.streamEnded = true;
+        }
+        const fresh: string[] = this.extractStreamImages(result.floors ?? []);
+        if (fresh.length > 0) {
+          this.urls = [...this.urls, ...fresh];
+          break;
+        }
+      }
+    } catch (e) {
+      console.error('[IMGSTREAM] 补页失败:', (e as Error).message);
+    } finally {
+      this.streamingMore = false;
+    }
+    // 缓冲：本次补完后立刻预取下一页，令下一次滑动直接命中内存缓存（与详情页共用同一份缓存，
+    // 返回详情页继续下滑时也能命中，等于顺带帮忙预取）
+    if (!this.streamEnded) {
+      TiebaService.getInstance().prefetchThreadNextPage(
+        this.streamTid, this.nextStreamPage - 1, this.streamSortType, this.streamSeeLz,
+        this.streamForumId, this.streamCommentRn);
+    }
+  }
+
+  /**
+   * 从楼层页结果提取图片，顺序与 `ThreadDetail.collectAllImages()` 逐项一致
+   * （楼图 → 该楼楼中楼图）。空串过滤仅为防御：空 url 不可渲染，正常解析不应产生。
+   */
+  private extractStreamImages(floors: FloorItem[]): string[] {
+    const out: string[] = [];
+    for (const floor of floors) {
+      if (floor.images && floor.images.length > 0) {
+        out.push(...floor.images);
+      }
+      if (floor.comments) {
+        for (const comment of floor.comments) {
+          if (comment.images && comment.images.length > 0) {
+            out.push(...comment.images);
+          }
+        }
+      }
+    }
+    return out.filter((url: string) => url.length > 0);
   }
 
   private async saveCurrentImage(): Promise<void> {

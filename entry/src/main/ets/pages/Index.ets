@@ -390,10 +390,15 @@ struct Index {
    * 动画期间锁定（animLock），快速连点直接忽略，避免动画错乱。
    */
   private switchTab(index: number): void {
-    // 重复点击当前已激活的 tab：首页 tab 触发整页刷新（按当前所在 feed），其余 tab 保持原行为
+    // 重复点击当前已激活的 tab：首页 tab 触发整页刷新（按当前所在 feed），收藏 tab 触发无感刷新，其余 tab 保持原行为
     if (index === this.selectedTab && !this.animLock && index === TabIndex.Home) {
       // 首页已抽为自含组件：自增 homeRetapRequest 通知 HomeTab 回顶并整页刷新（按当前 feed）
       AppStorage.setOrCreate<number>('homeRetapRequest', (AppStorage.get<number>('homeRetapRequest') ?? 0) + 1);
+      return;
+    }
+    if (index === this.selectedTab && !this.animLock && index === TabIndex.Favorite) {
+      // 收藏页常驻：重复点收藏 tab 通知其静默刷新内容（不显示加载态、不回顶）
+      this.notifyFavoriteEnter();
       return;
     }
     if (index === this.selectedTab || this.animLock) {
@@ -403,6 +408,10 @@ struct Index {
     this.animLock = true;
     this.prevTab = this.selectedTab;
     this.selectedTab = index;
+    if (index === TabIndex.Favorite) {
+      // 切到收藏页：通知常驻的 FavoriteTab 无感刷新（本地回流 + 云端首页增量）
+      this.notifyFavoriteEnter();
+    }
     // 初始位置（无动画赋值）：新页从 dir 方向侧外进入，旧页原位准备退场
     this.inOffset = dir * 100;
     this.outOffset = 0;
@@ -420,6 +429,14 @@ struct Index {
       this.outOffset = 0;
       this.animLock = false;
     }, 420);
+  }
+
+  /**
+   * 通知收藏页进入（2026-09-17）：自增 favEnterTick，常驻的 FavoriteTab 据此做无感刷新
+   * （本地缓存回流 + 云端首页增量，不显示加载态/同步提示）。切 Tab 与重复点收藏 Tab 共用。
+   */
+  private notifyFavoriteEnter(): void {
+    AppStorage.setOrCreate<number>('favEnterTick', (AppStorage.get<number>('favEnterTick') ?? 0) + 1);
   }
 
   /** 页面横向位移（百分比）：进场页用 inOffset，退场页用 outOffset */

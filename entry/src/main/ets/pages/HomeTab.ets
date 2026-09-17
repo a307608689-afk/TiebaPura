@@ -442,9 +442,9 @@ export struct HomeTab {
     if (this.pageWidth < Breakpoint.sm) {
       return 1;
     }
-    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列——不再吃 display 横竖屏
-    // 推导的 this.columns（小窗下 display 恒横屏会把中间档顶成 3 列挤爆）
-    return this.pageWidth >= Breakpoint.md ? 3 : 2;
+    // 2026-09-17 三次拍板：平板**竖屏 2 列**（≥840 竖屏 3 列作废）/ 横屏 3 列——updateColumns 已按
+    // display 横竖屏把 3/2 写入 this.columns；小窗 <600 已在首行闸门回落 1 列，不会挤爆
+    return this.columns;
   }
 
   /**

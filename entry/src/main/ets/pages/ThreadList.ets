@@ -3551,8 +3551,8 @@ struct ThreadList {
     if (this.pageWidth < Breakpoint.sm) {
       return 1;
     }
-    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
-    return this.pageWidth >= Breakpoint.md ? 3 : 2;
+    // 2026-09-17 三次拍板：平板**竖屏 2 列**（≥840 竖屏 3 列作废）/ 横屏 3 列（吧搜索态共用）
+    return this.isLandscape ? 3 : 2;
   }
 
   /**

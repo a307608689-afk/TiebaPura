@@ -26,14 +26,16 @@ import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY } from '../common/Constants';
-import { FavoriteStore } from '../service/FavoriteStore';
-import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType } from '../model/DataModel';
+import { FavoriteStore, CATEGORY_DEFAULT_ID } from '../service/FavoriteStore';
+import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType, FavCategory, CategoryMapping } from '../model/DataModel';
 import { ThreadDetailResult } from '../service/TiebaService';
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isLargeFoldDevice, isPuraXMaxDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadDetailSkeleton } from '../components/Skeleton';
+import { FavCategoryPicker } from '../components/FavCategoryPicker';
 import { EmojiLoader } from '../network/EmojiLoader';
 import { ImageCache } from '../cache/ImageCache';
+import { Haptic } from '../common/Haptic';
 import image from '@ohos.multimedia.image';
 
 enum LoadState {
@@ -510,6 +512,23 @@ struct ThreadDetail {
   @State seeLz: boolean = false;
   @State liked: boolean = false;
   @State collected: boolean = false;
+  /**
+   * 长按收藏钮 → 分类面板（复用 components/FavCategoryPicker，§6.8 系统半模态）。
+   * 副作用边界（用户拍板方案 A）：面板内只做勾选 / 新建分类，**不写库**；只有「完成」回调
+   * （applyPickCategory）才执行「收藏 + 归类」——下滑 / 点遮罩关闭 = 零副作用（误触无痕）。
+   */
+  @State pickerShow: boolean = false;
+  /** 面板内分类列表 / 帖↔分类映射：打开面板时按账号现读（组件 @Link 双向绑定，新建分类会整体回写） */
+  @State pickerCategories: FavCategory[] = [];
+  @State pickerMappings: CategoryMapping[] = [];
+  /** 面板勾选集合（分类 id；CATEGORY_DEFAULT_ID = 未分类，与具体分类互斥） */
+  @State pickerChecked: string[] = [];
+  /** 面板内新建分类输入态（置 true 时输入行展开，收起不关面板） */
+  @State pickerCreating: boolean = false;
+  /** 面板参与操作的帖子快照（本页恒为当前帖，@Prop 传给组件用于计数） */
+  @State pickerTargets: string[] = [];
+  /** 面板落库账号（打开面板时取自 AuthManager，@Prop 传给组件供新建分类写入） */
+  @State pickerAccountId: string = '';
   @State commentRn: number = 3;
   @State commentLoading: boolean = false;
   @State openingSubPost: boolean = false;
@@ -1130,6 +1149,23 @@ struct ThreadDetail {
         this.ContentLayer()
         this.BottomDock()
       }
+      /**
+       * 长按收藏钮 → 分类面板（共用组件 FavCategoryPicker，§6.8 系统半模态）。
+       * 组件自身 0×0 不参与本页布局，`bindSheet` 挂在组件内部；本页只驱动开合（pickerShow），
+       * 「完成」回调 applyPickCategory 才落库 → 下滑 / 点遮罩关闭 = 零副作用。
+       */
+      FavCategoryPicker({
+        show: $pickerShow,
+        categories: $pickerCategories,
+        mappings: $pickerMappings,
+        checked: $pickerChecked,
+        creating: $pickerCreating,
+        targets: this.pickerTargets,
+        accountId: this.pickerAccountId,
+        isDark: this.isDark,
+        fontScale: this.fontScale,
+        onDone: (checked: string[]) => { this.applyPickCategory(checked); }
+      })
       // 链接跳转确认浮层（沉浸光感卡片，风格与收藏页确认弹窗一致）
       if (this.showLinkDialog) {
         this.LinkConfirmDialog()
@@ -2277,6 +2313,72 @@ struct ThreadDetail {
     }
   }
 
+  // ===== 长按收藏钮 → 收藏并归类（共用面板 FavCategoryPicker，方案 A：关闭零副作用）=====
+
+  /**
+   * 长按收藏钮打开分类面板：面板内只勾选 / 新建分类，**不落库**。
+   * 打开时按账号现读分类与映射；默认勾选口径：
+   *  · 帖子已在某（些）自定义分类 → 勾其现有分类（否则「完成」的替换式写入会把已有归类抹掉）；
+   *  · 其余情况（未收藏 / 已在未分类）→ 勾「未分类」。
+   */
+  private async openCategoryPicker(): Promise<void> {
+    const accountId: string = AuthManager.getInstance().getUser()?.userId ?? '';
+    if (accountId.length === 0) {
+      this.getUIContext().getPromptAction().showToast({ message: '请先登录后再收藏归类' });
+      return;
+    }
+    if (this.detail === null) {
+      return;
+    }
+    const store = FavoriteStore.getInstance();
+    this.pickerAccountId = accountId;
+    this.pickerCategories = await store.loadCategories(accountId);
+    this.pickerMappings = await store.loadMappings(accountId);
+    this.pickerTargets = [this.tid];
+    const owned: string[] = this.pickerMappings
+      .filter((m: CategoryMapping): boolean => m.tid === this.tid && m.categoryId !== CATEGORY_DEFAULT_ID)
+      .map((m: CategoryMapping): string => m.categoryId);
+    this.pickerChecked = owned.length > 0 ? owned : [CATEGORY_DEFAULT_ID];
+    // 每次打开都回收起态：上次遗留的输入行不出现（组件内草稿由 beginCreate 自行清空）
+    this.pickerCreating = false;
+    this.pickerShow = true;
+    Haptic.light();
+  }
+
+  /**
+   * 面板「完成」：先补收藏（未收藏时），再按勾选替换式归类 —— 两步都只在这里发生，
+   * 下滑 / 点遮罩关闭面板不经过本方法，故天然零副作用。
+   * 只勾「未分类」= 移出全部自定义分类（与收藏页移入面板同语义）。
+   */
+  private async applyPickCategory(checked: string[]): Promise<void> {
+    const accountId: string = this.pickerAccountId;
+    const detail = this.detail;
+    if (accountId.length === 0 || detail === null) {
+      this.pickerShow = false;
+      return;
+    }
+    const wasCollected: boolean = this.collected;
+    if (!wasCollected) {
+      // 先按短按收藏的同一条链路落库（本地缓存 + 云端 + 收藏时间），保证两种入口状态一致
+      this.collected = true;
+      await this.persistPersonalState(CACHE_KEY.PERSONAL_COLLECTED, true);
+    }
+    const targets: string[] = checked.filter((id: string): boolean => id !== CATEGORY_DEFAULT_ID);
+    await FavoriteStore.getInstance().setThreadCategories(accountId, this.tid, detail.forumName, targets);
+    // 广播分类/映射变更：收藏页是常驻组件（切 Tab 不重建、onPageShow 不回调），除非它自己打开面板（@Link 回写），
+    // 否则这里落库的结果不会回流 —— 面板内新建的分类、本次归类都要靠这条广播才能即时显示（2026-09-17）
+    AppStorage.setOrCreate<number>('favCatChanged', (AppStorage.get<number>('favCatChanged') ?? 0) + 1);
+    this.pickerShow = false;
+    Haptic.light();
+    const names: string[] = targets
+      .map((id: string): string => this.pickerCategories.find((c: FavCategory): boolean => c.id === id)?.name ?? '')
+      .filter((n: string): boolean => n.length > 0);
+    const label: string = names.length > 0 ? `「${names.join('、')}」` : '未分类';
+    this.getUIContext().getPromptAction().showToast({
+      message: wasCollected ? `已归类到${label}` : `已收藏并归类到${label}`
+    });
+  }
+
   private openForumHome(): void {
     const name = (this.detail?.forumName ?? this.forumName).trim();
     const fid = (this.detail?.forumId ?? this.forumId ?? '').trim();
@@ -2582,7 +2684,7 @@ struct ThreadDetail {
   /**
    * 楼层卡估算高（vp，仅供列均衡分桶，不求像素准只求相对准）：
    * 头部 / 底部 / 卡内留白取常数 128；正文 = 行数 × 26（行高）+ 8（每行字数 ≈ 列宽 / 16 字号）；
-   * 图片宫格 = 显式总高（行 × 120 + 间隙，与渲染同式）；楼中楼预览条 40。
+   * 图片宫格 = 显式总高（行 × 格高〔gridCellHeight()〕+ 间隙，与渲染同式）；楼中楼预览条 40。
    * 各卡共享同一底数，常数误差在「列高差」里互相抵消。
    */
   private estimateFloorCardHeight(floor: FloorItem, colWidth: number): number {
@@ -2594,7 +2696,7 @@ struct ThreadDetail {
     }
     const imgRows: number = Math.ceil((floor.images ?? []).length / 3);
     if (imgRows > 0) {
-      h += imgRows * 120 + (imgRows - 1) * 6 + 12;
+      h += imgRows * this.gridCellHeight() + (imgRows - 1) * 6 + 12;
     }
     if ((floor.comments ?? []).length > 0 || (floor.commentsTotal ?? 0) > 0) {
       h += 40;
@@ -3003,7 +3105,8 @@ struct ThreadDetail {
    * 图片宫格（真机错位修复 2026-09-13）：`Grid` 是**可滚动容器**，嵌在 `WaterFlow.FlowItem` 内时
    * 「自测量高度」与「实际渲染高度」可能不一致（格高恒 120 但总高靠 Grid 自算），布局期用错高度
    * 会把后续 FlowItem 摆错位置 → 卡片重叠（竖屏）/ 列溢出（横屏），真机已复现。
-   * 故**显式给出总高** = 行数 × 120 + (行数 − 1) × 6，测量期即终值，与首页 ThreadCard
+   * 故**显式给出总高** = 行数 × 格高〔`gridCellHeight()`：手机/平板 120、大折叠与 Pura X Max 72〕
+   * + (行数 − 1) × 6，测量期即终值，与首页 ThreadCard
    * 「图片尺寸测量期确定」的成品口径对齐。
    * `capMaxWidth`：仅**通栏卡**（主楼）传 true（336 封顶防通栏拉伸）；列内卡（楼层 / 楼中楼）传 false
    * —— 窄列下列宽本就 < 336，写死 336 上限没有意义，跟随列宽（'100%'）杜绝交叉轴测量歧义。
@@ -3027,16 +3130,30 @@ struct ThreadDetail {
           Stack() {
             ThreadGridImage({ src: img, isDark: this.isDark })
               .width('100%')
-              .height(120)
+              .height(this.gridCellHeight())
           }
           .width('100%')
-          .height(120)
+          .height(this.gridCellHeight())
           .onClick(() => {
             const allImages = this.collectAllImages();
             const offset = this.getImageGlobalOffset(images);
+            // 图片流式补页（2026-09-17）：浏览页滑到已加载图片末尾时，会按同一组分页参数
+            // （tid/sortType/seeLz/forumId/commentRn）继续拉取后续楼层页并追加图片，
+            // 使「未加载楼层的图片」也能直接滑到，无需先滚回列表加载楼层。
+            // loadedPage/totalPage 用于给出补页游标与上限（详见 ImagePreview.ets 的流式补页说明）。
             this.getUIContext().getRouter().pushUrl({
               url: 'pages/ImagePreview',
-              params: { urls: allImages, index: offset + idx }
+              params: {
+                urls: allImages,
+                index: offset + idx,
+                tid: this.tid,
+                sortType: this.sortType,
+                seeLz: this.seeLz,
+                forumId: this.forumId,
+                commentRn: this.commentRn,
+                loadedPage: this.currentPage,
+                totalPage: this.totalFloorPage
+              }
             }).catch(() => {
               this.getUIContext().getPromptAction().showToast({ message: '图片预览打开失败，请稍后重试' });
             });
@@ -3624,7 +3741,9 @@ struct ThreadDetail {
     .alignItems(VerticalAlign.Center)
     .onClick(() => { this.toggleLike(); })
 
-    // 收藏按钮：同样去掉独立小玻璃框
+    // 收藏按钮：同样去掉独立小玻璃框。
+    // 短按 = 收藏 / 取消收藏（行为不变）；长按 350ms = 弹分类面板「收藏并归类」（方案 A：下滑/点遮罩关闭零副作用）。
+    // 长按与点击同挂一个组件时，长按识别成功后点击事件不再触发（与收藏页收纳夹长按置顶同机制），故短按不会被长按入口抢走。
     Row() {
       SymbolGlyph($r('sys.symbol.bookmark'))
         .fontSize(fs(22, this.fontScale))
@@ -3635,8 +3754,10 @@ struct ThreadDetail {
     .height(42)
     .padding({ left: 6, right: 6 })
     .alignItems(VerticalAlign.Center)
-    .accessibilityText(this.collected ? '取消收藏' : '收藏')
+    .accessibilityText(this.collected ? '取消收藏，长按收藏并归类' : '收藏，长按收藏并归类')
     .onClick(() => { this.collected = !this.collected; this.persistPersonalState(CACHE_KEY.PERSONAL_COLLECTED, this.collected); })
+    .gesture(LongPressGesture({ fingers: 1, repeat: false, duration: 350 })
+      .onAction(() => { this.openCategoryPicker(); }))
 
     // 回复框改为跳转入口：本客户端不提供发回帖能力（第三方协议有封号风险），
     // 点击后弹确认框并跳转官方贴吧对应帖子。外观沿用原输入胶囊（玻璃底 + 真磨砂 + 全圆胶囊）。

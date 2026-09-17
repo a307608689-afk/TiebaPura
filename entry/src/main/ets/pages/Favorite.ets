@@ -30,6 +30,7 @@ import { FavoriteStore, CATEGORY_DEFAULT_ID, BackupFolder, BackupImportSummary, 
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ListRowSkeleton } from '../components/Skeleton';
+import { FavCategoryPicker } from '../components/FavCategoryPicker';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { ShareUtil } from '../common/ShareUtil';
@@ -47,14 +48,6 @@ enum SortMode {
   TimeAsc = 2,
   TimeDesc = 3,
   Custom = 4,
-}
-
-/** 移入面板目标分类条目 */
-interface MoveTarget {
-  id: string;
-  icon: string;
-  name: string;
-  included: number;   // 当前已包含选中帖数
 }
 
 /** BUG-05 置顶/取消置顶确认弹窗目标 */
@@ -700,8 +693,8 @@ export struct FavoriteTab {
     if (this.pageWidth < 600) {
       return 1; // 折叠态 / 分屏 / 自由多窗窄窗
     }
-    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
-    return this.pageWidth >= 840 ? 3 : 2;
+    // 2026-09-17 三次拍板：平板**竖屏 2 列**（≥840 竖屏 3 列作废）/ 横屏 3 列（各视图共用）
+    return this.isLandscape() ? 3 : 2;
   }
 
   /** 帖子列表列模板（改动三 / 五共用）：收藏夹点开列表与搜索态同口径 */
@@ -730,7 +723,15 @@ export struct FavoriteTab {
   @State @Watch('syncBackState') showMovePanel: boolean = false;
   /** §4.3 改动六·方案四：平板「自定义排序」半屏面板开关（bindSheet，与 showMovePanel 同机制） */
   @State showSortPanel: boolean = false;
+  /** 移入面板勾选集合（分类 id；CATEGORY_DEFAULT_ID = 未分类，与具体分类互斥）——面板组件 @Link 双向绑定 */
   @State moveChecked: string[] = [];
+  /**
+   * 移入面板内「新建分类」输入态（面板组件 @Link 双向绑定；输入行草稿留在组件内，宿主只持两态开关）。
+   * 宿主持有它只为让返回键先退输入行、不关整个面板（与收藏页 categoryInputVisible 口径一致）。
+   */
+  @State pickerCreating: boolean = false;
+  /** 移入面板参与的帖子 tid 快照（须 @State 才能作为 @Prop 同步给面板组件 FavCategoryPicker） */
+  @State movePanelTids: string[] = [];
   /**
    * 导出授权弹窗显隐（v1.15.11 起为系统 CustomDialog + API 26 沉浸光感，见顶层 struct ExportDialogCard）。
    * 与其他弹窗同款：布尔状态 + @Watch 驱动 open/close（故原先挂在它上面的 syncBackState 由 onShowExportDialogChanged 代劳）。
@@ -1129,6 +1130,19 @@ export struct FavoriteTab {
   @StorageLink('favLoginRefresh') @Watch('onLoginRefresh') favLoginRefresh: number = 0;
   // 深色模式切换通知：本页或宿主切换深色时递增 → 重读 isDarkMode()，保持与 ForumsTab/MineTab/HomeTab 同链路
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
+  /**
+   * 分类集合变更通知（2026-09-17）：详情页长按收藏钮 → 分类面板内新建分类 / 完成归类落库后由**写方**自增。
+   * 本页是 Index 内常驻 @Component（非 @Entry，onPageShow 不回调），外部改分类没有任何回流通路，
+   * 不订阅则新建的分类必须重启 App 才会出现在「自定义分类」里。
+   */
+  @StorageLink('favCatChanged') @Watch('onCatChanged') favCatChanged: number = 0;
+  /**
+   * 进入收藏页通知（2026-09-17）：宿主 Index.switchTab 切到收藏 Tab（含重复点击收藏 Tab）时自增。
+   * 本页是常驻组件（非 @Entry，onPageShow 不回调）→ 此前切进来只能看到上次的内容，必须手动下拉刷新。
+   * 回调走 silentRefresh()：本地缓存回流 + 云端首页增量合并，全程不置 loading/refreshing/syncing 任一亮态、
+   * 不弹 toast；内容无变化时连 @State 都不写，列表零重绘（无感）。
+   */
+  @StorageLink('favEnterTick') @Watch('onEnterTick') favEnterTick: number = 0;
   private pageSize: number = 20;
   private accountId: string = '';
   // v1.15 拖拽分类列表：Scroller 用于拖拽中手动 scrollBy 跟随手指；lastAutoScrollTime 节流
@@ -1140,6 +1154,9 @@ export struct FavoriteTab {
   private lastAutoScrollTime: number = 0;
   // v1.13 加载冷却：内容不足一屏时 onReachEnd 会连续触发，加冷却避免"不断加载中"刷屏
   private lastLoadMoreAt: number = 0;
+  /** 进入页静默刷新的最小间隔（ms）：防切换动画期间/快速来回切 Tab 引发的请求风暴（2026-09-17） */
+  private static readonly ENTER_REFRESH_MIN_GAP_MS: number = 3000;
+  private lastEnterRefreshAt: number = 0;
   // v1.12 收藏夹/分类返回保持列表滚动位置：Scroller + 偏移记录（if/else 切换销毁 List 后 onAppear 恢复）
   private folderScroller: Scroller = new Scroller();
   private folderScrollOffset: number = 0;
@@ -1160,7 +1177,6 @@ export struct FavoriteTab {
   @State syncing: boolean = false;
   private syncRunning: boolean = false;
   private syncMeta: SyncMeta = { lastNetAt: 0, fullAt: 0 };
-  private movePanelTids: string[] = [];
   private static readonly AVATAR_CONCURRENCY: number = 2;
   // v1.18 自动同步参数：30min 网络冷却（冷却内进页零请求，本地缓存秒开）/ 每日一次全量校正 / 页间隔 300ms / 单次上限 100 页（超出交滚动触底）/ 每 20 页阶段落盘一次
   private static readonly SYNC_COOL_MS: number = 30 * 60 * 1000;
@@ -1831,7 +1847,11 @@ export struct FavoriteTab {
     }
   }
 
-  /** 轻量增量：拉云端最新一页合并（发现新增/首页取消；写缓存一次并重建） */
+  /**
+   * 轻量增量：拉云端最新一页合并（发现新增/首页取消；写缓存一次并重建）。
+   * 2026-09-17 起兼作"进入页无感刷新"的网络侧：内容与本地完全一致时零副作用返回（不赋值 @State /
+   * 不落盘 / 不重建），全程无加载态与轻提示，用户感知不到刷新动作。
+   */
   private async syncIncremental(): Promise<void> {
     if (this.loading || this.loadingMore || this.syncRunning) {
       return;
@@ -1840,8 +1860,10 @@ export struct FavoriteTab {
     const started: number = Date.now();
     try {
       const cloud = await TiebaService.getInstance().fetchCollectedThreads(this.accountId, 0, this.pageSize);
-      if (cloud.length > 0) {
-        this.allThreads = this.mergeByTid(cloud.concat(this.allThreads));
+      // 无感化（2026-09-17）：与本地完全一致 → 零副作用返回；有变化时合并顺序改为"本地在前 + 云端在后"，
+      // 同 tid 由云端记录覆盖（字段刷新），已有项顺序保持不变、新项追加到末尾，尽量减小列表跳动。
+      if (cloud.length > 0 && this.cloudDiffersFromLocal(cloud)) {
+        this.allThreads = this.mergeByTid(this.allThreads.concat(cloud));
         for (const t of this.allThreads) {
           this.knownTids.add(t.tid);
         }
@@ -2348,6 +2370,14 @@ export struct FavoriteTab {
       this.toast('分类名称最多 12 个字');
       return;
     }
+    // 重名拦截（与移入分类面板内「新建分类」同口径）：同名分类不再重复创建；
+    // 改名时排除自身，避免未改名直接保存被误拦。
+    const duplicated: boolean = this.categories.some((c: FavCategory): boolean =>
+      c.name === name && c.id !== this.categoryEditingId);
+    if (duplicated) {
+      this.toast('该分类已存在');
+      return;
+    }
     const store = FavoriteStore.getInstance();
     if (this.categoryEditingId.length === 0) {
       this.categories = await store.addCategory(this.accountId, name, '📁');
@@ -2377,6 +2407,13 @@ export struct FavoriteTab {
     }
     if (name === cat.name) {
       this.cancelCategoryRename();
+      return;
+    }
+    // 重名拦截（与分类列表内改名同口径）：弹窗内重命名也排除自身比对
+    const duplicated: boolean = this.categories.some((c: FavCategory): boolean =>
+      c.name === name && c.id !== cat.id);
+    if (duplicated) {
+      this.toast('该分类已存在');
       return;
     }
     const store = FavoriteStore.getInstance();
@@ -2433,28 +2470,8 @@ export struct FavoriteTab {
   }
 
   // ===== 移入分类（编辑态底部操作，多选勾选面板：一帖可同时在多个分类，§4.2）=====
-  private moveTargets(): MoveTarget[] {
-    const list: MoveTarget[] = [];
-    const tids: string[] = this.movePanelTids;
-    const includedOf = (categoryId: string): number => {
-      let n: number = 0;
-      for (const tid of tids) {
-        if (this.mappings.some((m: CategoryMapping): boolean => m.tid === tid && m.categoryId === categoryId)) {
-          n++;
-        }
-      }
-      return n;
-    };
-    list.push({ id: CATEGORY_DEFAULT_ID, icon: '📂', name: '未分类', included: includedOf(CATEGORY_DEFAULT_ID) });
-    for (const c of this.categories) {
-      list.push({ id: c.id, icon: c.icon, name: c.name, included: includedOf(c.id) });
-    }
-    return list;
-  }
-
-  private isMoveChecked(id: string): boolean {
-    return this.moveChecked.indexOf(id) >= 0;
-  }
+  // 面板 UI / 勾选 / 新建分类入口已收敛到 components/FavCategoryPicker.ets（收藏页与详情页单一来源），
+  // 此处只留两端：打开前的快照初始化、完成后的替换式落库。
 
   /** 打开移入面板：按当前选中帖快照初始化各分类勾选态（已含全部选中帖的分类默认勾选） */
   private openMovePanel(): void {
@@ -2478,33 +2495,19 @@ export struct FavoriteTab {
       }
     }
     this.moveChecked = checked;
+    // 每次打开都回收起态：上次遗留的输入行不出现（组件内草稿由 beginCreate 自行清空）
+    this.pickerCreating = false;
     this.showMovePanel = true;
   }
 
-  /** 切换勾选：未分类与具体分类互斥（勾选未分类 = 移出全部自定义分类） */
-  private toggleMoveTarget(id: string): void {
-    if (id === CATEGORY_DEFAULT_ID) {
-      this.moveChecked = this.isMoveChecked(CATEGORY_DEFAULT_ID) ? [] : [CATEGORY_DEFAULT_ID];
-      return;
-    }
-    let next: string[] = this.moveChecked.filter((x: string): boolean => x !== CATEGORY_DEFAULT_ID);
-    if (next.indexOf(id) >= 0) {
-      next = next.filter((x: string): boolean => x !== id);
-    } else {
-      next = [...next, id];
-    }
-    this.moveChecked = next;
-    Haptic.light();
-  }
-
-  /** 应用勾选：替换式写入（幂等，重复加入同分类自动去重） */
-  private async confirmMove(): Promise<void> {
+  /** 应用勾选：替换式写入（幂等，重复加入同分类自动去重）——由面板组件「完成」回调（onDone）驱动 */
+  private async applyMove(checked: string[]): Promise<void> {
     const tids: string[] = this.movePanelTids;
     if (tids.length === 0) {
       return;
     }
-    const moveToUnclassified: boolean = this.isMoveChecked(CATEGORY_DEFAULT_ID);
-    const targetIds: string[] = moveToUnclassified ? [] : this.moveChecked;
+    const moveToUnclassified: boolean = checked.indexOf(CATEGORY_DEFAULT_ID) >= 0;
+    const targetIds: string[] = moveToUnclassified ? [] : checked;
     const store = FavoriteStore.getInstance();
     for (const tid of tids) {
       const item = this.allThreads.find((t: PersonalContentItem): boolean => t.tid === tid);
@@ -2512,7 +2515,7 @@ export struct FavoriteTab {
     }
     this.showMovePanel = false;
     this.exitEditMode();
-    const names: string[] = this.moveChecked.map((id: string) =>
+    const names: string[] = checked.map((id: string) =>
       id === CATEGORY_DEFAULT_ID ? '未分类' : (this.categories.find((c: FavCategory): boolean => c.id === id)?.name ?? ''));
     const label: string = names.length > 0 ? names.join('、') : '未分类';
     Haptic.light();
@@ -2557,6 +2560,9 @@ export struct FavoriteTab {
       this.exitSearch();
     } else if (this.categoryInputVisible) {
       this.closeCategoryInput();
+    } else if (this.showMovePanel && this.pickerCreating) {
+      // 面板内输入态：返回键先退输入行（与收藏页 categoryInputVisible 口径一致），不关面板
+      this.pickerCreating = false;
     } else if (this.showMovePanel) {
       this.showMovePanel = false;
     } else if (this.showCategoryManage) {
@@ -2665,6 +2671,96 @@ export struct FavoriteTab {
   /** darkTick 递增（本页或宿主/其它 Tab 切换深色）→ 重读全局深色状态，保证整页背景/文字/按钮/卡片同步翻档 */
   private onDarkTick(): void {
     this.isDark = isDarkMode();
+  }
+
+  /**
+   * favCatChanged 递增（详情页长按收藏钮 → 面板内新建分类 / 完成归类落库）→ 重读分类与映射，
+   * 本页「自定义分类」列表与各分类计数即时对齐（此前无通路，必须重启 App 才刷新）。
+   * 只重读这两份本地数据（零网络）；收藏列表本身仍走 refreshFromCache 那条线，不在此触网。
+   */
+  private onCatChanged(): void {
+    if (this.accountId.length === 0) {
+      return; // loadAll 尚未完成：其自身会读到最新分类，无需在此抢先
+    }
+    this.reloadCategories().catch(() => {
+    });
+  }
+
+  /** 重读分类集合与帖↔分类映射；当前停留的自定义分类若已被外部删除则回落分类根视图（避免停在已不存在的分类里） */
+  private async reloadCategories(): Promise<void> {
+    const store = FavoriteStore.getInstance();
+    this.categories = await store.loadCategories(this.accountId);
+    this.mappings = await store.loadMappings(this.accountId);
+    if (this.selectedCategoryId.length > 0
+      && !this.categories.some((c: FavCategory): boolean => c.id === this.selectedCategoryId)) {
+      this.selectedCategoryId = '';
+    }
+  }
+
+  /**
+   * favEnterTick 递增（宿主 switchTab 切到收藏 Tab / 重复点收藏 Tab）→ 无感刷新内容。
+   * 只在已登录且无进行中的加载/同步、且距上次进入刷新超过 ENTER_REFRESH_MIN_GAP_MS 时才真的触网。
+   */
+  private onEnterTick(): void {
+    this.silentRefresh().catch(() => {
+    });
+  }
+
+  /**
+   * 进入收藏页的无感刷新（2026-09-17）：不再要求用户手动下拉。
+   * ①本地缓存回流（refreshFromCache，零网络；覆盖详情页收藏/取消收藏的即时写入与幽灵清理）；
+   * ②云端首页增量静默合并（syncIncremental，单请求；内容无变化时零副作用）。
+   * 全程不置 refreshing/loading/syncing 任一亮态、不弹 toast、不改动滚动位置，故用户"看不出在刷新"。
+   */
+  private async silentRefresh(): Promise<void> {
+    if (this.accountId.length === 0) {
+      return; // 未登录：loadAll 已置空态，无需刷新
+    }
+    if (this.loading || this.loadingMore || this.syncRunning || this.syncing) {
+      return; // 加载/同步进行中，结束后即为最新数据
+    }
+    const now: number = Date.now();
+    if (now - this.lastEnterRefreshAt < FavoriteTab.ENTER_REFRESH_MIN_GAP_MS) {
+      return; // 节流：切换动画期间/快速来回切 Tab 不重复请求
+    }
+    this.lastEnterRefreshAt = now;
+    if (this.allThreads.length === 0) {
+      // 空态或上次加载失败：无内容可保留，回落常规加载（此时只有显示加载态可选）
+      this.loadAll();
+      return;
+    }
+    try {
+      await this.refreshFromCache();
+    } catch (e) {
+      // 本地回流失败忽略：仍走下面的网络增量
+    }
+    if (this.accountId.length === 0) {
+      return;
+    }
+    // 后台静默增量（内部自带存在性判定，无变化时不写 @State/不落盘/不重建）
+    this.syncIncremental();
+  }
+
+  /**
+   * 无感刷新差异判定：云端首页条目相对本地集合，是否存在新增 tid 或同 tid 关键字段变化。
+   * 全部一致 → 整个静默刷新过程零副作用（不赋值 @State、不落盘、不重建列表），用户完全无感。
+   */
+  private cloudDiffersFromLocal(cloud: PersonalContentItem[]): boolean {
+    const map: Map<string, PersonalContentItem> = new Map<string, PersonalContentItem>();
+    for (const t of this.allThreads) {
+      map.set(t.tid, t);
+    }
+    for (const c of cloud) {
+      const cur: PersonalContentItem | undefined = map.get(c.tid);
+      if (cur === undefined) {
+        return true; // 新增收藏
+      }
+      if (cur.title !== c.title || cur.author !== c.author || cur.forumName !== c.forumName
+        || cur.abstract !== c.abstract || cur.replyNum !== c.replyNum || cur.createTime !== c.createTime) {
+        return true; // 同帖字段更新（标题编辑、回复数增长等）
+      }
+    }
+    return false;
   }
 
   /** fontTick 递增（字号设置写入 / 宿主返回广播）→ 显式回写 fontScale 强制本页字号依赖刷新 */
@@ -2944,7 +3040,24 @@ export struct FavoriteTab {
       // §4.3 真机三次修复（2026-09-14）：顶部满宽渐显带改 Stack 顶层背景色渐变条（zIndex 8）——
       // 盖住各列表内容顶部（视觉渐隐），低于 EditBar(15) / 兜底胶囊行(13)，槽位顶栏在 Navigation title 层更高
       this.TopFadeBand()
-      // 移入分类面板已改为系统半模态 bindSheet（§6.8），由根 Stack 的 .bindSheet 驱动，无需在此挂载
+      /**
+       * 移入分类面板（§6.8 系统半模态）：UI / 勾选 / 新建分类已收敛到共用组件 FavCategoryPicker，
+       * 组件自身 0×0 不参与本页布局，`bindSheet` 挂在组件内部（见 components/FavCategoryPicker.ets）。
+       * 本页只驱动开合（showMovePanel）并在「完成」回调里落库（applyMove），
+       * 故下滑 / 点遮罩关闭 = 零副作用。
+       */
+      FavCategoryPicker({
+        show: $showMovePanel,
+        categories: $categories,
+        mappings: $mappings,
+        checked: $moveChecked,
+        creating: $pickerCreating,
+        targets: this.movePanelTids,
+        accountId: this.accountId,
+        isDark: this.isDark,
+        fontScale: this.fontScale,
+        onDone: (checked: string[]) => { this.applyMove(checked); }
+      })
       // 备份 / 导出授权 / 置顶确认 / 批量删除确认 / 分类管理 已全部换成系统 CustomDialog（由 controller 驱动，无需在此挂载）
       /**
        * 排序菜单锚点（§6.9：自绘下拉浮层 → 系统 bindMenu）。
@@ -2988,134 +3101,6 @@ export struct FavoriteTab {
       this.pageHeight = n.height as number;
     })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    /**
-     * 移入分类面板（§6.8：自绘浮层 → 系统半模态 bindSheet）。
-     * 半模态属官方沉浸光感 A 档槽位，材质走 options.systemMaterial（页面 body 内的自绘浮层拿不到材质）。
-     * 几何逐项对齐改造前：高度 62% / 遮罩 #66000000 / 顶部圆角 24 / 无拖拽条 / 无系统关闭按钮。
-     * `$$` 双向绑定：用户下滑手势关闭时系统会回写 showMovePanel = false，@Watch 随之刷新 favCanGoBack。
-     */
-    .bindSheet($$this.showMovePanel, this.MovePanelContent(), {
-      height: '62%',
-      preferType: SheetType.BOTTOM,
-      showClose: false,
-      dragBar: false,
-      maskColor: '#66000000',
-      radius: { topLeft: 24, topRight: 24 },
-      systemMaterial: ImmMaterial.sheet(),
-      onDisappear: () => { this.showMovePanel = false; }
-    })
-  }
-
-  /**
-   * 移入分类选择面板内容（系统半模态 `bindSheet` 的 builder，§6.8）。
-   * 原自绘浮层的两层外壳已全部交给系统半模态：
-   * 遮罩 → `options.maskColor`；玻璃 → `options.systemMaterial(ImmMaterial.sheet())`；
-   * 高度 62% / 顶部圆角 24 / 无拖拽条 也移到 `options`（见 build() 根 Stack 的 `.bindSheet`）。
-   * 此处只保留内容本体（标题行 + 分类列表 + 完成按钮），尺寸、间距、文案零改动。
-   */
-  @Builder
-  MovePanelContent() {
-    Column() {
-      Row() {
-        Text('移入分类')
-          .fontSize(fs(16, this.fontScale))
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Theme.textPrimary(this.isDark))
-        Blank()
-        Text(`${this.movePanelTids.length} 条已选`)
-          .fontSize(fs(12, this.fontScale))
-          .fontColor(Theme.textTertiary(this.isDark))
-      }
-      .width('100%')
-      .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.sm })
-
-      List({ space: Spacing.md }) {
-        ForEach(this.moveTargets(), (t: MoveTarget) => {
-          ListItem() {
-            Row({ space: Spacing.md }) {
-              Stack() {
-                if (this.isMoveChecked(t.id)) {
-                  // 自绘对勾（与编辑态勾选圆同源），20 圆内按比例缩收
-                  Path()
-                    // 同上：commands 单位为 px，vp2px 换算（20 圆内等比缩收坐标）
-                    .commands(`M${vp2px(5.4)} ${vp2px(10.4)} L${vp2px(8.9)} ${vp2px(13.9)} L${vp2px(14.8)} ${vp2px(6.6)}`)
-                    .width(20)
-                    .height(20)
-                    .stroke(Color.White)
-                    .strokeWidth(2.2)
-                    .fillOpacity(0)
-                    .strokeLineCap(LineCapStyle.Round)
-                    .strokeLineJoin(LineJoinStyle.Round)
-                    .transition(
-                      TransitionEffect.OPACITY
-                        .combine(TransitionEffect.scale({ x: 0.6, y: 0.6 }))
-                        .animation({ duration: 220, curve: Curve.Friction })
-                    )
-                }
-              }
-              .width(20)
-              .height(20)
-              .borderRadius(10)
-              .backgroundColor(this.isMoveChecked(t.id) ? Theme.brand() : Color.Transparent)
-              .border({ width: 2, color: this.isMoveChecked(t.id) ? Color.Transparent : Theme.textTertiary(this.isDark) })
-
-              Stack({ alignContent: Alignment.Center }) {
-                SymbolGlyph($r(t.id === CATEGORY_DEFAULT_ID ? 'sys.symbol.folder' : 'sys.symbol.folder_fill'))
-                  .fontSize(fs(22, this.fontScale))
-                  .fontColor([Theme.brand()])
-              }
-              .width(44)
-              .height(44)
-              .backgroundColor(Theme.bgCard(this.isDark))
-              .borderRadius(22)
-              Text(t.name)
-                .fontSize(fs(15, this.fontScale))
-                .fontWeight(FontWeight.Medium)
-                .fontColor(Theme.textPrimary(this.isDark))
-                .layoutWeight(1)
-              if (t.included > 0) {
-                Text(`已含 ${t.included}/${this.movePanelTids.length}`)
-                  .fontSize(fs(11, this.fontScale))
-                  .fontColor(Theme.textTertiary(this.isDark))
-              }
-            }
-            .width('100%')
-            .padding(Spacing.lg)
-            // §9 注：卡内条目也吃官方材质 + 半透明底（原来的不透明卡片会在玻璃面板上叠出白块，§8 坑 6）
-            .systemMaterial(ImmMaterial.cardAction())
-            .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
-            .borderRadius(Radius.lg)
-            .accessibilityText(`${t.name}${t.included > 0 ? `，已含 ${t.included} 条` : ''}`)
-            .onClick(() => { this.toggleMoveTarget(t.id); })
-          }
-        }, (t: MoveTarget) => `mv_${t.id}`)
-      }
-      .layoutWeight(1)
-      .width('100%')
-      .padding({ left: Spacing.lg, right: Spacing.lg, top: 8 })
-      .scrollBar(BarState.Off)
-
-      Button() {
-        Text('完成')
-          .fontSize(fs(15, this.fontScale))
-          .fontColor(Color.White)
-          .fontWeight(FontWeight.Medium)
-      }
-      .width('calc(100% - 32vp)')
-      .height(44)
-      // §9 注：卡内主按钮挂品牌色材质 + 半透明底 + 同色浮起阴影（不透明底会盖掉材质）
-      .systemMaterial(ImmMaterial.accent(this.isDark))
-      .backgroundColor('#CC3173FF')
-      .borderRadius(Radius.full)
-      .shadow({ radius: 14, color: this.isDark ? '#663173FF' : '#4D3173FF', offsetY: 4 })
-      .margin({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: 24 })
-      .accessibilityText('完成移入')
-      .onClick(() => { this.confirmMove(); })
-    }
-    .width('100%')
-    .height('100%')
-    .padding({ top: 8 })
-    // 容器节点不设 backgroundColor / border / shadow / backgroundBlurStyle：四项由 options.systemMaterial 接管（§4.4）
   }
 
   @Builder

@@ -1388,8 +1388,8 @@ export struct ForumsTab {
     if (this.pageWidth < 600) {
       return 2;
     }
-    // 2026-09-17 二次拍板：窗口 ≥840 三列 / 600~840 中间档小窗两列（原「竖 2 / 横 3」按宽高比判作废）
-    return this.pageWidth >= 840 ? 3 : 2;
+    // 2026-09-17 三次拍板：平板**竖屏 2 列**（≥840 竖屏 3 列作废）/ 横屏 3 列
+    return this.isLandscape ? 3 : 2;
   }
 
   /** 列数 → Grid 列模板（手机 2 / 平板竖 2 / 平板横 3） */
