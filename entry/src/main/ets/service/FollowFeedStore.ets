@@ -397,22 +397,21 @@ export class FollowFeedStore {
     return candidates;
   }
 
-  /** 从游标表挑未翻尽、最久未拉的前 BARS_PER_ROUND 个吧 */
+  /** 从游标表挑未翻尽、最久未拉的前 BARS_PER_ROUND 个吧（无游标的新吧即时建档，lastFetchedAt=0 天然排最前） */
   private pickFromCursor(allowAny: boolean): PickedBar[] {
     const refs: CursorEntry[] = [];
-    this.cursors.forEach((c: BarCursor, name: string): void => {
-      if (!this.bars.includes(name)) {
-        return;
-      }
+    for (const name of this.bars) {
+      // 游标惰性建档必须在挑选时完成：旧实现只在拉取成功后建档，导致首轮 pickRound 空选、refill 空转
+      const c: BarCursor = this.ensureCursor(name);
       if (c.exhausted && !allowAny) {
-        return;
+        continue;
       }
       const e: CursorEntry = {
         name: name, page: c.page, sortType: c.sortType,
         lastFetchedAt: c.lastFetchedAt, exhausted: c.exhausted
       };
       refs.push(e);
-    });
+    }
     // 新吧（无游标）lastFetchedAt=0 天然排前，优先建立游标
     refs.sort((a: CursorEntry, b: CursorEntry): number => a.lastFetchedAt - b.lastFetchedAt);
     const picked: PickedBar[] = [];
