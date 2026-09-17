@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.tiebapura.app",
     "vendor": "a307608689-afk",
-    "versionCode": 1000004,
-    "versionName": "1.0.4",
+    "versionCode": 1000005,
+    "versionName": "1.0.5",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }
