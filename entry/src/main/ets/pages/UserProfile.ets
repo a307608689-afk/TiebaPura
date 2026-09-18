@@ -18,7 +18,7 @@
 
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isPuraXMaxDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isPuraXMaxDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { TiebaService, BlacklistPermOptions } from '../service/TiebaService';
@@ -645,7 +645,9 @@ struct UserProfile {
   private profileColumns(): number {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
-    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
+    // 阔直屏全屏白名单（2026-09-18）：Pura X View（VOL-AL00）等阔直屏竖屏全屏窗口宽仅 ~440vp，
+    // 会被本闸门误判成小窗；白名单放行（小窗 / 分屏仍拦，见 Theme.isWideBarFullscreen）
+    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm && !isWideBarFullscreen(this.pageWidth)) {
       return 1;
     }
     // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，

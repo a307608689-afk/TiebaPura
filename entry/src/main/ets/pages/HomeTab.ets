@@ -27,7 +27,7 @@ import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowFeedStore, POOL_HIGH, sortThreadsByTimeDesc } from '../service/FollowFeedStore';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 
@@ -359,7 +359,9 @@ export struct HomeTab {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——必须放在设备恒值分支（阔直屏 / 大折叠直接 return this.columns）之前，
     // 否则设备恒值分支会绕过宽度兜底（小窗里 display 仍是横屏大屏 → 旧逻辑恒 3 列）
-    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
+    // 阔直屏全屏白名单（2026-09-18）：Pura X View（VOL-AL00）等阔直屏竖屏全屏窗口宽仅 ~440vp，
+    // 会被本闸门误判成小窗；白名单放行（小窗 / 分屏仍拦，见 Theme.isWideBarFullscreen）
+    if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm && !isWideBarFullscreen(this.pageWidth)) {
       return 1;
     }
     // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
@@ -371,6 +373,9 @@ export struct HomeTab {
       }
     }
     // 阔直屏分支紧随其后（竖屏窗口宽 ~500 < 600 已被上面的窗口闸门回落 1 列，语义不变）
+    // 阔直屏分支紧随其后：全屏竖屏（窗口宽 ~440 < 600）经上面白名单放行后落到本行，
+    // 默认档返回 this.columns（updateColumns 按 display 横竖屏写入：竖 1 / 横 3，与改前同值）；
+    // 非全屏的自由小窗 / 分屏仍被闸门回落 1 列，到不了这里
     if (isWideBarDevice()) {
       return this.columns;
     }

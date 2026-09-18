@@ -1292,6 +1292,38 @@ export function isLargeScreenForm(isWideForm: boolean): boolean {
 }
 
 /**
+ * 阔直屏「全屏」白名单 —— 「列数调整」在阔直屏竖屏下生效的**唯一放行口**（2026-09-18 用户要求）。
+ *
+ * 背景：8 个多列页列数函数首行都有「窗口宽 < 600 → 回落手机单列档」的自由小窗 / 分屏闸门。
+ * 但阔直屏档设备**竖屏全屏**的窗口宽只有约 440vp（屏短边 1320px ÷ density；16:9.5 的
+ * Pura X View（VOL-AL00，2232×1320）与 16:10 的 Pura X 展开态同值），远小于 600 →
+ * 被闸门误判成自由小窗，于是「列数调整」在这类设备竖屏下**永不生效**（横屏窗口宽 ≥600 才命中）。
+ *
+ * 判据（必须同时满足）：
+ * ① 阔直屏档设备（isWideBarDevice：型号白名单 VOL-AL00 / 物理比例带 (1.4,1.85)）；
+ * ② 窗口宽 ≈ 屏短边 vp —— 即窗口占满屏宽（全屏）；自由小窗与左右分屏的窗口宽必然小于屏短边，
+ * 故它们仍返回 false，**2026-09-17「小窗 <600 一律回落 1 列」的结论不被破坏**。
+ *
+ * 入参传各页已维护的窗口实宽（pageWidth，vp）。未就绪 / 异常一律 false（安全方向 = 维持原闸门行为）。
+ */
+export function isWideBarFullscreen(pageWidth: number): boolean {
+  if (pageWidth <= 0) {
+    return false;
+  }
+  if (!isWideBarDevice()) {
+    return false;
+  }
+  try {
+    const d: display.Display = display.getDefaultDisplaySync();
+    const shortEdge: number = Math.min(d.width, d.height) / d.densityPixels;
+    // 容差 24vp：仅吸收 vp 取整误差；自由多窗即使拉到极宽也仍小于该值（分屏为屏宽一半）
+    return shortEdge > 0 && pageWidth >= shortEdge - 24;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * 「列数调整」覆盖值：mode=1 → 竖 2 / 横 3；mode=2 → 竖 3 / 横 4。
  * 返回 0 表示「不覆盖」（默认档）→ 调用方继续走原自动适配分支（逐像素零回归）。
  */

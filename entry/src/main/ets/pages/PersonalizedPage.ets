@@ -346,7 +346,8 @@ struct PersonalizedPage {
             }
           })
 
-          // 列数调整：三选一（默认 / 竖二横三 / 竖三横四），仅大屏形态生效（手机档与窄窗闸门不覆盖）
+          // 列数调整：三选一（默认 / 竖二横三 / 竖三横四），仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+          // 手机档与窄窗闸门不覆盖；阔直屏竖屏全屏走 isWideBarFullscreen 白名单放行
           Row({ space: Spacing.md }) {
             SymbolGlyph($r('sys.symbol.grid'))
               .fontColor([Theme.textPrimary(this.isDark)])
@@ -357,7 +358,7 @@ struct PersonalizedPage {
                 .fontSize(fs(18, this.fontScale))
                 .fontWeight(FontWeight.Medium)
                 .fontColor(Theme.textPrimary(this.isDark))
-              Text('平板 / 折叠屏展开的列表列数')
+              Text('平板 / 阔直屏 / 折叠屏展开的列表列数')
                 .fontSize(fs(12, this.fontScale))
                 .fontColor(Theme.textSecondary(this.isDark))
             }
