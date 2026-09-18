@@ -23,7 +23,7 @@ import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 
 enum PersonalMode {
@@ -77,6 +77,12 @@ struct PersonalContent {
   @State currentWidth: number = 0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
+  /** 内容列表 Scroller：「列数调整」切档后强制回到列表顶部用（2026-09-18） */
+  private listScroller: Scroller = new Scroller();
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位，否则回退自绘玻璃 TopBar（与 ThreadDetail 同判据） */
   @State materialSupported: boolean = false;
 
@@ -98,7 +104,23 @@ struct PersonalContent {
     // 首帧形态初值（§4.6 H-A / §4.8 T-B 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏
     // 若不预置会出现「先 1 列再跳 3/4 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
     this.refreshFormMetrics();
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     this.loadItems();
+  }
+
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回）→ 强制回到列表顶部。
+   * 默认档（0）与原自动适配逐像素一致，仅「用户显式选择」后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    try {
+      this.listScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
+    }
   }
 
   /** 形态度量回填：aboutToAppear 首帧（display 兜底猜测）+ 根 Stack onAreaChange（窗口实值）共用。
@@ -202,7 +224,7 @@ struct PersonalContent {
       } else if (this.state === LoadState.Empty) {
         EmptyView({ message: this.emptyMessage(), icon: '○' }).layoutWeight(1)
       } else {
-        List() {
+        List({ scroller: this.listScroller }) {
           // 预留顶栏高度作为初始间距
           ListItem() {
             Column().width('100%').height(98)
@@ -386,6 +408,14 @@ struct PersonalContent {
     // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
     if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
       return 1;
+    }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.isLandscape);
+      if (ov > 0) {
+        return ov;
+      }
     }
     // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径）
     if (isLargeFoldDevice()) {

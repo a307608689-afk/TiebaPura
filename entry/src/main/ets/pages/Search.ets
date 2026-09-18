@@ -31,7 +31,7 @@
 import { curves } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { TiebaService } from '../service/TiebaService';
 import {
   GlobalForumResult, GlobalForumSearchData, GlobalPostResult, GlobalPostSearchData,
@@ -57,6 +57,10 @@ const AVATAR_COLORS: string[] = ['#3173FF', '#8A5CF6', '#2CB883', '#F0576B', '#F
 struct GlobalQueryPage {
   @StorageLink('fontScale') fontScale: number = 1.0;
   @State fontSizeTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
   @State isDark: boolean = isDarkMode();
   // API26+ 真机沉浸光感：为 true 时 build 走官方 Tabs 悬浮条壳（底部模块栏整体入 .tabBar() 槽位，
   // 悬浮条本体挂 barFloatingStyle.systemMaterial 才渲染官方材质，与首页底栏同一机制）；其余走原手写真模糊兜底
@@ -108,6 +112,9 @@ struct GlobalQueryPage {
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
     this.isDark = isDarkMode();
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     const params = this.getUIContext().getRouter().getParams() as Record<string, string>;
     if (params && params.keyword && params.keyword.length > 0) {
       this.keyword = params.keyword;
@@ -146,11 +153,32 @@ struct GlobalQueryPage {
    * 结果列数：大屏竖屏 3 / 横屏 4（2026-09-15 用户拍板，与首页 §4.2 决策 12 同口径）。
    * 形态闸门必须放首行：只按宽度判会让手机横屏误命中多列（§6.1 D4）。
    */
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回，搜吧 / 搜贴 / 搜人三态共用）→ 强制回到列表顶部。
+   * 默认档（0）与原自动适配逐像素一致，仅「用户显式选择」后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    try {
+      this.scroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
+    }
+  }
+
   private searchColumns(): number {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
     if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
       return 1;
+    }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.isLandscape);
+      if (ov > 0) {
+        return ov;
+      }
     }
     // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径；搜吧 / 搜贴 / 搜人共用）
     if (isLargeFoldDevice()) {

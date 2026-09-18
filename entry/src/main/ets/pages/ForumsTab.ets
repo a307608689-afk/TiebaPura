@@ -26,7 +26,7 @@ import { AutoSignNotifier } from '../service/AutoSignNotifier';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { Haptic } from '../common/Haptic';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { compareByName } from '../common/Pinyin';
@@ -427,9 +427,15 @@ export struct ForumsTab {
   @State pageWidth: number = 0;
   /** 窗口高（vp）：与 pageWidth 配对判横竖屏 */
   @State pageHeight: number = 0;
+  /** 关注吧列表 Scroller：「列数调整」切档后强制回到列表顶部用（2026-09-18） */
+  private forumsScroller: Scroller = new Scroller();
   @StorageLink('fontScale') fontScale: number = 1.0;
   // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
   @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @StorageLink('tabLoginRefresh') @Watch('onLoginTick') tabLoginRefresh: number = 0;
   @StorageLink('forumsRefreshRequest') @Watch('onForumsRefresh') forumsRefreshRequest: number = 0;
@@ -553,6 +559,9 @@ export struct ForumsTab {
     } catch (e) {
       // 忽略：窗口未 attach，pageWidth 保持 0 → 列数回落手机档（安全方向）
     }
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     // 一键签到开关（慢速模式 / 官方一键签到）恢复：未初始化过才真正读缓存
     AutoSignManager.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
     if (this.loggedIn) {
@@ -562,6 +571,19 @@ export struct ForumsTab {
       this.loadForums();
     } else {
       this.forumState = LoadState.Empty;
+    }
+  }
+
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回）→ 强制回到列表顶部。
+   * 默认档（0）与原自动适配逐像素一致，仅「用户显式选择」后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    try {
+      this.forumsScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
     }
   }
 
@@ -1373,6 +1395,14 @@ export struct ForumsTab {
     if (this.pageWidth > 0 && this.pageWidth < 600) {
       return isWideBarDevice() ? 1 : 2;
     }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.isLandscape);
+      if (ov > 0) {
+        return ov;
+      }
+    }
     // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径）
     if (isLargeFoldDevice()) {
       return this.isLandscape ? 3 : 2;
@@ -1546,7 +1576,7 @@ export struct ForumsTab {
   @Builder
   ForumsContent() {
     Stack({ alignContent: Alignment.TopStart }) {
-      List() {
+      List({ scroller: this.forumsScroller }) {
         // 预留TopBar高度作为初始间距
         ListItem() {
           Column()

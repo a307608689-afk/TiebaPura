@@ -22,7 +22,7 @@ import { display } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { NotifyMessage } from '../model/DataModel';
-import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { formatTime } from '../common/Constants';
 
@@ -97,11 +97,34 @@ export struct MessagesTab {
   }
 
   /** 列数：大屏竖 3 / 横 4；窄窗与手机 1 列（形态闸门放首行，防手机横屏误命中） */
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回）→ 重算两个 Tab 的列分桶镜像 → 强制回到列表顶部。
+   * 默认档（0）与原自动适配逐像素一致，仅「用户显式选择」后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    this.syncAll();
+    try {
+      this.replyScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      this.atScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
+    }
+  }
+
   private notifyColumns(): number {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
     if (this.pageWidth > 0 && this.pageWidth < 600) {
       return 1;
+    }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.isLandscape());
+      if (ov > 0) {
+        return ov;
+      }
     }
     // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径）
     if (isLargeFoldDevice()) {
@@ -129,6 +152,10 @@ export struct MessagesTab {
   @StorageLink('fontScale') fontScale: number = 1.0;
   // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
   @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @StorageLink('tabLoginRefresh') @Watch('onLoginTick') tabLoginRefresh: number = 0;
 
@@ -159,6 +186,9 @@ export struct MessagesTab {
     } catch (e) {
       // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例；pageWidth=0 → notifyColumns()=1 安全方向
     }
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     this.enterPage();
   }
 

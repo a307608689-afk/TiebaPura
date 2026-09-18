@@ -27,7 +27,7 @@ import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { FollowFeedStore, POOL_HIGH, sortThreadsByTimeDesc } from '../service/FollowFeedStore';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
-import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 
@@ -140,6 +140,10 @@ export struct HomeTab {
   // 字号全局变更广播（2026-09-13）：从字号设置页返回时宿主自增，@Watch 回写 fontScale
   // 强制本页依赖刷新（离屏期间 @StorageLink 同步不重绘，工程已知问题）
   @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @State isDark: boolean = false;
   // 使用习惯：首页推荐仅显示关注吧的帖子（开关变化时自动刷新推荐流）
@@ -248,6 +252,9 @@ export struct HomeTab {
     } catch (e) {
       // 忽略：窗口未 attach 时取宽会失败，onAreaChange 会兜底
     }
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     // 无条件写列数标记（单列也写 1），避免跨页残留（§6.1 D1 / D6）
     this.syncCardColumns();
     // WaterFlow 竖屏 3 列 / 横屏 4 列（§4.2 决策 12）：首帧初值 + 监听方向变化
@@ -333,12 +340,35 @@ export struct HomeTab {
    * 列数：大屏竖屏 3 / 大屏横屏 4（§4.2 决策 12）；阔直屏竖 1 / 横 3（2026-09-17 用户改定）；手机（含横屏 / 分屏 / 自由多窗）与窄窗维持现状单列。
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
    */
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回）→ 重发 cardColumns → 强制回到两条 feed 的列表顶部。
+   * 默认档（0）与原自动适配逐像素一致，仅"用户显式选择"后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    this.syncCardColumns();
+    try {
+      this.homeScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      this.folScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
+    }
+  }
+
   private homeColumns(): number {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——必须放在设备恒值分支（阔直屏 / 大折叠直接 return this.columns）之前，
     // 否则设备恒值分支会绕过宽度兜底（小窗里 display 仍是横屏大屏 → 旧逻辑恒 3 列）
     if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
       return 1;
+    }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.pageWidth > this.pageHeight);
+      if (ov > 0) {
+        return ov;
+      }
     }
     // 阔直屏分支紧随其后（竖屏窗口宽 ~500 < 600 已被上面的窗口闸门回落 1 列，语义不变）
     if (isWideBarDevice()) {

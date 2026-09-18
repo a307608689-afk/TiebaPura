@@ -126,6 +126,11 @@ export interface CacheKeys {
   PIN_FOLLOW_FORUM: string;
   /** 首页推荐仅显示关注吧的帖子开关 */
   HOME_ONLY_FOLLOW: string;
+  /**
+   * 阔直屏「关闭自动旋转」开关（'1' = 已关闭自动旋转、固定竖屏；缺省/其他 = 允许旋转）。
+   * 仅阔直屏直板形态显示与生效，见 Theme.isWideBarFlatDevice()
+   */
+  AUTO_ROTATE: string;
   /** 软件手动深色模式（仅当 FOLLOW_SYSTEM_DARK=false 时生效；冷启动不再跟随系统时的回退值） */
   DARK_MODE: string;
   /** 是否跟随系统深色模式开关（默认 true：保持原 v1.x 「跟随系统」行为，首次启动不读 DARK_MODE） */
@@ -142,6 +147,12 @@ export interface CacheKeys {
   FORUM_SIGN_STATE: string;
   /** 已同意的隐私政策版本号：与 PRIVACY_POLICY_VERSION 比对，版本不一致需重新征得同意 */
   PRIVACY_AGREED: string;
+  /**
+   * 「列数调整」档位（'0' = 默认自动适配 / '1' = 竖二横三 / '2' = 竖三横四）。
+   * 仅在大屏形态（平板 / 2in1 / 阔直屏展开 / 大折叠展开 / Pura X Max 展开）生效；
+   * 缺省 null → 默认档，老用户升级逐像素零回归。
+   */
+  COLUMN_MODE: string;
 }
 
 // 缓存键
@@ -176,6 +187,7 @@ export const CACHE_KEY: CacheKeys = {
   FOLLOW_FORUM_SORT: 'follow_forum_sort',
   PIN_FOLLOW_FORUM: 'pin_follow_forum',
   HOME_ONLY_FOLLOW: 'tieba_home_only_follow',
+  AUTO_ROTATE: 'tieba_auto_rotate',
   DARK_MODE: 'tieba_dark_mode',
   FOLLOW_SYSTEM_DARK: 'tieba_follow_system_dark',
   FOLLOW_FEED: 'tieba_follow_feed',
@@ -184,6 +196,7 @@ export const CACHE_KEY: CacheKeys = {
   AUTO_SIGN_USE_OFFICIAL: 'auto_sign_use_official',
   FORUM_SIGN_STATE: 'tieba_forum_sign_state',
   PRIVACY_AGREED: 'tieba_privacy_agreed',
+  COLUMN_MODE: 'tieba_column_mode',
 };
 
 // 缓存过期时间接口

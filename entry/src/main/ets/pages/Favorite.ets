@@ -27,7 +27,7 @@ import { CategoryMapping, FavCategory, FolderItem, PostCardItem, PersonalContent
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { FavoriteStore, CATEGORY_DEFAULT_ID, BackupFolder, BackupImportSummary, BackupPayload } from '../service/FavoriteStore';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView, ThreadSharePayload } from '../components/CommonComponents';
 import { ListRowSkeleton } from '../components/Skeleton';
 import { FavCategoryPicker } from '../components/FavCategoryPicker';
@@ -678,6 +678,14 @@ export struct FavoriteTab {
     if (this.pageWidth > 0 && this.pageWidth < 600) {
       return 1;
     }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.isLandscape());
+      if (ov > 0) {
+        return ov;
+      }
+    }
     // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径）
     if (isLargeFoldDevice()) {
       return this.isLandscape() ? 3 : 2;
@@ -1104,6 +1112,10 @@ export struct FavoriteTab {
   @State fontSizeTick: number = 0;
   // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
   @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
 
   onPageShow(): void {
     this.fontSizeTick++;
@@ -1218,9 +1230,28 @@ export struct FavoriteTab {
     } catch (e) {
       // 忽略：窗口未 attach，fadeCoverVp 保持 0 → topFadeStop() 回退手机比例；pageWidth=0 → favColumns()=1 安全方向
     }
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     this.syncBackState();
     this.initSortState();
     this.loadAll();
+  }
+
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回）→ 强制回到列表顶部（分类 / 收藏夹 / 分类面板 / 帖子面板四个列表）。
+   * 默认档（0）与原自动适配逐像素一致，仅「用户显式选择」后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    try {
+      this.categoryScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      this.folderScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      this.panelThreadScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+      this.panelCategoryScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
+    }
   }
 
   /** v1.11 加载排序偏好与本地收藏时间 / 分类内帖子自定义顺序（异步，不阻塞首屏） */

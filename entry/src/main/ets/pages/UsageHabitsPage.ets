@@ -18,13 +18,15 @@
 
 import { common } from '@kit.AbilityKit';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
-import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop } from '../common/Theme';
+import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop, isWideBarFlatDevice } from '../common/Theme';
 import { BRAND_BLUE } from '../common/Constants';
 
 @Entry
 @Component
 struct UsageHabitsPage {
   @StorageLink('homeOnlyFollow') onlyFollow: boolean = false;
+  /** 「关闭自动旋转」开关（仅阔直屏直板显示；true = 已关闭自动旋转、固定竖屏） */
+  @StorageLink('autoRotateOff') autoRotateOff: boolean = false;
   @State isDark: boolean = isDarkMode();
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
@@ -78,6 +80,37 @@ struct UsageHabitsPage {
           .backgroundColor(Theme.bgCard(this.isDark))
           .borderRadius(Radius.lg)
           .margin({ top: Spacing.sm })
+
+          // 关闭自动旋转（仅阔直屏直板显示：只有该形态由本应用主动解锁了自动旋转）
+          if (isWideBarFlatDevice()) {
+            Row({ space: Spacing.md }) {
+              SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+                .fontColor([Theme.brand()])
+                .fontSize(fs(22, this.fontScale))
+
+              Column({ space: 2 }) {
+                Text('关闭自动旋转')
+                  .fontSize(fs(16, this.fontScale))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(Theme.textPrimary(this.isDark))
+                Text('开启后固定竖屏，不再自动转为横屏')
+                  .fontSize(fs(13, this.fontScale))
+                  .fontColor(Theme.textSecondary(this.isDark))
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+
+              Toggle({ type: ToggleType.Switch, isOn: this.autoRotateOff })
+                .selectedColor(BRAND_BLUE)
+                .onChange((isOn: boolean) => {
+                  UsageHabitsManager.getInstance().setAutoRotateOff(isOn);
+                })
+            }
+            .width('100%')
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.md })
+            .backgroundColor(Theme.bgCard(this.isDark))
+            .borderRadius(Radius.lg)
+          }
         }
         .width('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.xl })

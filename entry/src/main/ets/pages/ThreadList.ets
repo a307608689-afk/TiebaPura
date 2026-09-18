@@ -25,7 +25,7 @@ import { image } from '@kit.ImageKit';
 import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { ForumSignStore } from '../service/ForumSignStore';
 import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail } from '../model/DataModel';
-import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm } from '../common/Theme';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { LoadingView, EmptyView, ErrorView, ThreadCard, ThreadItemData, ThreadSharePayload, PinnedThreadItem } from '../components/CommonComponents';
@@ -560,6 +560,10 @@ struct ThreadList {
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
+  // 「列数调整」档位广播（2026-09-18，个性化 → 列数调整）：@Watch 回写本地档位 → 列数函数按新档返回并强制回到列表顶部
+  // （离屏期间 @StorageLink 同步不重绘，故用 tick + 本地 @State 兜底，同 fontTick 范式）
+  @StorageLink('columnModeTick') @Watch('onColumnModeTick') columnModeTick: number = 0;
+  @State columnMode: number = 0;
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位、FAB 走「空 tabBar 壳」槽位，
    *  否则回退页面主体自绘玻璃（与 ThreadDetail 同判据） */
   @State materialSupported: boolean = false;
@@ -906,6 +910,9 @@ struct ThreadList {
     } catch (e) {
       // 忽略：窗口未 attach 时取宽会失败，onAreaChange 会兜底
     }
+    // 「列数调整」档位初值（2026-09-18）：冷启动首帧即按已选档渲染
+    // （UsageHabitsManager.init 的 columnModeTick 可能早于本页构造，@Watch 不会补触发，故此处直读）
+    this.columnMode = readColumnMode();
     // 列数标记下发：**无条件写**（单列也写 1），避免跨页残留（§6.1 D1 / D6）
     this.syncCardColumns();
     // WaterFlow 分段初值（§4.8 T-G）：吧头跨列格子 + 主体多列格子
@@ -3530,11 +3537,34 @@ struct ThreadList {
    * 列数：大屏竖屏 3 / 横屏 4（与首页 §4.2 决策 12 同口径，§4.8 T-B）。
    * 形态闸门必须放首行：只按宽度判会让手机横屏（约 780vp ≥ 600）误命中多列（§6.1 D4）。
    */
+  /**
+   * 「列数调整」档位变化（个性化页写入 → `columnModeTick` 广播）：
+   * 回写本地档位（列数函数随新档返回）→ 重发 cardColumns → 重算 section 列数 → 强制回到列表顶部。
+   * 默认档（0）与原自动适配逐像素一致，仅「用户显式选择」后才改变列数。
+   */
+  private onColumnModeTick(): void {
+    this.columnMode = readColumnMode();
+    this.syncCardColumns();
+    this.syncSections();
+    try {
+      this.listScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (e) {
+    }
+  }
+
   private threadColumns(): number {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
     if (this.pageWidth > 0 && this.pageWidth < Breakpoint.sm) {
       return 1;
+    }
+    // 「列数调整」（2026-09-18，个性化 → 列数调整）：仅大屏形态（平板 / 阔直屏 / 大折叠展开）生效，
+    // 窄窗与手机档已由上面的窗口闸门返回不受影响；默认档 ov=0 → 原样走下面自动适配分支（逐像素零回归）
+    if (isLargeScreenForm(this.isWideFormDevice)) {
+      const ov: number = overrideColumns(this.columnMode, this.isLandscape);
+      if (ov > 0) {
+        return ov;
+      }
     }
     // 大折叠（docs/TiebaPura大折叠适配.md §4.2）：竖 2 / 横 3（2026-09-17 用户改定，与阔直屏同口径；吧主页与吧搜索态共用）
     if (isLargeFoldDevice()) {

@@ -20,7 +20,7 @@ import { AbilityConstant, UIAbility, Want, common, ConfigurationConstant, Config
 import { window } from '@kit.ArkUI';
 import { preferences } from '@kit.ArkData';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig, isWideBarDevice, isLargeFoldDevice } from '../common/Theme';
+import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig, isWideBarDevice, isLargeFoldDevice, isWideBarFlatDevice } from '../common/Theme';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { CacheManager, STORE_NAME } from '../cache/CacheManager';
 import { CACHE_KEY } from '../common/Constants';
@@ -88,10 +88,16 @@ export default class EntryAbility extends UIAbility {
         // （Theme.bg 深色档 #101114 / 浅色档 #F2F4F7），压缩遮罩消失→页面首帧之间的色差闪。
         // 注意：官方约束 setWindowBackgroundColor 必须在 loadContent 生效后调用，且为同步 void
         // 签名（无 Promise），故放在回调内 try/catch 兜底。同进度同步读 preferences（getPreferencesSync）。
+        // 「关闭自动旋转」（阔直屏直板专用）冷启动取值容器：必须声明在下方 splash 的 try 块**外**，
+        // 因为方向下发发生在该 try 之后（prefs 是块级作用域，出了块不可见）。
+        // 取值失败 / 抛异常时保持 false = 允许旋转（安全方向，零回归）。
+        let bootAutoRotateOff: boolean = false;
         try {
           const prefs: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: STORE_NAME });
           const splashFollowSys: boolean = prefs.getSync(CACHE_KEY.FOLLOW_SYSTEM_DARK, '1') !== '0';
           const splashManualDark: boolean = prefs.getSync(CACHE_KEY.DARK_MODE, '0') === '1';
+          // 借同一次同步读把「关闭自动旋转」开关也取出来（'1' = 已关闭自动旋转），供下方方向下发使用
+          bootAutoRotateOff = prefs.getSync(CACHE_KEY.AUTO_ROTATE, '0') === '1';
           const splashSysDark: boolean =
             this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
           mainWindow.setWindowBackgroundColor((splashFollowSys ? splashSysDark : splashManualDark)
@@ -105,9 +111,19 @@ export default class EntryAbility extends UIAbility {
         // 是关的 → 大屏形态下永远竖屏、横屏列数不可达。AUTO_ROTATION = 跟随重力、
         // 不受系统开关限制；非大屏设备（含折叠态）不进此分支，回归默认 unspecified 行为。
         if (isWideBarDevice() || isLargeFoldDevice()) {
-          mainWindow.setPreferredOrientation(window.Orientation.AUTO_ROTATION).catch((err: Error) => {
-            hilog.error(0x0000, TAG, 'setPreferredOrientation(AUTO_ROTATION) failed: %{public}s',
-              JSON.stringify(err));
+          // 阔直屏**直板**额外受「关闭自动旋转」开关约束（设置-使用习惯，仅该形态显示该开关）：
+          // 开关打开 → 显式锁 PORTRAIT；未打开 → AUTO_ROTATION（原行为）。
+          // Pura X / Pura X Max 展开、大折叠展开都不在 isWideBarFlatDevice() 内 → 恒走 AUTO_ROTATION，
+          // 与本次改动前逐字节一致。
+          // 开关值取自上方 splash 段的同步读（bootAutoRotateOff）：UsageHabitsManager.init 在下方
+          // await 才执行，若等它则窗口已按横屏渲染一帧，关闭旋转的设备会先横后竖地闪一下。
+          const lockPortrait: boolean = isWideBarFlatDevice() && bootAutoRotateOff;
+          const targetOrientation: window.Orientation = lockPortrait
+            ? window.Orientation.PORTRAIT
+            : window.Orientation.AUTO_ROTATION;
+          mainWindow.setPreferredOrientation(targetOrientation).catch((err: Error) => {
+            hilog.error(0x0000, TAG, 'setPreferredOrientation(%{public}s) failed: %{public}s',
+              lockPortrait ? 'PORTRAIT' : 'AUTO_ROTATION', JSON.stringify(err));
           });
         }
         // 缓存主窗口：Theme.setDarkMode 切换深色时要同步状态栏内容色，避免每次异步 getLastWindow

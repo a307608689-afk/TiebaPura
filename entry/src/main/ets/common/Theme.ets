@@ -1063,6 +1063,40 @@ export function isWideBarDevice(): boolean {
   }
 }
 
+/**
+ * 阔直屏**直板**判定 —— 与 isWideBarDevice() 的折叠分支严格互斥，只认 `!isFoldable() && phone`：
+ * - 主判据：物理长宽比带 (1.4, 1.85)（与 isWideBarDevice 同口径，密度无关、旋转不变）
+ * - 型号兜底：WIDE_BAR_MODEL（VOL-AL00）
+ * - Pura X（VDE-AL00/AL10）、Pura X Max 展开、大折叠展开、平板**一律 false**。这里刻意**不**复用
+ *   isWideBarDevice 里那条 `isPuraXFoldModel()` 异常兜底（HAL 误报非折叠），保证「不做 Pura X」语义干净。
+ *
+ * 用途：**只**服务「关闭自动旋转」开关（使用习惯页显隐 + 宿主旋转下发），不参与列数/宽度档位判定
+ * （那些仍走 isWideBarDevice()）。直板形态判定在整个 App 生命周期内稳定，不存在折叠态来回翻档问题。
+ */
+export function isWideBarFlatDevice(): boolean {
+  try {
+    if (display.isFoldable()) {
+      return false;
+    }
+    if (deviceInfo.deviceType !== 'phone') {
+      return false;
+    }
+    if (deviceInfo.productModel === WIDE_BAR_MODEL) {
+      return true;
+    }
+    const d: display.Display = display.getDefaultDisplaySync();
+    const w: number = d.width;
+    const h: number = d.height;
+    if (w <= 0 || h <= 0) {
+      return false;
+    }
+    const ratio: number = Math.max(w, h) / Math.min(w, h);
+    return ratio > 1.4 && ratio < 1.85;
+  } catch (e) {
+    return false;
+  }
+}
+
 /** 首次判定时打一条探针日志：真机到手第一时间核对 productModel / 比例，校准阈值（阔直屏文档 §2.4-2） */
 function logWideBarProbe(ratio: number, hit: boolean): void {
   if (_wideBarProbeLogged) {
@@ -1225,6 +1259,50 @@ export function isWideFormDevice(): boolean {
     // 取值失败继续走阔直屏判定（其内部自带 try/catch）
   }
   return isWideBarDevice();
+}
+
+/**
+ * 「列数调整」（个性化 → 列数调整）当前档位：
+ * 0 = 默认（按机型自动适配横竖屏）/ 1 = 竖二横三 / 2 = 竖三横四。
+ * 读 AppStorage（UsageHabitsManager.init 冷启动恢复 + setColumnMode 写入）。
+ */
+export function readColumnMode(): number {
+  const v: number = AppStorage.get<number>('columnMode') ?? 0;
+  return (v === 1 || v === 2) ? v : 0;
+}
+
+/** 「列数调整」档位文案（设置项右侧状态 + 弹窗选项共用） */
+export function columnModeLabel(mode: number): string {
+  if (mode === 1) {
+    return '竖二横三';
+  }
+  if (mode === 2) {
+    return '竖三横四';
+  }
+  return '默认';
+}
+
+/**
+ * 是否「大屏形态」——「列数调整」**仅**在此生效：平板 / 2in1 / 阔直屏（Pura X 直板与展开、Pura X Max 展开）
+ * / 大折叠展开。手机档与窄窗（各页 pageWidth < 600 闸门已提前返回）一律不受影响。
+ * 入参传各页已判好的 isWideFormDevice 字段，避免重复取值。
+ */
+export function isLargeScreenForm(isWideForm: boolean): boolean {
+  return isWideForm || isWideBarDevice() || isLargeFoldDevice();
+}
+
+/**
+ * 「列数调整」覆盖值：mode=1 → 竖 2 / 横 3；mode=2 → 竖 3 / 横 4。
+ * 返回 0 表示「不覆盖」（默认档）→ 调用方继续走原自动适配分支（逐像素零回归）。
+ */
+export function overrideColumns(mode: number, isLandscape: boolean): number {
+  if (mode === 1) {
+    return isLandscape ? 3 : 2;
+  }
+  if (mode === 2) {
+    return isLandscape ? 4 : 3;
+  }
+  return 0;
 }
 
 /**
