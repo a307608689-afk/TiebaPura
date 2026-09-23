@@ -2974,6 +2974,10 @@ struct ThreadList {
                   .backgroundColor(Theme.bgCard(this.isDark))
                   // 卡片圆角 26：与首页 ThreadCard、详情页卡片、其余列表页卡片统一口径
                   .borderRadius(26)
+                  // 置顶块与首张帖子卡的间距：WaterFlow 的 rowsGap 不跨 section 生效
+                  // （置顶块与普通帖分属两个 section），须在此显式补回旧结构 Column({space:6})
+                  // 的 6vp 卡距，与帖-帖间距（rowsGap=6）保持一致；空置顶时不渲染本层、不多占。
+                  .margin({ bottom: 6 })
                 } else {
                   Column().width('100%').height(0)
                 }
