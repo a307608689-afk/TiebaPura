@@ -2816,13 +2816,14 @@ struct ThreadList {
           .hitTestBehavior(HitTestMode.None)
       }
       // 新页（当前内容）：位移与旧页层对向，见 Scroll 链上的 translate
-      // 非搜索态一律走本 WaterFlow（单列/多列仅 crossCount 不同），搜索态仍走下方 Scroll 分支。
-      // （2026-09-24：曾试过单列档「置顶块 + 普通帖」跨 section 虚拟化，真机出现整层不渲染——
-      //   对齐 docs/floor-vanish-viewport-fix.md 的虚拟容器视口剔除同类问题，已回退单一数据源口径。）
-      if (!this.searchMode) {
-        // ===== WaterFlow 整页滚动，吧头作为**跨列的首个格子**随内容滚动 =====
+      // 仅多列档走本 WaterFlow；单列档与搜索态走下方 Scroll + Column 全量分支——
+      // 单列置顶是「合并卡片」（「置顶」标签 + 多条同在一个 bgCard 容器），WaterFlow 逐格渲染
+      // 拼不出该样式，且虚拟容器在沉浸场景有视口剔除风险（docs/floor-vanish-viewport-fix.md，
+      // 2026-09-24 实证：跨 section 虚拟化真机整层不渲染，单列档勿再迁入 WaterFlow）。
+      if (this.threadColumns() > 1 && !this.searchMode) {
+        // ===== WaterFlow 整页滚动（多列档），吧头作为**跨列的首个格子**随内容滚动 =====
         // 与首页（§4.2 决策 12）同一套 WaterFlow；差异仅在分段（WaterFlowSections）：
-        //   section 0 = 吧头（crossCount 1）；section 1 = 主体（单列 crossCount 1 / 多列 3/4）。
+        //   section 0 = 吧头（crossCount 1）；section 1 = 主体（crossCount 3/4）。
         // 卡片一律取自然高度（不设 onGetItemMainSizeByIndex），置顶卡作为普通格子、不拉伸。
         // 下拉刷新（2026-09-22，docs/下拉刷新.md）：与首页/消息页/进吧页同款——Refresh 容器
         // margin 下移到顶栏之下（默认指示器随之出现在顶栏下方），定高扣除下移量防底部溢出；
