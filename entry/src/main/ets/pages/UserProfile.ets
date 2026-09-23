@@ -25,6 +25,7 @@ import { TiebaService, BlacklistPermOptions } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, formatTime, BRAND_BLUE } from '../common/Constants';
+import { PrefetchGate } from '../common/PrefetchGate';
 import { UserProfileModel, UserLikeItem, PersonalContentItem } from '../model/DataModel';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
@@ -55,6 +56,17 @@ const USER_PROFILE_OFFICIAL_TITLE_BAR: boolean = true;
 /** 槽位高度 = 44(状态栏让位) + 44(按钮行高) + 10(底部呼吸)，与旧悬浮 TopBar 的 padding 逐项一致；
  *  内容让位（头部 / 列表顶部留白）一行未改。 */
 const USER_PROFILE_TITLE_BAR_HEIGHT: number = 98;
+/**
+ * 他人信息页列表预加载阈值（vp，2026-09-19，同 docs/帖子预加载.md §2）：滚动到「距内容底部剩余距离 < 该值」时
+ * 提前静默加载下一页；页内两个列表均为 List（无内容总高接口）→ 内容高按卡片估算高折算。
+ */
+const PROFILE_PREFETCH_DISTANCE: number = 1000;
+/** 预加载触发的最小滚动增量（vp）：同一屏内只触发一次（节流） */
+const PROFILE_PREFETCH_THROTTLE: number = 120;
+/** Header 估算高兜底（vp）：Header 未进入视口 / 未测到实测值时使用（实测值优先，见 onProfileHeaderAreaChange） */
+const PROFILE_HEADER_FALLBACK_H: number = 460;
+/** 列表底部占位高（vp，与渲染 `Column().width('100%').height(160)` 同源），参与内容高估算 */
+const PROFILE_BOTTOM_SPACE: number = 160;
 
 // 兼容不同 SDK 版本 AvoidArea 字段结构（底部安全区高度）
 interface SafeAreaRect {
@@ -116,6 +128,24 @@ struct UserProfile {
   @State likesPage: number = 1;
   @State likesHasMore: boolean = true;
   @State likesLoadingMore: boolean = false;
+
+  // ===== 列表预加载（2026-09-19，docs/帖子预加载.md §2/§4.4）=====
+  // 两个列表均为 List（无内容总高接口）→ 内容高按卡片估算折算。以下均为普通字段（非 @State）：
+  // onScroll / onAreaChange 属高频回调，写入 @State 会白触发整树重建。
+  private postsViewportH: number = 0;
+  /**
+   * 帖子列表剩余距离预取闸门（2026-09-19 口径修正）：偏移只取 `Scroller.currentOffset()` 真值，
+   * 不再用 `onScroll` 回调入参（其语义在工具链间有差异，会让剩余距离恒小 → 预取乱触发或永不触发）。
+   */
+  private postsPrefetchGate: PrefetchGate = new PrefetchGate(PROFILE_PREFETCH_DISTANCE, 'UserProfile.posts', PROFILE_PREFETCH_THROTTLE);
+  /** 帖子列表请求代际：首屏自增，作废在途的「加载更多」结果 */
+  private postsLoadToken: number = 0;
+  /** Header 实测高（vp）：仅接受 >100 的有效值（ListItem 回收时可能回调 0） */
+  private postsHeaderH: number = PROFILE_HEADER_FALLBACK_H;
+  private likesViewportH: number = 0;
+  /** 关注的吧列表剩余距离预取闸门（口径同帖子列表） */
+  private likesPrefetchGate: PrefetchGate = new PrefetchGate(PROFILE_PREFETCH_DISTANCE, 'UserProfile.likes', PROFILE_PREFETCH_THROTTLE);
+  private likesLoadToken: number = 0;
 
   // 关注 / 拉黑交互
   @State isFollowed: boolean = false;
@@ -249,6 +279,9 @@ struct UserProfile {
     this.postsState = ProfileLoadState.Loading;
     this.postsPage = 1;
     this.postsHasMore = true;
+    // 首屏：递增代际作废在途的「加载更多」，并复位预加载节流基线
+    this.postsLoadToken++;
+    this.postsPrefetchGate.reset();
     try {
       const list = await TiebaService.getInstance().fetchUserContent(this.userId, 1, true);
       this.posts = list;
@@ -260,22 +293,93 @@ struct UserProfile {
     }
   }
 
-  private async loadPostsMore(): Promise<void> {
+  /**
+   * 翻下一页：silent=true 时为预加载触发（失败静默丢弃，不打断浏览），手动触底仍提示。
+   * await 后校验请求代际，首屏 / 切用户期间返回的旧页直接丢弃（防重复与错序）。
+   */
+  private async loadPostsMore(silent: boolean = false): Promise<void> {
     if (this.postsLoadingMore || !this.postsHasMore || this.postsState !== ProfileLoadState.Ready) {
       return;
     }
     this.postsLoadingMore = true;
+    const myToken: number = this.postsLoadToken;
     try {
       const next: number = this.postsPage + 1;
       const list = await TiebaService.getInstance().fetchUserContent(this.userId, next, true);
+      if (myToken !== this.postsLoadToken) {
+        return;
+      }
       this.posts = [...this.posts, ...list];
       this.postsPage = next;
       this.postsHasMore = list.length >= this.PAGE_SIZE;
     } catch (e) {
-      this.toast('更多帖子加载失败，请稍后重试', ToastType.Error);
+      if (!silent && myToken === this.postsLoadToken) {
+        this.toast('更多帖子加载失败，请稍后重试', ToastType.Error);
+      }
     } finally {
       this.postsLoadingMore = false;
     }
+  }
+
+  /**
+   * 帖子列表预加载（2026-09-19，docs/帖子预加载.md §2/§4.4）：滚动到「距内容底部剩余距离 < PROFILE_PREFETCH_DISTANCE」
+   * 时提前静默加载下一页，让追加落在视口下方、在用户滑到底部边界之前完成（避免边界回弹瞬间插入新内容造成抽搐）。
+   * onReachEnd 保留作兜底（列表不满一屏等）。List 无内容总高接口 → 内容高按卡片估算高折算（与列均衡分桶同源）。
+   * 双重防重：postsLoadingMore 状态锁 + 偏移 PROFILE_PREFETCH_THROTTLE 节流；loadPostsMore 内另做请求代际校验。
+   */
+  private onPostsScroll(_x: number, y: number): void {
+    if (this.postsLoadingMore || !this.postsHasMore || this.postsState !== ProfileLoadState.Ready) {
+      return;
+    }
+    const cards: PersonalContentItem[] = this.sortedPosts();
+    const cols: number = this.profileColumns();
+    let sum: number = 0;
+    for (let i = 0; i < cards.length; i++) {
+      sum += this.estimateProfilePostCard(cards[i]) + 8;
+    }
+    const contentH: number = this.postsHeaderH + (cols > 1 ? sum / cols : sum) + PROFILE_BOTTOM_SPACE;
+    // 偏移取 Scroller 真值（onScroll 回调入参语义在工具链间有差异，非绝对偏移会让剩余距离恒小）
+    if (this.postsPrefetchGate.should(PrefetchGate.absoluteY(this.postsScroller), contentH, this.postsViewportH)) {
+      this.loadPostsMore(true);
+    }
+  }
+
+  /** 帖子列表视口尺寸变化：记录 List 视口高（普通字段，避免写入 @State 触发整树重建） */
+  private onPostsViewportAreaChange(_old: Area, n: Area): void {
+    this.postsViewportH = n.height as number;
+  }
+
+  /** Header 实测高：仅接受 >100 的有效值（ListItem 回收 / 首帧布局中可能回调 0，忽略以免污染估算） */
+  private onProfileHeaderAreaChange(_old: Area, n: Area): void {
+    const h: number = n.height as number;
+    if (h > 100) {
+      this.postsHeaderH = h;
+    }
+  }
+
+  /**
+   * 关注的吧列表预加载（2026-09-19，docs/帖子预加载.md §2/§4.4）：同帖子列表口径，但无 Header →
+   * 内容高 = 顶部占位 98 + 列高（LikeCard 估算高之和 / 列数）+ 底部占位 160。
+   */
+  private onLikesScroll(_x: number, y: number): void {
+    if (this.likesLoadingMore || !this.likesHasMore || this.likesState !== ProfileLoadState.Ready) {
+      return;
+    }
+    const cols: number = this.profileColumns();
+    let sum: number = 0;
+    for (let i = 0; i < this.likes.length; i++) {
+      sum += this.estimateProfileLikeCard(this.likes[i]) + 8;
+    }
+    const contentH: number = 98 + (cols > 1 ? sum / cols : sum) + PROFILE_BOTTOM_SPACE;
+    // 偏移取 Scroller 真值（口径同帖子列表）
+    if (this.likesPrefetchGate.should(PrefetchGate.absoluteY(this.likesScroller), contentH, this.likesViewportH)) {
+      this.loadLikesMore(true);
+    }
+  }
+
+  /** 关注的吧列表视口尺寸变化：记录 List 视口高（普通字段，避免写入 @State 触发整树重建） */
+  private onLikesViewportAreaChange(_old: Area, n: Area): void {
+    this.likesViewportH = n.height as number;
   }
 
   /** createTime 解析为时间戳（兼容 unix 秒 / 毫秒 / 格式化串；格式待批 A 确认） */
@@ -337,6 +441,9 @@ struct UserProfile {
     this.likesState = ProfileLoadState.Loading;
     this.likesPage = 1;
     this.likesHasMore = true;
+    // 首屏：递增代际作废在途的「加载更多」，并复位预加载节流基线
+    this.likesLoadToken++;
+    this.likesPrefetchGate.reset();
     try {
       const result = await TiebaService.getInstance().fetchUserLikeList(this.userId, 1, this.PAGE_SIZE);
       this.likes = result.list;
@@ -355,19 +462,26 @@ struct UserProfile {
     }
   }
 
-  private async loadLikesMore(): Promise<void> {
+  private async loadLikesMore(silent: boolean = false): Promise<void> {
     if (this.likesLoadingMore || !this.likesHasMore || this.likesState !== ProfileLoadState.Ready) {
       return;
     }
     this.likesLoadingMore = true;
+    const myToken: number = this.likesLoadToken;
     try {
       const next: number = this.likesPage + 1;
       const result = await TiebaService.getInstance().fetchUserLikeList(this.userId, next, this.PAGE_SIZE);
+      if (myToken !== this.likesLoadToken) {
+        return;
+      }
       this.likes = [...this.likes, ...result.list];
       this.likesPage = next;
       this.likesHasMore = result.hasMore;
     } catch (e) {
-      this.toast('更多关注的吧加载失败，请稍后重试', ToastType.Error);
+      // 预加载（silent）失败静默丢弃，不打断浏览；手动触底仍提示
+      if (!silent && myToken === this.likesLoadToken) {
+        this.toast('更多关注的吧加载失败，请稍后重试', ToastType.Error);
+      }
     } finally {
       this.likesLoadingMore = false;
     }
@@ -617,6 +731,11 @@ struct UserProfile {
       }
     }
     if (w <= 0 || h <= 0) {
+      return;
+    }
+    // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期 onAreaChange 逐帧回调，同值重写 @State 会白触发
+    // 页面整树重渲染；本函数只有下面三个赋值、无别的副作用，值未变直接返回。
+    if (w === this.pageWidth && h === this.pageHeight) {
       return;
     }
     this.pageWidth = w;
@@ -1200,6 +1319,8 @@ struct UserProfile {
             this.Header()
           }
           .width('100%')
+          // Header 实测高（预加载剩余距离估算用；实测优先，取不到用 PROFILE_HEADER_FALLBACK_H）
+          .onAreaChange((_old: Area, n: Area) => { this.onProfileHeaderAreaChange(_old, n); })
 
           if (this.profileColumns() > 1) {
             // 多列档（§4.11，2026-09-15 用户拍板瀑布流竖 3 / 横 4）：列内独立堆叠（与首页 / §4.12 同款观感）。
@@ -1238,6 +1359,10 @@ struct UserProfile {
         .padding({ left: Spacing.lg, right: Spacing.lg })
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
+        // 剩余距离预加载（docs/帖子预加载.md §2）：距底 < PROFILE_PREFETCH_DISTANCE 时提前静默取下一页；
+        // onReachEnd 保留作兜底（列表不满一屏等）
+        .onScroll((_x: number, y: number) => { this.onPostsScroll(_x, y); })
+        .onAreaChange((_old: Area, n: Area) => { this.onPostsViewportAreaChange(_old, n); })
         .onReachEnd(() => { this.loadPostsMore(); })
       }
     }
@@ -1354,6 +1479,9 @@ struct UserProfile {
       .padding({ left: Spacing.lg, right: Spacing.lg })
       .scrollBar(BarState.Off)
       .edgeEffect(EdgeEffect.Spring)
+      // 剩余距离预加载（docs/帖子预加载.md §2）：同帖子列表口径；onReachEnd 保留作兜底
+      .onScroll((_x: number, y: number) => { this.onLikesScroll(_x, y); })
+      .onAreaChange((_old: Area, n: Area) => { this.onLikesViewportAreaChange(_old, n); })
       .onReachEnd(() => { this.loadLikesMore(); })
     }
   }

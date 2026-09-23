@@ -429,6 +429,15 @@ export struct ForumsTab {
   @State pageHeight: number = 0;
   /** 关注吧列表 Scroller：「列数调整」切档后强制回到列表顶部用（2026-09-18） */
   private forumsScroller: Scroller = new Scroller();
+  // 乐观关注变更暂存（2026-09-22）：吧主页广播 → 本地立即呈现。服务端关注列表接口有延迟，
+  // 网络对账时对未同步的增量做保留/剔除，10 分钟后放弃保留、交还服务端真相
+  private pendingAddItems: Map<string, FollowItem> = new Map();
+  private pendingAddTs: Map<string, number> = new Map();
+  private pendingRemoveTs: Map<string, number> = new Map();
+  // 上次关注列表静默对账时间：切 Tab 进页/返回本页的节流闸（60s 内不重复发请求）
+  private lastFollowsRefreshAt: number = 0;
+  // 下拉刷新进行中（2026-09-22）：Refresh 组件双向状态，落地后由 pullRefreshForums 收起
+  @State forumsPullRefreshing: boolean = false;
   @StorageLink('fontScale') fontScale: number = 1.0;
   // 字号全局变更广播（2026-09-13）：@Watch 回写 fontScale 强制本页依赖刷新（离屏缓存不重绘兜底）
   @StorageLink('fontTick') @Watch('onFontTick') fontTick: number = 0;
@@ -439,6 +448,8 @@ export struct ForumsTab {
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @StorageLink('tabLoginRefresh') @Watch('onLoginTick') tabLoginRefresh: number = 0;
   @StorageLink('forumsRefreshRequest') @Watch('onForumsRefresh') forumsRefreshRequest: number = 0;
+  // 关注/取关广播（2026-09-22）：吧主页 ThreadList 关注/取关成功后递增，本页静默重拉「我关注的吧」（不闪 Loading）
+  @StorageLink('forumFollowsChanged') @Watch('onFollowsChangedTick') forumFollowsChanged: number = 0;
 
   /**
    * 一键签到弹窗控制器（系统 CustomDialog + API 26 沉浸光感）。
@@ -597,10 +608,172 @@ export struct ForumsTab {
     this.fontScale = AppStorage.get<number>('fontScale') ?? 1.0;
   }
 
-  /** 从其它页面返回本页（Index.onPageShow 递增 forumsRefreshRequest）：静默刷新足迹（本地缓存直出，不发网络） */
+  /**
+   * 回到进吧页（Index 切 Tab 进入 / 从其它页面返回时递增 forumsRefreshRequest）：
+   * 足迹本地缓存直出；关注吧列表节流静默对账（60s 一次，有在途乐观增量时强制）。
+   * 注意本页为条件挂载（Index 动画 420ms 后 prevTab=-1，离开本 Tab 即卸载）：
+   * 切 Tab 进入走 aboutToAppear → loadForums 全量重拉；本 handler 只覆盖
+   * 「停留在本页时从路由页返回」（组件在挂载态，tick 可达）与外部变更对账。
+   */
   onForumsRefresh(): void {
+    console.info(`[FORUMS-FOLLOW] onForumsRefresh loggedIn=${this.loggedIn}`);
     if (this.loggedIn) {
       this.loadRecentForums();
+      this.refreshFollowsSilently(false);
+    }
+  }
+
+  /** 吧主页关注/取关成功广播（ThreadList 递增 forumFollowsChanged）：乐观更新 + 网络对账 */
+  onFollowsChangedTick(): void {
+    const name: string = AppStorage.get<string>('forumFollowsChangeName') ?? '';
+    const followed: string = AppStorage.get<string>('forumFollowsChangeFollowed') ?? '1';
+    if (name.length === 0) {
+      return;
+    }
+    const now: number = Date.now();
+    if (followed === '1') {
+      // 新关注：乐观插入（level 0 / 未签到 / 无热度 → 渲染时自动隐藏对应角标，无头像回落首字占位）
+      this.pendingRemoveTs.delete(name);
+      if (!this.pendingAddItems.has(name)) {
+        const item: FollowItem = {
+          forumId: AppStorage.get<string>('forumFollowsChangeFid') ?? '',
+          forumName: name,
+          level: 0,
+          exp: 0,
+          isSign: false,
+          memberCount: '',
+          avatar: AppStorage.get<string>('forumFollowsChangeAvatar') ?? ''
+        };
+        this.pendingAddItems.set(name, item);
+        this.pendingAddTs.set(name, now);
+      }
+      const pendingItem: FollowItem | undefined = this.pendingAddItems.get(name);
+      if (pendingItem && !this.follows.some((f: FollowItem) => f.forumName === name)) {
+        this.follows = [pendingItem].concat(this.follows);
+        this.syncFollows();
+        if (this.forumState !== LoadState.Loading && this.forumState !== LoadState.Error) {
+          this.forumState = LoadState.Success;
+        }
+      }
+    } else {
+      // 取关：乐观移除（含置顶清理，与页内长按取关同语义）并回写缓存
+      this.pendingAddItems.delete(name);
+      this.pendingAddTs.delete(name);
+      this.pendingRemoveTs.set(name, now);
+      if (this.follows.some((f: FollowItem) => f.forumName === name)) {
+        this.follows = this.follows.filter((f: FollowItem) => f.forumName !== name);
+        this.syncFollows();
+        if (this.follows.length === 0) {
+          this.forumState = LoadState.Empty;
+        }
+        CacheManager.getInstance().putWithTtl(CACHE_KEY.FOLLOW_LIST, this.follows, CACHE_TTL.FOLLOW_LIST).catch(() => {
+        });
+      }
+      if (this.isForumPinned(name)) {
+        this.pinnedForums = this.pinnedForums.filter((n: string) => n !== name);
+        this.savePinnedForums();
+      }
+    }
+    console.info(`[FORUMS-FOLLOW] optimistic ${followed === '1' ? 'add' : 'remove'}: ${name}`);
+    this.refreshFollowsSilently(true);
+  }
+
+  /**
+   * 静默刷新「我关注的吧」：不走 Loading 态（当前列表保持在场，避免闪屏），
+   * 网络返回后整体替换列表并回写缓存；失败保持现状。离屏期间 @State 已更新，
+   * 切回本 Tab 即按新列表渲染（与 fontTick/darkTick 同款 tick 联动范式）。
+   */
+  private async refreshFollowsSilently(force: boolean): Promise<void> {
+    if (!this.loggedIn) {
+      return;
+    }
+    // 节流：切 Tab 进页/返回本页的高频触发 60s 内只发一次请求；
+    // 应用内关注/取关广播（force）与有在途乐观增量时绕过节流
+    const now: number = Date.now();
+    const hasPending: boolean = this.pendingAddItems.size > 0 || this.pendingRemoveTs.size > 0;
+    if (!force && !hasPending && now - this.lastFollowsRefreshAt < 60 * 1000) {
+      return;
+    }
+    this.lastFollowsRefreshAt = now;
+    console.info(`[FORUMS-FOLLOW] refresh start force=${force}`);
+    try {
+      let list: FollowItem[] = await this.fetchAllFollowPages();
+      console.info(`[FORUMS-FOLLOW] refresh total=${list.length}`);
+      // 服务端关注列表可能滞后于关注/取关操作：对账保留未同步的乐观增量
+      this.prunePendingFollows();
+      if (list.length > 0) {
+        this.pendingRemoveTs.forEach((_ts: number, removeName: string) => {
+          list = list.filter((f: FollowItem) => f.forumName !== removeName);
+        });
+        this.pendingAddItems.forEach((item: FollowItem, addName: string) => {
+          if (!list.some((f: FollowItem) => f.forumName === addName)) {
+            list = [item].concat(list);
+          }
+        });
+      }
+      this.follows = list;
+      this.syncFollows();
+      if (this.forumState !== LoadState.Loading) {
+        this.forumState = list.length > 0 ? LoadState.Success : LoadState.Empty;
+      }
+      if (list.length > 0) {
+        await CacheManager.getInstance().putWithTtl(CACHE_KEY.FOLLOW_LIST, list, CACHE_TTL.FOLLOW_LIST);
+      }
+      // 新关注吧可能补齐足迹头像
+      this.enrichRecentAvatars();
+    } catch (e) {
+      // 静默失败：保持当前列表与状态
+      console.info(`[FORUMS-FOLLOW] silent refresh failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** 清理过期的乐观增量暂存（10 分钟）：过期后交还服务端真相 */
+  private prunePendingFollows(): void {
+    const cutoff: number = Date.now() - 10 * 60 * 1000;
+    const expiredAdds: string[] = [];
+    const expiredRemoves: string[] = [];
+    this.pendingAddTs.forEach((ts: number, name: string) => {
+      if (ts < cutoff) {
+        expiredAdds.push(name);
+      }
+    });
+    this.pendingRemoveTs.forEach((ts: number, name: string) => {
+      if (ts < cutoff) {
+        expiredRemoves.push(name);
+      }
+    });
+    for (const name of expiredAdds) {
+      this.pendingAddItems.delete(name);
+      this.pendingAddTs.delete(name);
+      this.pendingRemoveTs.delete(name);
+    }
+    for (const name of expiredRemoves) {
+      this.pendingRemoveTs.delete(name);
+    }
+  }
+
+  /**
+   * 下拉刷新（2026-09-22）：足迹本地直出 + 关注吧列表全量重拉。
+   * 保持当前列表在场（不切 Loading 态、不闪屏），数据落地后收起刷新指示器；
+   * 复用 refreshFollowsSilently(true) 绕过节流并带乐观增量对账。
+   * ⚠️ 必须显式走 false→true→false 的变化链（与首页推荐页同款）：Refresh 组件
+   * 依赖绑定的 refreshing 变量出现 true→false 变化沿才收起指示器，若只依赖
+   * 框架回写（变量恒 false）指示器会永远停在刷新中。
+   */
+  private async pullRefreshForums(): Promise<void> {
+    this.forumsPullRefreshing = true;
+    // 看门狗：弱网/接口挂起时 15s 强制收起指示器，避免永远转圈
+    const watchdog: number = setTimeout(() => {
+      this.forumsPullRefreshing = false;
+    }, 15000);
+    try {
+      if (this.loggedIn) {
+        this.loadRecentForums();
+        await this.refreshFollowsSilently(true);
+      }
+    } finally {
+      clearTimeout(watchdog);
+      this.forumsPullRefreshing = false;
     }
   }
 
@@ -625,6 +798,37 @@ export struct ForumsTab {
     this.onFollowsSync(this.follows.slice());
   }
 
+  /**
+   * 拉取全量关注吧列表（跨页合并去重）。接口按 50/页分页且顺序与关注时间无关——
+   * 此前只拉第 1 页，第 51 个之后的关注吧（含新关注的吧）永远不显示（2026-09-22 实测
+   * 65 个关注、原神在第 2 页）。上限 10 页 = 500 个，足够覆盖。
+   */
+  private async fetchAllFollowPages(): Promise<FollowItem[]> {
+    const seen: Set<string> = new Set<string>();
+    const all: FollowItem[] = [];
+    let page: number = 1;
+    let hasMore: boolean = true;
+    while (hasMore && page <= 10) {
+      let batch: FollowItem[] = [];
+      try {
+        const result = await TiebaService.getInstance().fetchFollowList(page);
+        batch = result.list;
+        hasMore = result.hasMore && result.list.length > 0;
+      } catch (e) {
+        // 某页失败：用已拉到的部分兜底（至少第 1 页在列）
+        hasMore = false;
+      }
+      for (const f of batch) {
+        if (!seen.has(f.forumName)) {
+          seen.add(f.forumName);
+          all.push(f);
+        }
+      }
+      page++;
+    }
+    return all;
+  }
+
   async loadForums(): Promise<void> {
     if (!this.loggedIn) {
       this.forumState = LoadState.Empty;
@@ -639,12 +843,13 @@ export struct ForumsTab {
         this.syncFollows();
         this.forumState = LoadState.Success;
       }
-      const result = await TiebaService.getInstance().fetchFollowList(1);
-      this.follows = result.list;
+      const list = await this.fetchAllFollowPages();
+      console.info(`[FORUMS-FOLLOW] loadForums network total=${list.length}`);
+      this.follows = list;
       this.syncFollows();
-      this.forumState = result.list.length > 0 ? LoadState.Success : LoadState.Empty;
-      if (result.list.length > 0) {
-        await CacheManager.getInstance().putWithTtl(CACHE_KEY.FOLLOW_LIST, result.list, CACHE_TTL.FOLLOW_LIST);
+      this.forumState = list.length > 0 ? LoadState.Success : LoadState.Empty;
+      if (list.length > 0) {
+        await CacheManager.getInstance().putWithTtl(CACHE_KEY.FOLLOW_LIST, list, CACHE_TTL.FOLLOW_LIST);
       }
       // 关注列表已就绪：补齐足迹头像（先查关注吧，仍缺的再按吧名拉取并回写历史缓存）
       this.enrichRecentAvatars();
@@ -1195,6 +1400,8 @@ export struct ForumsTab {
       this.getUIContext().getPromptAction().showToast({ message: '贴吧信息暂不可用' });
       return;
     }
+    // 点击即预取：利用路由转场窗口后台取吧首屏，吧页打开时经在途合流消费，不新增请求
+    TiebaService.getInstance().prefetchForumThreads(forumName);
     this.getUIContext().getRouter().pushUrl({
       url: 'pages/ThreadList',
       params: { kw: forumName, fid: forumId }
@@ -1578,14 +1785,11 @@ export struct ForumsTab {
   @Builder
   ForumsContent() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 下拉刷新（2026-09-22）：与首页推荐/消息页同款——Refresh 容器 margin 下移到标题栏之下
+      // （系统默认指示器随之出现在标题栏下方），定高扣除下移量避免底部溢出；原 90vp 顶部占位
+      // ListItem 由该 margin 接管，内容起点逐像素不变。全量重拉不闪 Loading
+      Refresh({ refreshing: this.forumsPullRefreshing, offset: 48, friction: 62 }) {
       List({ scroller: this.forumsScroller }) {
-        // 预留TopBar高度作为初始间距
-        ListItem() {
-          Column()
-            .width('100%')
-            .height(90)
-        }
-        .backgroundColor(Color.Transparent)
 
         if (!this.loggedIn) {
           ListItem() {
@@ -1877,13 +2081,20 @@ export struct ForumsTab {
           .padding({ bottom: 150 })
         }
       }
-    }
-    .width('100%')
-    .layoutWeight(1)
-    .padding({ bottom: 150 })
-    .scrollBar(BarState.Off)
-    .clip(false)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ bottom: 150 })
+      .scrollBar(BarState.Off)
+      .clip(false)
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      }
+      .width('100%')
+      .height('calc(100% - 90vp)')
+      .margin({ top: 90 })
+      // 与首页同款：Refresh 自身不裁切 → 列表内容可溢出到材质顶栏之下渲染（顶部沉浸的关键）
+      .clip(false)
+      .onRefreshing(() => { this.pullRefreshForums(); })
 
     // §4.1 顺带（2026-09-14）：顶部渐显带改挂页面层（盖列表内容）；位置在悬浮 TopBar **之前**，
     // 故不会盖住顶栏按钮——官方 title 槽位路径 TopBar 在 Navigation title 层，更不受影响
@@ -1921,6 +2132,11 @@ export struct ForumsTab {
     .onAreaChange((oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
       const height = newValue.height as number;
+      // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期逐帧回调，同值重写下面四个 @State 会白触发整树
+      // 重渲染；本页 isWideScreen 只由 width 推导（不依赖折叠运行时状态），可一并短路。
+      if (width === this.pageWidth && height === this.pageHeight) {
+        return;
+      }
       this.isWideScreen = width >= 840;
       // §4.1：窗口宽 / 高 → 列数判定
       this.pageWidth = width;

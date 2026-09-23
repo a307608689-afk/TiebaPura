@@ -70,15 +70,31 @@ export class UsageHabitsManager {
       const savedColumnMode = await cache.get(CACHE_KEY.COLUMN_MODE);
       const cm: number = Number.parseInt(savedColumnMode ?? '0', 10);
       AppStorage.setOrCreate('columnMode', (cm === 1 || cm === 2) ? cm : 0);
+      // 「帖子沉浸式阅读」：缺省 null → 关闭，老用户升级零行为变化
+      const savedImmersiveRead = await cache.get(CACHE_KEY.IMMERSIVE_READ);
+      AppStorage.setOrCreate('immersiveReading', savedImmersiveRead === '1');
+      // 「帖子极速开启」：缺省 null → 开启（用户拍板默认开启），仅老用户显式关闭过才保持关
+      const savedFastOpen = await cache.get(CACHE_KEY.THREAD_FEED_PREFETCH);
+      AppStorage.setOrCreate('threadFastOpen', savedFastOpen !== '0');
+      // 「仅 WiFi 启用」：缺省 null → 开启（用户拍板默认开启），主开关开启时生效
+      const savedFastWifi = await cache.get(CACHE_KEY.THREAD_FAST_WIFI);
+      AppStorage.setOrCreate('threadFastWifi', savedFastWifi !== '0');
+      // 「吧主页默认进入界面」：缺省 null → 0（热门，用户拍板默认档），老用户升级零回归
+      const savedForumSort = await cache.get(CACHE_KEY.FORUM_DEFAULT_SORT);
+      AppStorage.setOrCreate('forumDefaultSort', savedForumSort === '1' ? 1 : 0);
       // 冷启动可能早于各列表页构造：bump 一次 tick，让已构造的页面重读档位（未构造页 aboutToAppear 自会读）
       AppStorage.setOrCreate('columnModeTick', (AppStorage.get<number>('columnModeTick') ?? 0) + 1);
     } catch (e) {
-      // 忽略缓存错误，使用默认值（关闭 / 跟随系统 / 允许旋转 / 列数默认档）
+      // 忽略缓存错误，使用默认值（关闭 / 跟随系统 / 允许旋转 / 列数默认档 / 沉浸阅读关）
       AppStorage.setOrCreate('homeOnlyFollow', false);
       AppStorage.setOrCreate('appFollowSystemDark', true);
       AppStorage.setOrCreate('appDarkMode', false);
       AppStorage.setOrCreate('autoRotateOff', false);
       AppStorage.setOrCreate('columnMode', 0);
+      AppStorage.setOrCreate('immersiveReading', false);
+      AppStorage.setOrCreate('threadFastOpen', true);
+      AppStorage.setOrCreate('threadFastWifi', true);
+      AppStorage.setOrCreate('forumDefaultSort', 0);
     }
   }
 
@@ -178,6 +194,106 @@ export class UsageHabitsManager {
     }
   }
 
+  /**
+   * 当前是否开启「帖子沉浸式阅读」（详情页向下滑动自动收起顶栏与底栏）。默认 false，保持既有行为。
+   * 真源为 AppStorage（详情页 / 楼中楼页用 @StorageLink 直接同步），manager 只负责冷启动恢复与落盘。
+   */
+  isImmersiveReading(): boolean {
+    return AppStorage.get<boolean>('immersiveReading') ?? false;
+  }
+
+  /**
+   * 设置「帖子沉浸式阅读」：立即更新 AppStorage 并落盘。
+   * 注意：页面内「已藏起」是页面局部 @State（绝不写 AppStorage，否则切页 / 换帖会残留隐藏态）；
+   * 详情页以 @Watch 监听本值，关闭开关时立即把顶栏与底栏恢复显示。
+   */
+  async setImmersiveReading(enabled: boolean): Promise<void> {
+    AppStorage.setOrCreate('immersiveReading', enabled);
+    this.persistImmersiveRead(enabled).catch(() => {
+    });
+  }
+
+  /**
+   * 当前是否开启「帖子极速开启」（feed 首屏前 3 卡详情+图片预取）。默认 false（关闭），用户拍板。
+   * 真源为 AppStorage（服务层预取入口直接读），manager 只负责冷启动恢复与落盘。
+   */
+  isThreadFastOpen(): boolean {
+    return AppStorage.get<boolean>('threadFastOpen') ?? true;
+  }
+
+  /** 设置「帖子极速开启」：立即更新 AppStorage 并落盘。 */
+  async setThreadFastOpen(enabled: boolean): Promise<void> {
+    AppStorage.setOrCreate('threadFastOpen', enabled);
+    this.persistThreadFastOpen(enabled).catch(() => {
+    });
+  }
+
+  private async persistThreadFastOpen(enabled: boolean): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.THREAD_FEED_PREFETCH, enabled ? '1' : '0');
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
+  /** 当前是否「仅 WiFi 启用」极速预取。默认 true（开启）。 */
+  isThreadFastWifi(): boolean {
+    return AppStorage.get<boolean>('threadFastWifi') ?? true;
+  }
+
+  /** 设置「仅 WiFi 启用」：立即更新 AppStorage 并落盘。 */
+  async setThreadFastWifi(enabled: boolean): Promise<void> {
+    AppStorage.setOrCreate('threadFastWifi', enabled);
+    this.persistThreadFastWifi(enabled).catch(() => {
+    });
+  }
+
+  private async persistThreadFastWifi(enabled: boolean): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.THREAD_FAST_WIFI, enabled ? '1' : '0');
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
+  /**
+   * 当前「吧主页默认进入界面」档位：0 = 热门（默认）/ 1 = 最新。
+   * 真源为 AppStorage（吧主页 ThreadList aboutToAppear 直读），manager 只负责冷启动恢复与落盘。
+   */
+  getForumDefaultSort(): number {
+    return (AppStorage.get<number>('forumDefaultSort') ?? 0) === 1 ? 1 : 0;
+  }
+
+  /** 设置「吧主页默认进入界面」档位：立即更新 AppStorage 并落盘。 */
+  async setForumDefaultSort(mode: number): Promise<void> {
+    const v: number = mode === 1 ? 1 : 0;
+    AppStorage.setOrCreate('forumDefaultSort', v);
+    await this.persistForumDefaultSort(v);
+  }
+
+  private async persistForumDefaultSort(mode: number): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.FORUM_DEFAULT_SORT, `${mode}`);
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
   private async persistDarkMode(enabled: boolean): Promise<void> {
     if (!this.context) {
       return;
@@ -186,6 +302,19 @@ export class UsageHabitsManager {
       const cache = CacheManager.getInstance();
       await cache.init(this.context);
       await cache.put(CACHE_KEY.DARK_MODE, enabled ? '1' : '0');
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
+  private async persistImmersiveRead(enabled: boolean): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.IMMERSIVE_READ, enabled ? '1' : '0');
     } catch (e) {
       // 忽略持久化错误
     }

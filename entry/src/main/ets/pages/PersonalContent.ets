@@ -17,13 +17,15 @@
  */
 
 import { CacheManager } from '../cache/CacheManager';
-import { CACHE_KEY } from '../common/Constants';
+import { CACHE_KEY, formatTime } from '../common/Constants';
+import { PrefetchGate } from '../common/PrefetchGate';
 import { PersonalContentItem, PagedResult } from '../model/DataModel';
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
+import { HistoryStore } from '../service/HistoryStore';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
-import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
+import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 
 enum PersonalMode {
@@ -50,6 +52,15 @@ const PERSONAL_CONTENT_TITLE_BAR_HEIGHT: number = 98;
  * 只有极端长短交错才补位。
  */
 const PERSONAL_COL_BALANCE_THRESHOLD: number = 240;
+
+/**
+ * 列表预加载阈值（vp，2026-09-19，同 docs/帖子预加载.md §2）：滚动到「距内容底部剩余距离 < 该值」时
+ * 提前静默加载下一页，让追加落在视口下方、在用户滑到底部边界之前完成，避免「边界回弹瞬间插入新内容」造成抽搐。
+ * List 无内容总高接口 → 内容高按 ContentCard 估算高（estimateContentCardHeight）折算，与列均衡分桶同式。
+ */
+const PERSONAL_PREFETCH_DISTANCE: number = 1000;
+/** 预加载触发的最小滚动增量（vp）：同一屏内只触发一次，防逐帧回调反复穿透状态锁（节流） */
+const PERSONAL_PREFETCH_THROTTLE: number = 120;
 
 @Entry
 @Component
@@ -83,15 +94,40 @@ struct PersonalContent {
   @State columnMode: number = 0;
   /** 内容列表 Scroller：「列数调整」切档后强制回到列表顶部用（2026-09-18） */
   private listScroller: Scroller = new Scroller();
+  /** 下拉刷新进行中（2026-09-22，docs/下拉刷新.md）：显式 true→false 变化链 + 看门狗 */
+  @State pullRefreshing: boolean = false;
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位，否则回退自绘玻璃 TopBar（与 ThreadDetail 同判据） */
   @State materialSupported: boolean = false;
 
   onPageShow(): void {
     this.fontSizeTick++;
+    // 浏览历史「实时更新」（2026-09-23）：本页被别的页面盖住后重新显示（例如从历史里点开帖子再返回）时
+    // 重读本地记录，让刚浏览的帖立刻回到列表顶部。仅历史模式重读——点赞 / 收藏是云端分页，
+    // 每次回页都重拉会打断浏览（点赞翻页重排曾出现抽搐）。首次 onPageShow 与 aboutToAppear 的
+    // 首次加载重合，用 pageShownOnce 跳过以免重复读盘。
+    if (this.mode === PersonalMode.History) {
+      if (this.pageShownOnce) {
+        this.loadItems(true);
+      } else {
+        this.pageShownOnce = true;
+      }
+    }
   }
+  /** onPageShow 是否已出现过一次（跳过与 aboutToAppear 重合的首帧） */
+  private pageShownOnce: boolean = false;
   private pageSize: number = 20;
   /** 「我的点赞」云端已加载到的页码（1 基，与服务端 pn 语义一致） */
   private likesPage: number = 0;
+  // ===== 列表预加载（2026-09-19，docs/帖子预加载.md §2）=====
+  /** List 视口高（vp，onAreaChange 实测）；普通字段（非 @State）避免高频回调触发整树重建 */
+  private viewportH: number = 0;
+  /**
+   * 剩余距离预取闸门（2026-09-19 口径修正）：偏移只取 `Scroller.currentOffset()` 真值，
+   * 不再用 `onScroll` 回调入参（其语义在工具链间有差异，会让剩余距离恒小 → 预取乱触发或永不触发）。
+   */
+  private prefetchGate: PrefetchGate = new PrefetchGate(PERSONAL_PREFETCH_DISTANCE, 'PersonalContent');
+  /** 请求代际：首屏 / 重新加载自增，作废在途的「加载更多」结果 */
+  private loadToken: number = 0;
 
   aboutToAppear(): void {
     MaterialManager.init();
@@ -141,6 +177,11 @@ struct PersonalContent {
     if (w <= 0 || h <= 0) {
       return;
     }
+    // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期 onAreaChange 逐帧回调，同值重写 @State 会白触发
+    // 页面整树重渲染；本函数只有下面三个赋值、无别的副作用，值未变直接返回。
+    if (w === this.pageWidth && h === this.pageHeight) {
+      return;
+    }
     this.pageWidth = w;
     this.pageHeight = h;
     this.isLandscape = w > h;
@@ -153,10 +194,16 @@ struct PersonalContent {
     return '我的帖子';
   }
 
-  private async loadItems(): Promise<void> {
+  private async loadItems(silent: boolean = false): Promise<void> {
     if (this.loading) return;
     this.loading = true;
-    this.state = LoadState.Loading;
+    // 首屏 / 重新加载：递增代际作废在途的「加载更多」，并复位预加载节流基线
+    this.loadToken++;
+    this.prefetchGate.reset();
+    // silent（下拉刷新）：不切 Loading 态，保持当前列表在场，结果返回后一次性替换
+    if (!silent) {
+      this.state = LoadState.Loading;
+    }
     try {
       if (this.mode === PersonalMode.Posts) {
         const list = await TiebaService.getInstance().fetchUserContent(this.accountId, 1, true);
@@ -172,19 +219,46 @@ struct PersonalContent {
       } else if (this.mode === PersonalMode.Likes) {
         await this.loadLikes();
       } else {
-        const baseKey: string = CACHE_KEY.PERSONAL_HISTORY;
-        const cached = await CacheManager.getInstance().get(`${baseKey}_${this.accountId}`);
-        this.items = cached ? this.sortItems(JSON.parse(cached) as PersonalContentItem[]) : [];
+        // 浏览历史（2026-09-23 修复）：读 HistoryStore —— 同帖去重 + 按**浏览时间**倒序。
+        // 旧实现直接读原始数组再按 createTime（帖子**发布时间**的展示串，如「54 分钟前」「09-21 19:34」）
+        // 排序，而 Date.parse 对这两类串的结果分别是 0 与 2001 年 → 排序与浏览先后无关，
+        // 刚浏览的帖（相对时间串）被压到列表最底部，表现为「刚浏览过的帖在历史里看不到」。
+        this.items = await HistoryStore.getInstance().load(this.accountId);
         this.hasMore = false;
       }
       this.state = this.items.length > 0 ? LoadState.Success : LoadState.Empty;
     } catch (e) {
-      this.items = [];
-      this.state = LoadState.Error;
       const message: string = e instanceof Error ? e.message : `${e}`;
-      this.errorMsg = message.trim().length > 0 ? message : `${this.title}加载失败，请稍后重试`;
+      if (silent && this.items.length > 0) {
+        // 静默刷新失败且已有内容：保留旧列表只提示，不清空、不落错误页
+        this.getUIContext().getPromptAction().showToast({
+          message: `刷新失败：${message.trim().length > 0 ? message : '请稍后重试'}`
+        });
+      } else {
+        this.items = [];
+        this.state = LoadState.Error;
+        this.errorMsg = message.trim().length > 0 ? message : `${this.title}加载失败，请稍后重试`;
+      }
     } finally {
       this.loading = false;
+    }
+  }
+
+  /**
+   * 下拉刷新（2026-09-22，docs/下拉刷新.md）：走 loadItems(silent=true)——
+   * 保列表在场、不切 Loading；进入即显式置 true（false→true→false 变化链，否则指示器永久转圈），
+   * 15s 看门狗兜底强制收起。
+   */
+  private async pullRefresh(): Promise<void> {
+    this.pullRefreshing = true;
+    const watchdog: number = setTimeout(() => {
+      this.pullRefreshing = false;
+    }, 15000);
+    try {
+      await this.loadItems(true);
+    } finally {
+      clearTimeout(watchdog);
+      this.pullRefreshing = false;
     }
   }
 
@@ -224,11 +298,11 @@ struct PersonalContent {
       } else if (this.state === LoadState.Empty) {
         EmptyView({ message: this.emptyMessage(), icon: '○' }).layoutWeight(1)
       } else {
+        // 下拉刷新（2026-09-22，docs/下拉刷新.md）：与首页/消息页/进吧页同款——Refresh 容器
+        // margin 下移到顶栏之下（默认指示器随之出现在顶栏下方），定高扣除下移量防底部溢出；
+        // 内容里原 98vp 顶栏让位与顶部渐显带（容器高度比例，会随容器下移压到首卡上）一并交接/移除
+        Refresh({ refreshing: this.pullRefreshing, offset: 48, friction: 62 }) {
         List({ scroller: this.listScroller }) {
-          // 预留顶栏高度作为初始间距
-          ListItem() {
-            Column().width('100%').height(98)
-          }
           if (this.pcColumns() > 1) {
             // 多列档（§4.11 P-B，2026-09-14）：列内独立堆叠瀑布流（与首页 / 收藏页 / 搜索页同款观感）。
             // 结构照收藏页五轮教训：外层 ForEach **只遍历列索引**（key 稳定 → 列容器复用），
@@ -264,13 +338,15 @@ struct PersonalContent {
             }, (item: PersonalContentItem) => item.tid)
           }
         }
-        .layoutWeight(1)
+        .height('100%')
         .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
         .scrollBar(BarState.Off)
         .clip(false)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .overlay(this.BottomFadeOverlay())
-        .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+        // 剩余距离预加载（docs/帖子预加载.md §2/§4.4）：距底 < PERSONAL_PREFETCH_DISTANCE 提前静默取下一页；
+        // 与 onScrollIndex 预取位互补（本阈值支持多列档按剩余距离提前量触发）；onReachEnd 保留作兜底
+        .onScroll((_x: number, y: number) => { this.onListScroll(_x, y); })
+        .onAreaChange((_old: Area, n: Area) => { this.onListAreaChange(_old, n); })
         .onReachEnd(() => { this.loadMore(); })
         // 距末尾还有 5 项就提前取下一页：让追加落在视口下方、在用户滑到底部边界之前完成，
         // 避免「边界回弹的瞬间插入新内容」造成抽搐；onReachEnd 保留作兜底（列表不满一屏等）。
@@ -287,6 +363,11 @@ struct PersonalContent {
             this.loadMore();
           }
         })
+        }
+        .width('100%')
+        .height('calc(100% - 98vp)')
+        .margin({ top: 98 })
+        .onRefreshing(() => { this.pullRefresh(); })
       }
 
       // 悬浮顶栏（内容可穿过）；官方 title 槽位路径下已在槽位里（PersonalTitleBar），不再叠一层
@@ -504,32 +585,86 @@ struct PersonalContent {
     return h;
   }
 
-  /** 触底翻页：收藏走 offset，点赞走 1 基页码 pn（服务端 data.has_more 判定） */
-  private async loadMore(): Promise<void> {    if (this.loading || this.loadingMore || !this.hasMore) return;
+  /**
+   * 触底翻页：收藏走 offset，点赞走 1 基页码 pn（服务端 data.has_more 判定）。
+   * silent=true 为预加载触发：失败静默丢弃（不打断浏览），手动触底仍提示。
+   */
+  private async loadMore(silent: boolean = false): Promise<void> {
+    if (this.loading || this.loadingMore || !this.hasMore) return;
     const isLikes: boolean = this.mode === PersonalMode.Likes;
     if (!isLikes && this.mode !== PersonalMode.Collections) return;
     this.loadingMore = true;
+    const myToken: number = this.loadToken;
     try {
       if (isLikes) {
         const result: PagedResult<PersonalContentItem> =
           await TiebaService.getInstance().fetchUserAgreeThreads(this.likesPage + 1, this.pageSize);
+        // 代际校验：首屏 / 重载期间返回的旧页直接丢弃（防重复与错序）
+        if (myToken !== this.loadToken) return;
         this.likesPage += 1;
         this.items = this.appendUnique(this.items, result.list);
         await CacheManager.getInstance().put(`${CACHE_KEY.PERSONAL_LIKED}_${this.accountId}`, JSON.stringify(this.items));
         this.hasMore = result.hasMore;
       } else {
         const remote = await TiebaService.getInstance().fetchCollectedThreads(this.accountId, this.items.length, this.pageSize);
+        if (myToken !== this.loadToken) return;
         this.items = this.mergeItems(this.items, remote);
         await CacheManager.getInstance().put(`${CACHE_KEY.PERSONAL_COLLECTED}_${this.accountId}`, JSON.stringify(this.items));
         this.hasMore = remote.length >= this.pageSize;
       }
       this.state = this.items.length > 0 ? LoadState.Success : LoadState.Empty;
     } catch (e) {
-      const tip: string = isLikes ? '更多点赞加载失败，请稍后重试' : '更多收藏加载失败，请稍后重试';
-      this.getUIContext().getPromptAction().showToast({ message: tip });
+      if (!silent && myToken === this.loadToken) {
+        const tip: string = isLikes ? '更多点赞加载失败，请稍后重试' : '更多收藏加载失败，请稍后重试';
+        this.getUIContext().getPromptAction().showToast({ message: tip });
+      }
     } finally {
       this.loadingMore = false;
     }
+  }
+
+  /**
+   * 列表预加载（2026-09-19，docs/帖子预加载.md §2/§4.4）：滚动到「距内容底部剩余距离 < PERSONAL_PREFETCH_DISTANCE」
+   * 时提前静默加载下一页，让追加落在视口下方、在用户滑到底部边界之前完成（避免边界回弹瞬间插入新内容造成抽搐）。
+   * onReachEnd 保留作兜底（列表不满一屏等）。仅在点赞 / 收藏（有云端分页）模式下生效；
+   * 「我的帖子 / 浏览历史」为本地一次全量读取（hasMore=false）→ 本函数自然不触发。
+   * 双重防重：loadingMore 状态锁 + 偏移 PERSONAL_PREFETCH_THROTTLE 节流；loadMore 内另做请求代际校验。
+   */
+  private onListScroll(_x: number, _y: number): void {
+    if (this.loadingMore || !this.hasMore || this.state !== LoadState.Success) {
+      return;
+    }
+    if (this.mode !== PersonalMode.Likes && this.mode !== PersonalMode.Collections) {
+      return;
+    }
+    // 偏移取 Scroller 真值（onScroll 回调入参语义在工具链间有差异，非绝对偏移会让剩余距离恒小）
+    if (this.prefetchGate.should(PrefetchGate.absoluteY(this.listScroller), this.estimatedContentH(), this.viewportH)) {
+      this.loadMore(true);
+    }
+  }
+
+  /** 视口尺寸变化：记录 List 视口高（供剩余距离估算；普通字段，避免写入 @State 触发整树重建） */
+  private onListAreaChange(_old: Area, n: Area): void {
+    this.viewportH = n.height as number;
+  }
+
+  /** 单列卡宽（vp）：与 pcColumnsData 同式（内容区宽 − List 左右 padding(lg×2) − 列间 gap(6×(cols−1))） */
+  private pcColWidth(): number {
+    const cols: number = this.pcColumns();
+    return (this.currentWidth - Spacing.lg * 2 - 6 * (cols - 1)) / cols;
+  }
+
+  /**
+   * 内容总高估算（vp）：List 无内容总高接口 → 首项顶栏占位 98 + 列高（卡片估算高之和 / 列数）+ 底部 padding(Spacing.xl)。
+   * 与列均衡分桶（estimateContentCardHeight）同源同式，只求相对准以定位阈值，不求像素级吻合。
+   */
+  private estimatedContentH(): number {
+    const cols: number = this.pcColumns();
+    let sum: number = 0;
+    for (let i = 0; i < this.items.length; i++) {
+      sum += this.estimateContentCardHeight(this.items[i], this.pcColWidth()) + 6;
+    }
+    return 98 + sum / cols + Spacing.xl;
   }
 
   private emptyMessage(): string {
@@ -600,6 +735,24 @@ struct PersonalContent {
   }
 
   /**
+   * 卡片右下角时间文案（2026-09-23）：「浏览历史」显示**浏览时间**（列表已按浏览时间倒序，
+   * 配浏览时间才自洽——刚看完的帖显示「刚刚」，从而直观体现"实时更新"）；其余模式维持
+   * 帖子发布/最后回复时间（`createTime`，原样）。老记录无 visitTime 时回落 createTime。
+   */
+  private cardTimeText(item: PersonalContentItem): string {
+    if (this.mode === PersonalMode.History) {
+      const visitTime: number = item.visitTime ?? 0;
+      if (visitTime > 0) {
+        const text: string = formatTime(visitTime);
+        if (text.length > 0) {
+          return text;
+        }
+      }
+    }
+    return item.createTime;
+  }
+
+  /**
    * 内容卡。`bottomMargin` = 卡片底部外距：**单列档传 `Spacing.md`(12)**（原样承担手机行间距，
    * 逐像素不变）；**多列档传 0**（列内间距由外层 `Column({ space: 6 })` 承担 → 上下 6 = 左右列间 6，
    * 2026-09-14 用户要求「上下间距跟左右间距一致」；原样叠加会造成上下 18 vs 左右 6）。
@@ -628,7 +781,7 @@ struct PersonalContent {
         Text(`${item.replyNum} 回复`)
           .fontSize(fs(11, this.fontScale))
           .fontColor(Theme.textTertiary(this.isDark))
-        Text(item.createTime)
+        Text(this.cardTimeText(item))
           .fontSize(fs(11, this.fontScale))
           .fontColor(Theme.textTertiary(this.isDark))
           .margin({ left: 8 })
@@ -652,16 +805,4 @@ struct PersonalContent {
     })
   }
 
-  @Builder
-  BottomFadeOverlay() {
-    Stack()
-      .height('100%')
-      .width('100%')
-      .linearGradient({
-        direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', tabletTopFadeStop(98)], ['#FFFFFFFF', 1.0]]
-      })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
-      .hitTestBehavior(HitTestMode.None)
-  }
 }

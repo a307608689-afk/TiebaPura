@@ -16,7 +16,9 @@
     "pages/BlacklistManager",
     "pages/UserProfile",
     "pages/FollowList",
+    "pages/GoodCategoryPage",
     "pages/UsageHabitsPage",
-    "pages/AutoSignSettings"
+    "pages/AutoSignSettings",
+    "pages/SettingsMore"
   ]
 }

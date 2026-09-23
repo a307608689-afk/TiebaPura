@@ -28,6 +28,8 @@ import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail } from '../m
 import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
+import { Haptic } from '../common/Haptic';
+import { PrefetchGate } from '../common/PrefetchGate';
 import { LoadingView, EmptyView, ErrorView, ThreadCard, ThreadItemData, ThreadSharePayload, PinnedThreadItem } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
 
@@ -37,6 +39,13 @@ enum LoadState {
 
 /** 吧主页预加载阈值：距底部剩余距离小于该值时提前静默加载下一页（约 2 屏，覆盖快速甩滑的请求耗时） */
 const THREAD_PREFETCH_DISTANCE: number = 1200;
+/**
+ * 尾部加载提示延迟（ms）：后台预取路径**先静默**（不显形、不转圈），超过该时长仍未返回才浮出 loading ——
+ * 绝大多数请求 300~600ms 返回，用户永远看不到"正在加载"。口径同 ThreadDetail.DETAIL_LOAD_HINT_DELAY。
+ */
+const LIST_LOAD_HINT_DELAY: number = 1200;
+/** 尾部哨兵固定高度（vp）：静默占位 / 加载中 / 加载失败重试三态等高，追加内容时视口零位移 */
+const LIST_FOOTER_SENTINEL_H: number = 40;
 
 /**
  * 本吧搜索扫描参数（BUG-03 后续优化）：
@@ -109,6 +118,8 @@ const SORT_SKELETON_FADE: number = 150;     // 未命中缓存时骨架屏淡入
 /** Scroll 首项「顶栏让位」高度 vp：也即吧头块在 Scroll 内容坐标里的顶边。
  *  渲染层首个占位项必须与本值同源；旧页快照的裁剪边界（= 本值 + 吧头块实测高 − 当前滚动偏移）由它推出。 */
 const THREAD_LIST_HEADER_TOP_SPACE: number = 90;
+/** 顶部渐显带的覆盖高度 vp = 顶栏 98 + 10 呼吸：只罩住顶部按钮区，不吃到吧头（2026-09-22） */
+const THREAD_LIST_TITLE_BAR_FADE: number = 108;
 /** 内容滚动容器 id：`componentSnapshot` 按它截取旧页（见上方 SORT_ANIM_* 注释） */
 const THREAD_SCROLL_SNAPSHOT_ID: string = 'threadListScrollSnapshot';
 
@@ -179,6 +190,10 @@ const THREAD_LIST_DIALOG_MAX_WIDTH: number = 400;
  *  （刷新钮移除后最高点由刷新钮退回加号，故比原值 166 少 68、比更早的 244 少 146，
  *    列表可视区同步变大）。 */
 const THREAD_LIST_CONTENT_BOTTOM_SPACE: number = 98;
+// 左右滑切排序：滑动结束后延时解锁卡点按（GoodCategoryPage 同款，覆盖手势收尾的 click 派发窗口）
+const THREAD_LIST_SWIPE_UNLOCK_DELAY: number = 250;
+// 左右滑切排序的最小位移阈值（vp），与 HomeTab 推荐流同档
+const THREAD_LIST_SWIPE_SWITCH_THRESHOLD: number = 80;
 
 /** 吧列表本地快照（含吧头信息），命中缓存即秒开再后台静默刷新 */
 interface ForumListCache {
@@ -493,7 +508,21 @@ struct ThreadList {
   /** 吧头块实测高（vp）= 吧头（+ 兜底排序栏）那一层，由渲染层 onAreaChange 回填。
    *  旧页快照的裁剪边界由它推出；未测到（≤ 0）时不裁、自动降级回调整前的整屏裁剪行为 */
   private headerBlockH: number = 0;
-  private lastPrefetchY: number = -10000;
+  /**
+   * 剩余距离预取闸门（2026-09-19 口径修正）：滚动偏移只信 `Scroller.currentOffset()`，
+   * 不再用 `onScroll` 回调入参（其语义在工具链间有差异，会把剩余距离算成恒小于阈值的错值，
+   * 表现为「每滚一下都翻页」或「滑到底空一段才加载」）。单列档内容高由 onContentAreaChange 实测；
+   * 多列档 WaterFlow 无内容总高接口 → 折算（见 listContentH / estimatedColumnContentH）。
+   */
+  private prefetchGate: PrefetchGate = new PrefetchGate(THREAD_PREFETCH_DISTANCE, 'ThreadList');
+  /** 尾部加载提示是否浮出：后台预取路径超时才置 true；用户显式触底立即置 true（口径同 ThreadDetail） */
+  @State loadingHintVisible: boolean = false;
+  /** 尾部加载失败态：仅用户显式路径置位（后台预取失败保持静默，由触底兜底重试） */
+  @State loadMoreFailed: boolean = false;
+  /** 尾部提示延时器句柄（setTimeout 返回值，-1 = 空闲）：退页时必须清理，防回调落到已销毁组件 */
+  private loadingHintTimer: number = -1;
+  /** 几何来源探针是否已打印（每会话仅一条）：真机自证「内容高是实测还是折算、折算参数是多少」 */
+  private contentSrcNoted: boolean = false;
   private loadToken: number = 0;
   @State selectedSort: number = 0;
   /** WaterFlow 数据源（§4.8 T-G）：置顶卡 + 普通帖合并列表，@Watch('onThreadsChanged') 自动同步 */
@@ -580,8 +609,42 @@ struct ThreadList {
    *  那是 Scroll 视口尺寸（横屏时已被顶部 90 占位与底部让位吃掉），与窗口高不等 */
   @State isLandscape: boolean = false;
 
+  // ===== 派生值缓存（2026-09-19）：零风险自失效 —— 键一律取「引用 + 影响结果的状态值」=====
+  // 前提（已逐行核）：this.threads 全程整体赋值（concat / map / 字面量 / 外部数组），**无原地 mutate**，
+  // 故「引用相等 ⇒ 逐项相等」，引用比较即可判失效，无需人工维护失效点。
+  // 缓存字段必须保持普通 private（写成 @State 会在渲染期写状态 → 触发重建 → 死循环）。
+  /** threadColumns() 结果缓存：本函数每次 build 被调 5~10 次，而内部整条设备判定链
+   *  （isWideBarFullscreen → isWideBarDevice / isLargeScreenForm → isWideBarDevice + isLargeFoldDevice
+   *  / isLargeFoldDevice / isWideBarDevice）每次都要调 display.isFoldable() / getFoldStatus() /
+   *  getDefaultDisplaySync()，结果却只由 pageWidth / pageHeight / columnMode 决定
+   *  （isLandscape 派生自前两者，isWideFormDevice 是 readonly 常量）。
+   *  折叠屏展开↔折叠必然改变窗口尺寸 ⇒ 键必变 ⇒ 不会漏翻档。 */
+  private colCacheKey: string = '';
+  private colCacheValue: number = 0;
+  /** 置顶 / 普通拆分缓存：键 = threads 引用 + 排序档（threads 引用一变即整表失效） */
+  private pinnedCacheSrc: ThreadItem[] | null = null;
+  private pinnedCacheSort: number = -1;
+  private pinnedCacheValue: ThreadItem[] = [];
+  private normalCacheSrc: ThreadItem[] | null = null;
+  private normalCacheSort: number = -1;
+  private normalCacheValue: ThreadItem[] = [];
+  /** 下一次 push 的目标是否为精选分类页：是则本次退场改静止，避免默认横滑与分类页上滑叠出双动画 */
+  private pushingToGoodPage: boolean = false;
+
   onPageShow(): void {
+    // 从精选分类页等二级页返回本页：复位 push 目标标记（本页 onPageShow 只在回栈可见时触发）
+    this.pushingToGoodPage = false;
     this.fontSizeTick++;
+  }
+
+  /** 退页清理尾部提示延时器：避免定时回调落到已销毁组件（@State 写入告警 / 空引用） */
+  aboutToDisappear(): void {
+    this.clearLoadingHintTimer();
+    // 左右滑切排序的解锁延时器一并清理，避免回调落到已销毁组件
+    if (this.swipeLockTimer !== -1) {
+      clearTimeout(this.swipeLockTimer);
+      this.swipeLockTimer = -1;
+    }
   }
 
   /**
@@ -615,6 +678,12 @@ struct ThreadList {
   // tab 按压回弹：点击瞬间缩一下再弹回，增强切换按键手感
   @State pressedTab: number = -1;
   private pulseTimer: number = -1;
+  // 左右滑切排序的滑动锁：横向 PanGesture 起手即上锁、抬指延时解锁；
+  // 锁住期间 openThread 短路 —— 滑动手势期间抬指仍可能给卡片派发 click（GoodCategoryPage 真机结论）
+  private swipeLock: boolean = false;
+  private swipeLockTimer: number = -1;
+  // 上一次抬指判定时刻：内层 Stack 与 WaterFlow/Scroll 多挂点会同触发同一手势，用它去重
+  private lastSwipeHandledMs: number = 0;
   // 延迟初始化：aboutToAppear生命周期阶段UIContext就绪后赋值，避免类字段初始化期获取null
   private context?: common.UIAbilityContext;
 
@@ -817,6 +886,14 @@ struct ThreadList {
     this.forumInfo = this.withFollowState(previous, !wasLiked);
     try {
       await TiebaService.getInstance().toggleFollow(this.forumName, !wasLiked, fid);
+      // 关注/取关成功：失效关注列表缓存（30min TTL 旧快照会兜底旧数据）+ 广播进吧页。
+      // 携带变更内容（吧名/关注态/头像/fid）：服务端关注列表接口有延迟，进吧页先乐观呈现再对账
+      CacheManager.getInstance().delete(CACHE_KEY.FOLLOW_LIST).catch(() => {});
+      AppStorage.setOrCreate<string>('forumFollowsChangeName', this.forumName);
+      AppStorage.setOrCreate<string>('forumFollowsChangeFollowed', wasLiked ? '0' : '1');
+      AppStorage.setOrCreate<string>('forumFollowsChangeAvatar', this.forumInfo.avatar);
+      AppStorage.setOrCreate<string>('forumFollowsChangeFid', fid);
+      AppStorage.setOrCreate<number>('forumFollowsChanged', (AppStorage.get<number>('forumFollowsChanged') ?? 0) + 1);
       this.getUIContext().getPromptAction().showToast({ message: wasLiked ? '已取消关注' : '已关注' });
     } catch (e) {
       // 失败回滚状态
@@ -893,6 +970,57 @@ struct ThreadList {
     }, 90);
   }
 
+  // ===== 左右滑切排序（2026-09-22）：HomeTab 推荐流 / GoodCategoryPage 同款机制 =====
+  // 外层普通容器 parallelGesture 挂横向 PanGesture（挂列表 Scroll/WaterFlow 上会被内部滚动消费），
+  // 与竖向滚动并行识别；起手即锁卡点按，抬指按位移方向切到相邻排序（走 selectSort 既有的
+  // 「旧页快照 + 两页对向平移」过场，方向 enterDir 自动随目标索引推导）。
+
+  private lockSwipe(): void {
+    this.swipeLock = true;
+    if (this.swipeLockTimer !== -1) {
+      clearTimeout(this.swipeLockTimer);
+      this.swipeLockTimer = -1;
+    }
+  }
+
+  private unlockSwipeDelayed(): void {
+    if (this.swipeLockTimer !== -1) {
+      clearTimeout(this.swipeLockTimer);
+    }
+    this.swipeLockTimer = setTimeout(() => {
+      this.swipeLockTimer = -1;
+      this.swipeLock = false;
+    }, THREAD_LIST_SWIPE_UNLOCK_DELAY);
+  }
+
+  /**
+   * 抬指判定：左滑（dx 为负）切到右侧相邻排序、右滑切回左侧；
+   * 位移不足阈值或已在边界（最新→热门再右滑 / 精选再左滑）不动。
+   * 搜索态不参与（搜索结果无排序档，且须让位给横滑选择文本等交互）。
+   * 同一次手势会从内层 Stack（parallelGesture）与 WaterFlow/Scroll 节点（.gesture）多个挂点
+   * 各触发一次回调 —— 用 350ms 时间戳去重，保证一次滑动只切一档。
+   */
+  private onSortSwipeEnd(event: GestureEvent): void {
+    if (this.searchMode) {
+      return;
+    }
+    const now: number = Date.now();
+    if (now - this.lastSwipeHandledMs < 350) {
+      return;
+    }
+    this.lastSwipeHandledMs = now;
+    const dx: number = event.offsetX;
+    if (dx < -THREAD_LIST_SWIPE_SWITCH_THRESHOLD && this.selectedSort < 2) {
+      console.info(`[TL_SWIPE] end dx=${dx.toFixed(0)} -> sort ${this.selectedSort} + 1`);
+      this.selectSort(this.selectedSort + 1);
+    } else if (dx > THREAD_LIST_SWIPE_SWITCH_THRESHOLD && this.selectedSort > 0) {
+      console.info(`[TL_SWIPE] end dx=${dx.toFixed(0)} -> sort ${this.selectedSort} - 1`);
+      this.selectSort(this.selectedSort - 1);
+    } else {
+      console.info(`[TL_SWIPE] end dx=${dx.toFixed(0)} sort=${this.selectedSort} (no switch)`);
+    }
+  }
+
   aboutToAppear(): void {
     // 生命周期阶段UIContext已就绪，安全初始化context缓存
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -938,10 +1066,18 @@ struct ThreadList {
     }
     // 恢复本吧今日签到状态：吧头接口不返回签到态，签到结果由本地记录持久化回显
     this.restoreSignState();
+    // 「吧主页默认进入界面」档位初值（使用习惯页设置）：0 = 热门（默认，老用户零回归）/ 1 = 最新。
+    // 必须在 loadThreads 之前写：缓存 key（forumCacheKey）与请求参数都以 selectedSort 为真源。
+    const savedSort: number = AppStorage.get<number>('forumDefaultSort') ?? 0;
+    this.selectedSort = savedSort === 1 ? 1 : 0;
     this.loadThreads();
   }
 
   private openThread(tid: string): void {
+    // 左右滑切排序期间锁点按：滑动抬指时手势仲裁仍可能给卡片派发 click，这里直接短路防误开帖
+    if (this.swipeLock) {
+      return;
+    }
     if (tid.length === 0) {
       this.getUIContext().getPromptAction().showToast({ message: '帖子信息暂不可用' });
       return;
@@ -969,6 +1105,77 @@ struct ThreadList {
     }).catch(() => {
       this.getUIContext().getPromptAction().showToast({ message: '用户主页打开失败，请稍后重试' });
     });
+  }
+
+  // ===== 精选二级分类页入口（2026-09-20）：底栏「精选」钮长按，按下即预取 =====
+
+  /** 本次进吧只预取一次精选首屏 */
+  private goodPrefetchDone: boolean = false;
+  private goodPressTimer: number = -1;
+
+  /**
+   * 精选钮触摸：Down 起 60ms 计时（长按意图在 350ms 阈值前就起跑预取请求），
+   * Up / Cancel 撤销 —— 快速点按（切排序自会拉取）不白发预取。
+   */
+  private onGoodButtonTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Down) {
+      if (this.goodPressTimer !== -1) {
+        clearTimeout(this.goodPressTimer);
+      }
+      this.goodPressTimer = setTimeout(() => {
+        this.goodPressTimer = -1;
+        this.startGoodPrefetch();
+      }, 60);
+    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      if (this.goodPressTimer !== -1) {
+        clearTimeout(this.goodPressTimer);
+        this.goodPressTimer = -1;
+      }
+    }
+  }
+
+  /** 预取精选首屏（GoodCategoryPage 首屏合流消费）；5 分钟内的新鲜磁盘缓存已在则跳过省流量 */
+  private startGoodPrefetch(): void {
+    if (this.goodPrefetchDone) {
+      return;
+    }
+    this.goodPrefetchDone = true;
+    CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey(2))
+      .then((cached) => {
+        if (cached && !cached.expired && cached.data.threads.length > 0) {
+          return;
+        }
+        TiebaService.getInstance().prefetchGoodFirstPage(this.forumName);
+      })
+      .catch(() => {
+        TiebaService.getInstance().prefetchGoodFirstPage(this.forumName);
+      });
+  }
+
+  /** 长按「精选」：进入精选二级分类页（页面自下而上转场，零提示静默进入） */
+  private openGoodCategories(): void {
+    Haptic.light();
+    // 本次 push 的退场改静止（见 pageTransition）：分类页自带自下而上入场，
+    // 若本页仍走系统默认横滑退场，平板宽屏上会叠出「一个上滑 + 一个左滑」双动画
+    this.pushingToGoodPage = true;
+    this.getUIContext().getRouter().pushUrl({
+      url: 'pages/GoodCategoryPage',
+      params: { kw: this.forumName, fid: this.forumId }
+    }).catch(() => {});
+  }
+
+  /**
+   * pop 返回到本页（详情 / 楼中楼 / 搜索 / 精选分类页等）：本页**静态揭出**（1ms 收场）。
+   * router 默认底层页横滑入场，会与精选分类页的「自下而上退场」叠出多余的水平动画（真机反馈）；
+   * push 进本页（从首页进吧）不受影响仍走系统默认。
+   * push 退场：仅当本次 push 目标是精选分类页时改**静止**（1ms）——分类页自带自下而上入场，
+   * 本页默认横滑退场会与之叠成双动画（真机反馈，平板宽屏尤为明显）；其余 push（进详情等）保持系统默认。
+   */
+  pageTransition() {
+    PageTransitionEnter({ type: RouteType.Pop, duration: 1 });
+    if (this.pushingToGoodPage) {
+      PageTransitionExit({ type: RouteType.Push, duration: 1 });
+    }
   }
 
   // 原底部加号 FAB 的 openCompose() 已移除（2026-09-14）：加号改为「确认跳转官方吧主页」，
@@ -1513,9 +1720,9 @@ struct ThreadList {
     if (this.selectedSort === 2) {
       return this.threads;
     }
-    const pinned: ThreadItem[] = this.threads.filter((t: ThreadItem) => t.isTop === true);
-    const normal: ThreadItem[] = this.threads.filter((t: ThreadItem) => t.isTop !== true);
-    return pinned.concat(normal);
+    // 复用置顶 / 普通拆分缓存（语义等价：isTop===true 全量后接 isTop!==true 全量），
+    // 避免同一份 threads 在「同步数据源」与「渲染置顶区」两条路径上被重复全量过滤。
+    return this.pinnedThreads().concat(this.normalThreads());
   }
 
   /** 把合并后的列表同步进 WaterFlow 数据源（全量替换或尾部追加） */
@@ -1542,6 +1749,7 @@ struct ThreadList {
     }
     // 数据量变化 → 主体 section 的 itemsCount 必须同步（数量不匹配会让 WaterFlow 无法滚动）
     this.syncSections();
+    this.scheduleListPrefetch();
   }
 
   /** 加载态变化 → 主体格子数变化（骨架屏 / 空态 / 错误视图各占 1 格） */
@@ -1666,7 +1874,9 @@ struct ThreadList {
     // 裁剪边界：吧头块底边在滚动视口里的 y（vp）。吧头高未测到时不裁，避免旧页内容整体错位。
     // 单列 / 多列同款：多列档的吧头由「等量反向位移」抵消（见吧头 FlowItem），转场中同样静止，
     // 故旧页快照同样要裁掉吧头 —— 否则旧页滑出时吧头会跟着滑，与静止的新页吧头重叠。
-    const listTop: number = THREAD_LIST_HEADER_TOP_SPACE + this.headerBlockH
+    // 下拉刷新（2026-09-22）后：容器在 Refresh 内、拖移 90vp 到页 90，内容让位由 margin 承担 →
+    // 容器局部坐标里首项即吧头，裁剪边界 = 「吧头块底边 − 滚动偏移」
+    const listTop: number = this.headerBlockH
       - this.listScroller.currentOffset().yOffset;
     const clipTop: number = (this.headerBlockH > 0 && this.viewportH > 0)
       ? Math.max(0, Math.min(listTop, this.viewportH)) : 0;
@@ -1753,6 +1963,8 @@ struct ThreadList {
   async loadThreads(forceRefresh: boolean = false): Promise<void> {
     // 请求代际递增：使 in-flight 的加载更多结果作废，避免 concat 到重置后的新列表（刷新/排序切换）
     const myToken: number = ++this.loadToken;
+    // 预取节流基线同步复位：刷新 / 切排序后列表与内容高整体换新，沿用旧偏移基线会漏触发
+    this.prefetchGate.reset();
     // 快照本次请求的排序：期间用户切换排序会再次触发 loadThreads（代际已变），返回时据此丢弃过期结果
     const mySort: number = this.selectedSort;
     if (!forceRefresh && this.page === 1) {
@@ -1823,7 +2035,8 @@ struct ThreadList {
       this.skeletonOpacity = 1.0;
     }
     try {
-      const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, this.page, this.selectedSort, false);
+      // 预取合流版：page=1/sort=0 且点击时已起跑预取则直接消费，不另发一次请求；否则原样回落
+      const result = await TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, this.page, this.selectedSort, false);
       // 竞态防护：请求期间用户已切换排序/刷新，丢弃晚归结果，避免旧排序内容覆盖当前列表
       if (myToken !== this.loadToken || mySort !== this.selectedSort) {
         return;
@@ -1874,7 +2087,7 @@ struct ThreadList {
     // 竞态防护：静默刷新期间用户可能已切换排序/刷新（代际/排序变化），返回后丢弃过期结果
     const myToken: number = this.loadToken;
     const mySort: number = this.selectedSort;
-    TiebaService.getInstance().fetchForumThreads(this.forumName, 1, this.selectedSort, false).then((result) => {
+    TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, 1, this.selectedSort, false).then((result) => {
       if (myToken !== this.loadToken || mySort !== this.selectedSort || result.list.length === 0) {
         return;
       }
@@ -2020,11 +2233,18 @@ struct ThreadList {
     }
   }
 
+  /**
+   * 加载下一页。
+   * @param silent 后台预取路径（滚动预取）传 true：尾部先静默、超时才浮出 loading，失败也不打扰用户
+   *               （由触底 / 滚动兜底重试）；用户显式路径（触底 onReachEnd、点击重试）保持默认 false：
+   *               立即浮出 loading，失败给出可点重试。
+   */
   async loadMore(silent: boolean = false): Promise<void> {
     if (this.loadingMore || !this.hasMore) {
       return;
     }
     this.loadingMore = true;
+    this.beginLoadMoreHint(silent);
     // 记录当前代际：返回时若已刷新/切换排序则丢弃结果
     const myToken: number = this.loadToken;
     try {
@@ -2036,12 +2256,54 @@ struct ThreadList {
       // 去重合并 + 推进分页状态
       this.mergePage(nextPage, result.list);
     } catch (e) {
-      // 预加载失败静默忽略，靠 onReachEnd 兜底重试；仅用户主动触底时提示
+      // 预加载失败静默忽略，靠 onReachEnd 兜底重试；仅用户主动触底时提示（并保留可点重试位）
       if (!silent) {
+        this.loadMoreFailed = true;
         this.getUIContext().getPromptAction().showToast({ message: '加载更多失败，请稍后重试' });
       }
     } finally {
       this.loadingMore = false;
+      this.endLoadMoreHint();
+    }
+  }
+
+  /** 尾部加载提示起手：显式路径立即浮出；后台预取路径先静默，超时 LIST_LOAD_HINT_DELAY 才浮出 */
+  private beginLoadMoreHint(silent: boolean): void {
+    this.clearLoadingHintTimer();
+    this.loadMoreFailed = false;
+    if (!silent) {
+      this.loadingHintVisible = true;
+      return;
+    }
+    this.loadingHintVisible = false;
+    this.loadingHintTimer = setTimeout(() => {
+      this.loadingHintTimer = -1;
+      this.loadingHintVisible = true;
+    }, LIST_LOAD_HINT_DELAY);
+  }
+
+  /** 尾部加载提示收尾：清延时器 + 收回 loading（失败态由 loadMoreFailed 单独承载并保持可见） */
+  private endLoadMoreHint(): void {
+    this.clearLoadingHintTimer();
+    this.loadingHintVisible = false;
+  }
+
+  /** 清理尾部提示延时器（beginLoadMoreHint 重排前 + aboutToDisappear 退页时调用） */
+  private clearLoadingHintTimer(): void {
+    if (this.loadingHintTimer !== -1) {
+      clearTimeout(this.loadingHintTimer);
+      this.loadingHintTimer = -1;
+    }
+  }
+
+  /**
+   * 用户已触底：若后台预取仍在途，立即浮出提示 —— 用户已滑到边界在等，不宜再保持静默
+   * （否则尾部是一片空白占位，比转圈更糟）。
+   */
+  private revealLoadHintOnReachEnd(): void {
+    if (this.loadingMore && !this.loadMoreFailed) {
+      this.clearLoadingHintTimer();
+      this.loadingHintVisible = true;
     }
   }
 
@@ -2091,14 +2353,79 @@ struct ThreadList {
    * 搜索态下改为"接近结果末尾即续扫下一批吧内分页"（批量补扫，不再等触底才挤出一条）。
    * loadingMore / searchFetching 锁 + 偏移节流防重；onReachEnd 保留作兜底。
    */
-  private onListScroll(_x: number, y: number): void {
-    this.lastScrollY = y;
-    const remaining: number = this.contentH - this.viewportH - y;
+  /** 「帖子极速开启」当前可见帖子登记（进入视野顺序，最新在前；停歇预取取前 3） */
+  private visibleTids: string[] = [];
+  /** 手指按下 y（按下让滑动暂停；单列 Scroll 分支无卡片几何，按登记顺序兜底） */
+  private listPausePressY: number = -1;
+  private listSwipeTimer: number = -1;
+  private listPrefetchTimer: number = -1;
+
+  /** 卡片进入/离开视野登记（WaterFlow 与单列 Scroll 两分支的 ThreadCard 均挂） */
+  private onCardListVisible(tid: string, isVisible: boolean): void {
+    const idx: number = this.visibleTids.indexOf(tid);
+    if (isVisible) {
+      if (idx >= 0) {
+        this.visibleTids.splice(idx, 1);
+      }
+      this.visibleTids.unshift(tid);
+    } else if (idx >= 0) {
+      this.visibleTids.splice(idx, 1);
+    }
+  }
+
+  /** 记录手指按下 y */
+  private onListTouchRecord(event: TouchEvent): void {
+    if (event.type === TouchType.Down) {
+      this.listPausePressY = event.touches[0].y;
+    }
+  }
+
+  private onListScrollStart(): void {
+    if (this.listSwipeTimer >= 0) {
+      clearTimeout(this.listSwipeTimer);
+      this.listSwipeTimer = -1;
+    }
+  }
+
+  /** 滑动停歇 → 300ms 防抖 → 可见登记表前 3 个预取（开关关闭时服务层入口短路） */
+  private onListScrollStopPrefetch(): void {
+    if (this.listSwipeTimer >= 0) {
+      clearTimeout(this.listSwipeTimer);
+    }
+    this.listSwipeTimer = setTimeout(() => {
+      this.listSwipeTimer = -1;
+      const picks: ThreadItem[] = [];
+      for (const tid of this.visibleTids) {
+        const hit: ThreadItem | undefined = this.threads.find((t: ThreadItem): boolean => t.tid === tid);
+        if (hit !== undefined) {
+          picks.push(hit);
+          if (picks.length >= 3) {
+            break;
+          }
+        }
+      }
+      TiebaService.getInstance().prefetchFeedTopThreads(picks);
+    }, 300);
+  }
+
+  /** 「帖子极速开启」列表预取调度：800ms 防抖，取列表前 3 卡（数据同步收口点调用，去重后近零开销） */
+  private scheduleListPrefetch(): void {
+    if (this.listPrefetchTimer >= 0) {
+      clearTimeout(this.listPrefetchTimer);
+    }
+    this.listPrefetchTimer = setTimeout(() => {
+      this.listPrefetchTimer = -1;
+      TiebaService.getInstance().prefetchFeedTopThreads(this.waterFlowThreads());
+    }, 800);
+  }
+
+  private onListScroll(_x: number, _y: number): void {
+    const atY: number = PrefetchGate.absoluteY(this.listScroller);
+    this.lastScrollY = atY;
     if (this.searchMode) {
       // 搜索态与列表态解耦：不依赖吧内列表的 loadState（列表可能尚未加载完就进了搜索），
       // 且按模式分派（服务端翻页 / 本地续扫），接近结果末尾即提前取下一批
-      if (remaining <= THREAD_PREFETCH_DISTANCE && Math.abs(y - this.lastPrefetchY) >= 120) {
-        this.lastPrefetchY = y;
+      if (this.prefetchGate.should(atY, this.searchContentH(), this.viewportH)) {
         this.searchNextBatch();
       }
       return;
@@ -2109,23 +2436,61 @@ struct ThreadList {
     if (this.loadingMore || !this.hasMore) {
       return;
     }
-    if (remaining > THREAD_PREFETCH_DISTANCE) {
-      return;
+    if (this.prefetchGate.should(atY, this.listContentH(), this.viewportH)) {
+      this.loadMore(true);
     }
-    // 节流：偏移变化超过 120vp 才允许再次触发，避免同一轮滚动连续请求
-    if (Math.abs(y - this.lastPrefetchY) < 120) {
-      return;
-    }
-    this.lastPrefetchY = y;
-    this.loadMore(true);
   }
 
   /** 内容尺寸变化：记录内容高；搜索态下内容变化即重判自动续载（结果不满一屏时无法滚动） */
   private onContentAreaChange(_old: Area, n: Area): void {
-    this.contentH = n.height as number;
+    const h: number = n.height as number;
+    if (h > 0) {
+      this.contentH = h;
+    }
+    // 真机自证：单列档几何来源（每会话一条，onAreaChange 是高频回调不重复打）
+    if (!this.contentSrcNoted && this.contentH > 0 && !this.searchMode && this.threadColumns() <= 1 && this.viewportH > 0) {
+      this.contentSrcNoted = true;
+      this.prefetchGate.noteGeometry('measured(single-column)', this.contentH, this.viewportH);
+    }
     if (this.searchMode) {
       this.maybeAutoContinueSearch();
     }
+  }
+
+  /**
+   * 待用内容总高（vp）：单列档（Scroll + Column 全量渲染）用 onAreaChange 实测值；
+   * 多列档是 WaterFlow 虚拟容器 —— **自身高恒等于视口高**，不存在内容总高的读取接口，
+   * 故按「顶栏让位 + 吧头块 + 每列条数 × 卡高估算 + 底部让位」折算。
+   */
+  private listContentH(): number {
+    if (this.threadColumns() > 1) {
+      return this.estimatedColumnContentH();
+    }
+    return this.contentH;
+  }
+
+  /** 搜索态内容总高（vp）：搜索结果一律单列渲染，沿用实测值即可 */
+  private searchContentH(): number {
+    return this.contentH;
+  }
+
+  /**
+   * 多列档内容总高折算（vp）：只求相对准以定位预取阈值（见 docs/帖子预加载.md §8 维护须知），
+   * 不做像素级承诺。取值刻意略偏小：折算偏小 → 剩余距离偏小 → 触发更早，宁可早取不漏取。
+   */
+  private estimatedColumnContentH(): number {
+    const cols: number = Math.max(1, this.threadColumns());
+    const count: number = this.listDataSource.totalCount();
+    const rows: number = Math.ceil(count / cols);
+    // 可用总宽 = 窗口宽 − 左右外边距 − 列间距（折算口径统一收口在 PrefetchGate，卡高估算也在那里）
+    const availW: number = Math.max(1, this.pageWidth) - Spacing.lg * 2 - Spacing.md * (cols - 1);
+    const total: number = PrefetchGate.estimateWaterfallContentH(count, cols, availW, Spacing.md);
+    // 真机自证：折算参数一次性打全（若真机预取时机偏早/偏晚，照这行日志校准权重即可）
+    if (!this.contentSrcNoted && this.viewportH > 0 && count > 0) {
+      this.contentSrcNoted = true;
+      this.prefetchGate.noteGeometry(`estimated(${cols}col/${rows}row)`, total, this.viewportH);
+    }
+    return total;
   }
 
   /** 视口尺寸变化：记录视口高 / 宽（宽供旧页快照 region 裁剪用）；搜索态下同时补一次自动续载判定 */
@@ -2426,8 +2791,9 @@ struct ThreadList {
           .height(Math.max(0, this.viewportH - this.exitClipTop))
           // 截图与展示区同尺寸，Cover 在此等价 1:1 铺满，不会变形
           .objectFit(ImageFit.Cover)
-          // y 落到列表区顶边（水平位移才是过场：百分比相对自身宽 = 屏宽）
-          .translate({ x: `${this.outOffset}%`, y: this.exitClipTop })
+          // y 落到列表区顶边（水平位移才是过场：百分比相对自身宽 = 屏宽）；
+          // + 让位量：列表容器本体已被 Refresh 的 margin 下移到页 90
+          .translate({ x: `${this.outOffset}%`, y: THREAD_LIST_HEADER_TOP_SPACE + this.exitClipTop })
           .hitTestBehavior(HitTestMode.None)
       }
       // 新页（当前内容）：位移与旧页层对向，见 Scroll 链上的 translate
@@ -2436,12 +2802,15 @@ struct ThreadList {
         // 与首页（§4.2 决策 12）同一套 WaterFlow；差异仅在分段（WaterFlowSections）：
         //   section 0 = 吧头（crossCount 1 → 独占整行）；section 1 = 主体（crossCount 3/4 → 多列瀑布流）。
         // 卡片一律取自然高度（不设 onGetItemMainSizeByIndex），置顶卡作为普通格子、不拉伸。
+        // 下拉刷新（2026-09-22，docs/下拉刷新.md）：与首页/消息页/进吧页同款——Refresh 容器
+        // margin 下移到顶栏之下（默认指示器随之出现在顶栏下方），定高扣除下移量防底部溢出；
+        // 内容里原有的 90vp 顶栏让位由该 margin 接管（快照裁剪公式同步减去该值，见 captureExitSnapshot）
+        Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
         WaterFlow({ scroller: this.listScroller, sections: this.sections }) {
-          // 跨列格子（独占整行）：顶栏让位 + 吧头 + 兜底排序栏 —— 与单列档同源，随内容一起滚动
+          // 跨列格子（独占整行）：吧头 + 兜底排序栏 —— 与单列档同源，随内容一起滚动
+          // （顶栏让位已由 Refresh 的 margin 承担，见容器链）
           FlowItem() {
             Column() {
-              Column().width('100%').height(THREAD_LIST_HEADER_TOP_SPACE)
-
               Column() {
                 this.ForumHeaderBuilder()
 
@@ -2507,6 +2876,7 @@ struct ThreadList {
                       onComment: (tid: string) => this.openThread(tid),
                       onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
                     })
+                      .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean) => this.onCardListVisible(item.tid, isVisible))
                   }
                 }
                 .width('100%')
@@ -2533,10 +2903,14 @@ struct ThreadList {
             }
           }
         }
+        // 预加载窗口（2026-09-19）：按「列数×2」预建离屏格子（3 列=6、4 列=8），
+        // 与首页 WaterFlow 同口径；只改离屏构建窗口，不动几何/材质/滚动行为。
+        .cachedCount(Math.max(2, this.threadColumns() * 2))
         .columnsGap(Spacing.md)
         .rowsGap(Spacing.md)
         .padding({ bottom: this.contentBottomSpace() })
-        .layoutWeight(1)
+        // 容器在 Refresh 内 → 用满高（Refresh 已 margin 90 下移）
+        .height('100%')
         // 排序切换过场（§4.8 T-G）：位移**不挂 `WaterFlow` 整页** —— 挂整页会把吧头一起带走，
         // 而用「吧头反向位移」抵消又会被虚拟容器的渲染区裁掉（真机表现为「吧头被遮挡后再出现」）。
         // 现改为逐张帖子卡片位移（见上面的 `LazyForEach`），容器与吧头保持静止。
@@ -2544,21 +2918,50 @@ struct ThreadList {
         .scrollBar(BarState.Off)
         .clip(false)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .overlay(this.BottomFadeOverlay())
-        .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+        // 顶部渐显带移到页面层（与首页同挂点）：容器顶边已在页 90vp，带若挂在此处会整体下移压到吧头
         .edgeEffect(EdgeEffect.Spring)
         .onAreaChange((oldValue: Area, newValue: Area) => this.onViewportAreaChange(oldValue, newValue))
         .onScroll((xOffset: number, yOffset: number) => this.onListScroll(xOffset, yOffset))
+        .onTouch((event: TouchEvent) => this.onListTouchRecord(event))
+        .onScrollStart(() => this.onListScrollStart())
+        .onScrollStop(() => this.onListScrollStopPrefetch())
         .onReachEnd(() => {
+          // 用户已滑到边界：后台预取仍在途时立即浮出 loading（空白占位比转圈更糟）
+          this.revealLoadHintOnReachEnd();
           if (this.hasMore && !this.loadingMore) {
             this.loadMore();
           }
         })
+        // 左右滑切排序·节点兜底挂接：容器自身带的内置滚动手势显然在本节点正常派发
+        // （竖向滚动可用），同节点 .gesture 横向 Pan 经方向竞争可与竖滚共存（UserProfile 双页栈同款机制）。
+        // 与内层 Stack 的 parallelGesture 多点同触发，由 onSortSwipeEnd 时间戳去重。
+        .gesture(
+          PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 30 })
+            .onActionStart(() => {
+              console.info('[TL_SWIPE] waterflow pan start');
+              this.lockSwipe();
+            })
+            .onActionEnd((event: GestureEvent) => {
+              this.onSortSwipeEnd(event);
+              this.unlockSwipeDelayed();
+            })
+            .onActionCancel(() => {
+              this.unlockSwipeDelayed();
+            })
+        )
+        }
+        .width('100%')
+        .height('calc(100% - 90vp)')
+        .margin({ top: THREAD_LIST_HEADER_TOP_SPACE })
+        // 与首页同款：Refresh 自身不裁切 → 列表内容可溢出到顶栏之下渲染（顶部沉浸的关键）
+        .clip(false)
+        .onRefreshing(() => { this.handleRefresh(true); })
       } else {
+      // 下拉刷新（2026-09-22，docs/下拉刷新.md）：单列档与多列档同款（见多列档注释）
+      Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
       Scroll(this.listScroller) {
         Column() {
-          // 预留顶栏高度作为初始间距（与旧页快照的裁剪边界同源，见 THREAD_LIST_HEADER_TOP_SPACE）
-          Column().width('100%').height(THREAD_LIST_HEADER_TOP_SPACE)
+          // 顶栏让位已由 Refresh 的 margin 承担（见容器链），内容不再重复让位
 
           // 本吧本地搜索态：隐藏吧头/排序 Tab，仅显示搜索结果
           // 转场：进入搜索向上轻收淡出、退出搜索自上方落下淡入（与下方结果区反向，形成"换场"层次）
@@ -2717,22 +3120,29 @@ struct ThreadList {
                     onComment: (tid: string) => this.openThread(tid),
                     onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
                   })
+                    .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean) => this.onCardListVisible(item.tid, isVisible))
                 }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
               }
 
               if (this.hasMore) {
+                // 尾部哨兵三态等高（LIST_FOOTER_SENTINEL_H）：静默占位 / 加载中 / 加载失败重试。
+                // 静默态不显形 —— 后台预取未超时时整行只占位，用户滑到底看到的是"无缝续上"而非转圈。
                 Row() {
-                  if (this.loadingMore) {
-                    LoadingView({ message: '加载中...' }).height(40)
-                  } else {
-                    Text('上拉加载更多')
+                  if (this.loadingHintVisible) {
+                    LoadingView({ message: '加载中...' }).height(LIST_FOOTER_SENTINEL_H)
+                  } else if (this.loadMoreFailed) {
+                    Button('加载失败，点击重试')
                       .fontSize(fs(13, this.fontScale))
-                      .fontColor(Theme.textTertiary(this.isDark))
+                      .fontColor(Theme.brand())
+                      .backgroundColor(Color.Transparent)
+                      .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                      .onClick(() => { this.loadMore(); })
                   }
+                  // 静默态（后台预取在途且未超时）：不显形、不转圈，仅留等高占位
                 }
                 .width('100%')
+                .height(LIST_FOOTER_SENTINEL_H)
                 .justifyContent(FlexAlign.Center)
-                .padding({ top: Spacing.md, bottom: Spacing.md })
               }
             }
             .width('100%')
@@ -2766,25 +3176,55 @@ struct ThreadList {
       // 新页位移已下移到「列表区」那一层，故这里不再挂 translate —— 吧头/兜底排序栏由此保持静止
       .id(THREAD_SCROLL_SNAPSHOT_ID)
       .scrollBar(BarState.Off)
-      .layoutWeight(1)
+      // 容器在 Refresh 内 → 满高（Refresh 已 margin 90 下移）；渐显带改挂页面层（见多列档注释）
+      .height('100%')
       .clip(false)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .overlay(this.BottomFadeOverlay())
-      .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
+      // 顶部渐显带改挂页面层（与首页同挂点）
       .edgeEffect(EdgeEffect.Spring)
       .onAreaChange((oldValue: Area, newValue: Area) => this.onViewportAreaChange(oldValue, newValue))
       .onScroll((xOffset: number, yOffset: number) => this.onListScroll(xOffset, yOffset))
+      .onTouch((event: TouchEvent) => this.onListTouchRecord(event))
+      .onScrollStart(() => this.onListScrollStart())
+      .onScrollStop(() => this.onListScrollStopPrefetch())
       .onReachEnd(() => {
         // 搜索态：触底兜底再取一批（正常滚动已在接近末尾时提前取）
         if (this.searchMode) {
           this.searchNextBatch();
           return;
         }
+        // 用户已滑到边界：后台预取仍在途时立即浮出 loading（空白占位比转圈更糟）
+        this.revealLoadHintOnReachEnd();
         if (this.hasMore && !this.loadingMore) {
           this.loadMore();
         }
       })
+      // 左右滑切排序·节点兜底挂接（与多列档 WaterFlow 同款）：容器内置滚动手势在本节点
+      // 正常派发，同节点 .gesture 横向 Pan 经方向竞争与竖滚共存；多点同触发由时间戳去重。
+      .gesture(
+        PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 30 })
+          .onActionStart(() => {
+            console.info('[TL_SWIPE] scroll pan start');
+            this.lockSwipe();
+          })
+          .onActionEnd((event: GestureEvent) => {
+            this.onSortSwipeEnd(event);
+            this.unlockSwipeDelayed();
+          })
+          .onActionCancel(() => {
+            this.unlockSwipeDelayed();
+          })
+      )
       }
+      .width('100%')
+      .height('calc(100% - 90vp)')
+      .margin({ top: THREAD_LIST_HEADER_TOP_SPACE })
+      .clip(false)
+      .onRefreshing(() => { this.handleRefresh(true); })
+      }
+
+      // 顶部满宽渐显带（2026-09-22）：挂页面层、只罩顶部按钮区（108vp），位置在悬浮顶栏之前 → 不遮按钮
+      this.TopFadeBand()
 
       // 悬浮顶栏（内容可穿过）；
       // 官方 title 槽位路径下整行已在槽位里（ThreadTitleBar），这里不再叠一层
@@ -2894,6 +3334,26 @@ struct ThreadList {
     .height('100%')
     .backgroundColor(Theme.bg(this.isDark))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    // 左右滑切排序手势（热门 / 最新 / 精选）：挂**列表内容的直接父层 Stack**（HomeTab 推荐流 /
+    // UserProfile 双页栈同款层级，真机验证可用；挂更外层 Stack 真机实测不触发）。
+    // parallelGesture 与列表竖向滚动并行识别（Horizontal 轴方向竞争不冲突）。
+    // onActionStart 起手即锁卡点按：滑动期间抬指仍可能给卡片派发 click（openThread 内 swipeLock 短路），
+    // 抬指延时解锁。同名手势还挂在 WaterFlow / Scroll 节点自身兜底（见各容器链尾），
+    // 多点同触发由 onSortSwipeEnd 内 350ms 时间戳去重。
+    .parallelGesture(
+      PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 30 })
+        .onActionStart(() => {
+          console.info('[TL_SWIPE] stack pan start');
+          this.lockSwipe();
+        })
+        .onActionEnd((event: GestureEvent) => {
+          this.onSortSwipeEnd(event);
+          this.unlockSwipeDelayed();
+        })
+        .onActionCancel(() => {
+          this.unlockSwipeDelayed();
+        })
+    )
 
     // 悬浮 FAB 与底部排序底栏（§4.8 T-F「选项 B」）：
     // 槽位路径 + 非搜索态时，底栏与加号合并为 `BottomGroupShell()`（缝 12、锚点分档：手机左对齐 / 平板居中）；
@@ -3329,6 +3789,18 @@ struct ThreadList {
     .scale({ x: this.pressedTab === index ? 0.93 : 1, y: this.pressedTab === index ? 0.93 : 1 })
     .animation({ duration: 100, curve: Curve.EaseOut })
     .accessibilityText(label)
+    .onTouch((event: TouchEvent) => {
+      // 精选钮按下即预取（60ms 计时：快点按不白发，长按意图在 350ms 前就起跑）
+      if (index === 2) {
+        this.onGoodButtonTouch(event);
+      }
+    })
+    .gesture(LongPressGesture({ fingers: 1, repeat: false, duration: 350 })
+      .onAction(() => {
+        if (index === 2) {
+          this.openGoodCategories();
+        }
+      }))
     .onClick(() => {
       this.pulseTab(index);
       this.selectSort(index);
@@ -3399,7 +3871,7 @@ struct ThreadList {
       Column({ space: 8 }) {
         // 吧名
         Text((this.forumInfo?.forumName ?? this.forumName) + '吧')
-          .fontSize(fs(28, this.fontScale))
+          .fontSize(fs(19, this.fontScale))
           .fontWeight(FontWeight.Bold)
           .fontColor(Theme.textPrimary(this.isDark))
           .maxLines(1)
@@ -3553,6 +4025,23 @@ struct ThreadList {
   }
 
   private threadColumns(): number {
+    // 派生缓存（2026-09-19，零风险）：本函数每次 build 被调 5~10 次，而内部整条设备判定链
+    // （isWideBarFullscreen → isWideBarDevice / isLargeScreenForm → isWideBarDevice + isLargeFoldDevice
+    //  / isLargeFoldDevice / isWideBarDevice）每次都会调 display.isFoldable() / getFoldStatus() /
+    // getDefaultDisplaySync()，结果却只由 pageWidth / pageHeight / columnMode 决定。
+    // 折叠屏展开↔折叠必然改变窗口尺寸 ⇒ 键必变 ⇒ 不会漏翻档。
+    const key: string = `${this.pageWidth}|${this.pageHeight}|${this.columnMode}`;
+    if (key === this.colCacheKey) {
+      return this.colCacheValue;
+    }
+    const cols: number = this.computeThreadColumns();
+    this.colCacheKey = key;
+    this.colCacheValue = cols;
+    return cols;
+  }
+
+  /** 列数真值计算（无缓存）：仅供 threadColumns() 调用，勿直接调用以免绕过缓存 */
+  private computeThreadColumns(): number {
     // 窗口闸门最前（2026-09-17 小窗 / 分屏适配）：窗口宽 <600（自由多窗小窗 / 分屏窄窗）一律回落
     // 手机单列档——须在设备恒值分支（大折叠恒 3）之前，防小窗误命中
     // 阔直屏全屏白名单（2026-09-18）：Pura X View（VOL-AL00）等阔直屏竖屏全屏窗口宽仅 ~440vp，
@@ -3593,7 +4082,11 @@ struct ThreadList {
    * 只在多列档写会让别的页在单列下按多列几何渲染（§6.1 D1 / D6：折叠屏展开 → 折叠必须回 1）。
    */
   private syncCardColumns(): void {
-    AppStorage.setOrCreate(CARD_COLUMNS_KEY, this.threadColumns());
+    // 同值短路（2026-09-18 旋转丝滑）：见 HomeTab 同款说明——同值重写会白触发全屏 ThreadCard 重排
+    const next: number = this.threadColumns();
+    if (AppStorage.get<number>(CARD_COLUMNS_KEY) !== next) {
+      AppStorage.setOrCreate(CARD_COLUMNS_KEY, next);
+    }
   }
 
   /** 把扁平列表按当前列数切成二维行数组（仅列数 > 1 时调用） */
@@ -3693,20 +4186,35 @@ struct ThreadList {
   }
 
   private pinnedThreads(): ThreadItem[] {
-    // On "精选" tab (sort=2), don't separate - show everything as ThreadCard for easy browsing
-    if (this.selectedSort === 2) {
-      return [];
+    // 派生缓存（2026-09-19，零风险自失效）：键 = threads 引用 + 排序档；
+    // threads 全程整体赋值 ⇒ 引用变即内容变。返回值仅被读取（.length / threadRows / ForEach），无调用方 mutate。
+    if (this.pinnedCacheSrc === this.threads && this.pinnedCacheSort === this.selectedSort) {
+      return this.pinnedCacheValue;
     }
-    return this.threads.filter((t: ThreadItem) => t.isTop === true);
+    // On "精选" tab (sort=2), don't separate - show everything as ThreadCard for easy browsing
+    const result: ThreadItem[] = this.selectedSort === 2
+      ? []
+      : this.threads.filter((t: ThreadItem) => t.isTop === true);
+    this.pinnedCacheSrc = this.threads;
+    this.pinnedCacheSort = this.selectedSort;
+    this.pinnedCacheValue = result;
+    return result;
   }
 
   private normalThreads(): ThreadItem[] {
-    // On "精选" tab (sort=2), show ALL threads as normal cards
-    if (this.selectedSort === 2) {
-      return this.threads;
+    // 派生缓存（2026-09-19，零风险自失效）：同 pinnedThreads
+    if (this.normalCacheSrc === this.threads && this.normalCacheSort === this.selectedSort) {
+      return this.normalCacheValue;
     }
+    // On "精选" tab (sort=2), show ALL threads as normal cards
     // On other tabs: show non-置顶 threads as normal cards (精品 threads included)
-    return this.threads.filter((t: ThreadItem) => t.isTop !== true);
+    const result: ThreadItem[] = this.selectedSort === 2
+      ? this.threads
+      : this.threads.filter((t: ThreadItem) => t.isTop !== true);
+    this.normalCacheSrc = this.threads;
+    this.normalCacheSort = this.selectedSort;
+    this.normalCacheValue = result;
+    return result;
   }
 
   /**
@@ -3920,12 +4428,17 @@ struct ThreadList {
           this.pulseTab(2);
           this.selectSort(2);
         })
+        // 与槽位路径同款：长按精选进精选二级分类页
+        .gesture(LongPressGesture({ fingers: 1, repeat: false, duration: 350 })
+          .onAction(() => {
+            this.openGoodCategories();
+          }))
     }
     .width('100%')
     .padding({ left: 12, right: 12, top: 4, bottom: 8 })
   }
 
-  private async handleRefresh(): Promise<void> {
+  private async handleRefresh(fromPull: boolean = false): Promise<void> {
     if (this.refreshing) {
       console.info(`[REFRESH] skip (busy) sort=${this.selectedSort}`);
       return;
@@ -3957,7 +4470,10 @@ struct ThreadList {
         this.saveForumCache(result.list);
       }
       console.info(`[REFRESH] ok sort=${this.selectedSort} n=${result.list.length} cost=${Date.now() - t0}ms`);
-      this.getUIContext().getPromptAction().showToast({ message: '刷新成功' });
+      // 下拉刷新路径不弹「刷新成功」（下拉手势本身即反馈，每次弹 toast 过噪）；重复点排序仍保留
+      if (!fromPull) {
+        this.getUIContext().getPromptAction().showToast({ message: '刷新成功' });
+      }
     } catch (e) {
       const msg = (e as Error).message ?? '刷新失败';
       console.info(`[REFRESH] fail sort=${this.selectedSort} cost=${Date.now() - t0}ms err=${msg}`);
@@ -4093,24 +4609,25 @@ struct ThreadList {
     }
   }
 
-  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（90vp = 吧头让位折算），手机维持 15% */
-  private topFadeStop(): number {
-    if (!this.isWideFormDevice || this.pageHeight <= 0) {
-      return 0.15;
-    }
-    return Math.min(0.15, THREAD_LIST_HEADER_TOP_SPACE / this.pageHeight);
-  }
-
+  /**
+   * 顶部满宽渐显带（2026-09-22 收敛，同 ForumsTab/Favorite 的「背景色渐变条」范式）：
+   * 高 108 = 顶栏 98 + 10 呼吸，**只覆盖顶部按钮区**，不吃到吧头（此前 DST_IN 版按容器高度比例
+   * 取「页高 15%」，且容器 margin 下移后整体压到吧头上，用户两次反馈）。
+   * 背景色 → 透明的实色渐变条叠加在页面背景之上 = 视觉等价渐隐，宽度不依赖滚动容器解析。
+   */
   @Builder
-  BottomFadeOverlay() {
-    Stack()
-      .height('100%')
+  TopFadeBand() {
+    Column()
       .width('100%')
+      .height(THREAD_LIST_TITLE_BAR_FADE)
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
+
 }

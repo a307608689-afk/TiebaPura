@@ -23,6 +23,9 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 const TAG: string = 'CacheManager';
 export const STORE_NAME: string = 'tieba_cache';
 
+/** 读操作等待 store 就绪的最长时间；超时按未命中放行，绝不卡住 UI */
+const READY_WAIT_MS: number = 300;
+
 interface TtlWrapper<T> {
   data: T;
   expireAt: number;
@@ -46,6 +49,12 @@ interface PruneEntry {
 export class CacheManager {
   private static instance: CacheManager | null = null;
   private store: preferences.Preferences | null = null;
+  /** init 已收敛（成功或失败）标记，配合 readyWaiters 唤醒等待中的读操作 */
+  private ready: boolean = false;
+  /** init 是否已被调用过：没被调用过就没人会唤醒等待者，读操作必须立刻返回，不能白等超时 */
+  private initStarted: boolean = false;
+  /** 在 init 收敛前发起、正在等待 store 就绪的读操作回调 */
+  private readyWaiters: Array<() => void> = [];
 
   static getInstance(): CacheManager {
     if (CacheManager.instance === null) {
@@ -58,6 +67,7 @@ export class CacheManager {
    * 初始化，需传入 UIAbilityContext
    */
   async init(context: common.UIAbilityContext): Promise<void> {
+    this.initStarted = true;
     if (this.store !== null) {
       return;
     }
@@ -65,26 +75,58 @@ export class CacheManager {
       this.store = await preferences.getPreferences(context, STORE_NAME);
     } catch (e) {
       hilog.error(0x0000, TAG, 'init error: %{public}s', JSON.stringify(e));
+    } finally {
+      // 无论成功失败都要唤醒等待者：失败时等待者按「store 仍为空」的原有语义返回未命中
+      this.markReady();
+    }
+  }
+
+  /** 标记 store 就绪并唤醒全部等待者 */
+  private markReady(): void {
+    this.ready = true;
+    const waiters: Array<() => void> = this.readyWaiters;
+    this.readyWaiters = [];
+    for (const w of waiters) {
+      w();
     }
   }
 
   /**
-   * 写入字符串
+   * 等待 store 就绪：init 已发起但未收敛时挂起读操作至其完成（或 READY_WAIT_MS 超时放行）。
+   * 冷启动时 onCreate 已 fire-and-forget 调 init，而页面首帧读盘可能抢在其前，
+   * 若不等就会全部 miss（详情页首屏退化为纯网络加载）。
+   * init 从未被调用时立刻返回（保持改造前语义），绝不白等超时。
    */
-  async appendJsonItem<T>(key: string, value: T, maxItems: number = 50): Promise<void> {
-    const raw = await this.get(key);
-    let items: T[] = [];
-    if (raw !== undefined) {
-      try {
-        items = JSON.parse(raw) as T[];
-      } catch (e) {
-        items = [];
-      }
+  private waitReady(): Promise<void> {
+    if (this.ready || !this.initStarted) {
+      return Promise.resolve();
     }
-    const next: T[] = [value, ...items].slice(0, maxItems);
-    await this.put(key, JSON.stringify(next));
+    return new Promise<void>((resolve: () => void): void => {
+      let settled: boolean = false;
+      const done: () => void = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        const idx: number = this.readyWaiters.indexOf(done);
+        if (idx >= 0) {
+          // 超时先到的情况：从等待队列摘除，避免 init 收敛时重复唤醒
+          this.readyWaiters.splice(idx, 1);
+        }
+        resolve();
+      };
+      this.readyWaiters.push(done);
+      setTimeout(done, READY_WAIT_MS);
+    });
   }
 
+  /**
+   * 写入字符串
+   *
+   * 注（2026-09-23）：原 `appendJsonItem`（无脑前插的 JSON 数组追加）已删除——浏览历史是它唯一
+   * 的使用方，而「纯前插 + 不去重」正是「同一帖每次进都留一条、50 条上限被重复项吃光」的根因；
+   * 历史记录现统一走 `service/HistoryStore`（去重 + 浏览时间 + 串行写）。
+   */
   async put(key: string, value: string): Promise<void> {
     if (this.store === null) {
       return;
@@ -101,6 +143,7 @@ export class CacheManager {
    * 读取字符串
    */
   async get(key: string): Promise<string | undefined> {
+    await this.waitReady();
     if (this.store === null) {
       return undefined;
     }
@@ -119,6 +162,7 @@ export class CacheManager {
    */
   async getAllByPrefix(prefix: string): Promise<Map<string, string>> {
     const result: Map<string, string> = new Map<string, string>();
+    await this.waitReady();
     if (this.store === null) {
       return result;
     }

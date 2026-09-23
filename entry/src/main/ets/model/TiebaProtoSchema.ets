@@ -464,6 +464,16 @@ export interface FrsForumMessage {
   slogan?: string;
   fShareImg?: string;
   forumShareLink?: string;
+  /** 精选二级分类（ForumInfo.good_classify，field 21；2026-09-20 精选分类页探针实测） */
+  goodClassify?: GoodClassifyMessage[];
+}
+
+/** 精选二级分类项（实测响应只带 class_id(3)/class_name(4)；name(1)/id(2) 兼容保留） */
+export interface GoodClassifyMessage {
+  name?: string;
+  id?: number;
+  classId?: number;
+  className?: string;
 }
 
 export interface FrsGroupMessage {

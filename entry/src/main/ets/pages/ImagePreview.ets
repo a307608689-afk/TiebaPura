@@ -23,6 +23,7 @@ import { fileIo } from '@kit.CoreFileKit';
 import { HttpClient } from '../network/HttpClient';
 import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { FloorItem } from '../model/DataModel';
+import { ImageCache, acquireImagePreloadSlot, releaseImagePreloadSlot } from '../cache/ImageCache';
 import { Theme, Spacing, Radius, isDarkMode, MaterialManager, fs } from '../common/Theme';
 
 /**
@@ -74,6 +75,19 @@ struct ImagePreview {
   @State panX: number = 0;
   @State panY: number = 0;
 
+  /**
+   * 2026-09-23 预览提速（P1/P4）：url → 本地 file:// 显示路径（整体赋新对象触发重渲染，
+   * 与 ThreadCard gridThumbFallbacks 同口径）。显示优先级：高清档（pv_，720 宽）>
+   * 基础档（HASH 归一，与宫格/预热共用同一文件）> 原始 URL 直连（改前行为兜底）。
+   * 改前预览页 Image 直喂 http URL 走 ArkUI 内置加载器——与 ImageCache 完全不相干，
+   * 明明本地已有同图文件还要冷启动网络栈整图重下，这就是「第一张图慢」的根因。
+   */
+  @State imageSources: Record<string, string> = {};
+  /** 已发起过后台解析链的 URL（去重；同一 url 只 kick 一次） */
+  private kickedUrls: Set<string> = new Set<string>();
+  /** 已拿到高清档的 URL：防止基础档结果晚到时把高清显示降级覆盖回去 */
+  private hdDoneUrls: Set<string> = new Set<string>();
+
   private pinchBaseScale: number = 1;
   private pinchBasePanX: number = 0;
   private pinchBasePanY: number = 0;
@@ -118,6 +132,11 @@ struct ImagePreview {
     // 否则首屏就是"最后一张"、要等用户先滑动一次才触发
     if (this.currentIndex >= this.urls.length - 3) {
       this.appendStreamPage();
+    }
+    // 预览提速（P1 同步直出 + P2 邻图预取）：当前图闸门插队（priority=1），
+    // 左右邻图普通档；基础档与详情宫格共用 HASH 归一缓存，大多数字图已是本地文件。
+    for (const off of [-1, 0, 1, 2]) {
+      this.kickImage(this.currentIndex + off, off === 0 ? 1 : 0);
     }
   }
 
@@ -173,7 +192,9 @@ struct ImagePreview {
             Stack() {
               // 图片节点常驻：缩放/平移只改属性，节点永不销毁重建，
               // 双击放大/缩回瞬间不再重新解码位图，消除"闪一下"
-              Image(url)
+              // src 三级解析（P1/P4）：本地高清 > 本地基础档 > 原始 URL 直连（改前行为）；
+              // 后台解析落地后经 imageSources 整体赋值热替换，布局/手势/几何零改动
+              Image(this.srcOf(idx))
                 .width('100%')
                 .height('100%')
                 .objectFit(ImageFit.Contain)
@@ -247,6 +268,10 @@ struct ImagePreview {
         .onChange((index: number) => {
           this.currentIndex = index;
           this.resetZoom();
+          // P2 邻图预取：翻到新页即补齐它的邻域（kickedUrls 去重，重复触发零开销）
+          for (const off of [-1, 0, 1, 2]) {
+            this.kickImage(index + off, off === 0 ? 1 : 0);
+          }
           // 流式补页触发：距已加载图片末尾还剩 3 张时开始拉下一页，尽量让用户滑到头时新图已就位
           if (index >= this.urls.length - 3) {
             this.appendStreamPage();
@@ -353,6 +378,88 @@ struct ImagePreview {
     .width('100%')
     .height('100%')
     .backgroundColor(Color.Black)
+  }
+
+  /**
+   * 显示 src 三级解析：imageSources 里的本地路径（高清/基础档）> 原始 URL（改前直连行为）。
+   * 纯函数读 @State Record：整体赋值后所有 Image 的 src 自动重算。
+   */
+  private srcOf(idx: number): string {
+    const url: string = this.urls[idx] ?? '';
+    if (url.length === 0) {
+      return url;
+    }
+    const local: string | undefined = this.imageSources[url];
+    return local !== undefined ? local : url;
+  }
+
+  /**
+   * 写入本地显示路径（整体赋新对象触发重渲染）。isHd=false 的基础档结果若晚于高清档
+   * 到达则丢弃，避免显示被降级覆盖。
+   */
+  private setLocalSrc(url: string, path: string, isHd: boolean): void {
+    if (this.imageSources[url] === path) {
+      return;
+    }
+    if (!isHd && this.hdDoneUrls.has(url)) {
+      return;
+    }
+    const next: Record<string, string> = {};
+    const keys: string[] = Object.keys(this.imageSources);
+    for (const k of keys) {
+      next[k] = this.imageSources[k];
+    }
+    next[url] = path;
+    this.imageSources = next;
+  }
+
+  /**
+   * 单图解析链（2026-09-23 预览提速）：
+   * ① P1 同步直出：getVerifiedCachedPath 命中（宫格显示/预热已落地的同 HASH 文件，
+   *    90% 以上场景）→ 本帧即 file:// 上屏，零网络等待——这是「第一张图慢」的根治点；
+   * ② 基础档：未命中时 resolve（与宫格在途请求按缓存文件名合流，不重复下载），落地即显示；
+   * ③ P4 高清档：resolvePreview 拉 w%3D720（独立 pv_ 缓存），落地后静默替换——
+   *    全屏 Contain 与双击/捏合放大的清晰度终态，高于改前的 400 档。
+   * 整条链只占一个闸门槽位（priority：当前图 1 插队 / 邻图 0），失败静默回落直连。
+   */
+  private kickImage(idx: number, priority: number): void {
+    if (idx < 0 || idx >= this.urls.length) {
+      return;
+    }
+    const url: string = this.urls[idx];
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return;
+    }
+    if (this.kickedUrls.has(url)) {
+      return;
+    }
+    this.kickedUrls.add(url);
+    // ① 同步直出：Z1 校验口径（≥阈值字节、非已知占位模板），与详情宫格首帧同一语义
+    const local: string | null = ImageCache.getVerifiedCachedPath(url);
+    if (local !== null) {
+      this.setLocalSrc(url, local, false);
+    }
+    (async (): Promise<void> => {
+      await acquireImagePreloadSlot(priority);
+      try {
+        if (local === null) {
+          // ② 基础档：in-flight 合流——宫格那条解析还在路上时这里直接等它，不排第二次队
+          const basic: string = await ImageCache.resolve(url);
+          if (basic.startsWith('file://')) {
+            this.setLocalSrc(url, basic, false);
+          }
+        }
+        // ③ 高清档：无宽度参数的 URL 本身即原图，resolvePreview 内部与基础档同文件，不重复下载
+        const hd: string = await ImageCache.resolvePreview(url);
+        if (hd.startsWith('file://')) {
+          this.setLocalSrc(url, hd, true);
+        }
+      } catch (e) {
+        // 静默：显示侧维持原始 URL 直连（与改前行为一致），不影响浏览
+      } finally {
+        releaseImagePreloadSlot();
+      }
+    })();
   }
 
   private getScale(idx: number): number {
@@ -517,21 +624,16 @@ struct ImagePreview {
   }
 
   /**
-   * 从楼层页结果提取图片，顺序与 `ThreadDetail.collectAllImages()` 逐项一致
-   * （楼图 → 该楼楼中楼图）。空串过滤仅为防御：空 url 不可渲染，正常解析不应产生。
+   * 从楼层页结果提取图片，顺序与 `ThreadDetail.collectAllImages()` 逐项一致。
+   * 2026-09-20 预览解耦：**只收楼层图，不再收集楼中楼（comments）图片**——
+   * 楼中楼图片预览已独立（宫格点击走单张预览），主图流左右滑/补页均不应出现楼中楼图。
+   * 空串过滤仅为防御：空 url 不可渲染，正常解析不应产生。
    */
   private extractStreamImages(floors: FloorItem[]): string[] {
     const out: string[] = [];
     for (const floor of floors) {
       if (floor.images && floor.images.length > 0) {
         out.push(...floor.images);
-      }
-      if (floor.comments) {
-        for (const comment of floor.comments) {
-          if (comment.images && comment.images.length > 0) {
-            out.push(...comment.images);
-          }
-        }
       }
     }
     return out.filter((url: string) => url.length > 0);
@@ -551,14 +653,27 @@ struct ImagePreview {
       const dest = await fileIo.open(createdUri, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
       try {
         const imageUrl: string = this.urls[this.currentIndex];
-        const bytes: ArrayBuffer = await HttpClient.getBinary(imageUrl, {
-          'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-          'Referer': 'https://tieba.baidu.com/'
-        });
-        if (bytes.byteLength === 0) {
-          throw new Error('图片内容为空');
+        // 预览提速 P4：高清档（pv_，720/原图）已落地 → 直接拷贝本地文件，
+        // 零网络等待且保存的就是预览终态那份最高清字节；未落地维持原网络请求兜底
+        const hdPath: string | null = ImageCache.getPreviewCachedPath(imageUrl);
+        if (hdPath !== null) {
+          const srcFile: fileIo.File =
+            fileIo.openSync(hdPath.substring('file://'.length), fileIo.OpenMode.READ_ONLY);
+          try {
+            await fileIo.copyFile(srcFile.fd, dest.fd);
+          } finally {
+            fileIo.closeSync(srcFile);
+          }
+        } else {
+          const bytes: ArrayBuffer = await HttpClient.getBinary(imageUrl, {
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            'Referer': 'https://tieba.baidu.com/'
+          });
+          if (bytes.byteLength === 0) {
+            throw new Error('图片内容为空');
+          }
+          await fileIo.write(dest.fd, bytes);
         }
-        await fileIo.write(dest.fd, bytes);
       } finally {
         await fileIo.close(dest);
       }

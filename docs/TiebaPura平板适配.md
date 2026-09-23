@@ -61,6 +61,7 @@
 > 更新：2026-09-17 · **§6.8 分类变更跨页回流（数据链路修复，几何零改动）**：用户报「详情页长按收藏 → 面板内新建分类 / 选分类 → 完成 → 打开收藏页，自定义分类列表仍不刷新，须重启 App 才出现」。根因 = 收藏页是 Index 内**常驻 @Component**（非 @Entry，`onPageShow` 不回调；`refreshFromCache()` 也只重读收藏项、从不重读分类），而 `categories` / `mappings` 只在该页 `loadAll()`（aboutToAppear / 换号）里读一次 → 外部落库没有任何回流通路。修法 = 新增 AppStorage 广播 token **`favCatChanged`**：写方自增——`FavCategoryPicker.commitCreate()`（面板内新建分类落库后）与 `ThreadDetail.applyPickCategory()`（完成归类落库后）；订阅方 = 收藏页 `@StorageLink('favCatChanged') @Watch('onCatChanged')` → `reloadCategories()` 重读 `loadCategories` + `loadMappings`（纯本地零网络，不动收藏列表那条 refreshFromCache 线），并在当前停留的自定义分类已被删时回落分类根视图。收藏页自身 CRUD / 移入（@Link 回写）不广播，保持零变化。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验**。
 > 更新：2026-09-17 · **§4.3 收藏归类面板「新建分类」行加号列对齐（纯面板内几何微调）**：用户要求「新建分类的加号跟勾选圆左对齐，文字也跟着调整」→ 收起态由「20 透明占位（对齐勾选圆）+ 44 图标圆（加号）+ 文字」改为「20 宽列内居中加号（与勾选圆同列、同视觉中心）+ 文字随之前移一列」，删掉 44 图标圆（加号不再占第二列）；加号列高取 44 与分类行图标圆等高 → 行高（padding 16×2 + 44）不变，行不塌；加号不设品牌色底圆，与「已勾选」实心勾选圆区分。展开态（输入行 + 取消 / 保存）与其余条目几何、材质、文案零改动。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验**。
 > 更新：2026-09-17 · **§4.3 收藏归类面板抽为共用组件 + 详情页长按收藏钮入口 + 新建分类重名拦截（功能改动，几何零改动）**：① 新增 `components/FavCategoryPicker.ets` 作单一来源（面板 UI / 勾选互斥 / 新建分类校验；**不碰持久化**，落库交宿主 `onDone`），收藏页原根节点 `.bindSheet` 与 `MovePanelContent` 整体迁入（62% 高 / 遮罩 `#66000000` / 顶部圆角 24 / `ImmMaterial.sheet()` / 无拖拽条逐项不变），「完成」由 `Favorite.applyMove(checked)` 承接；② **详情页新增长按入口**：收藏钮短按行为不变，长按 350ms 弹同一面板（`ThreadDetail.openCategoryPicker`），「完成」走 `applyPickCategory`——未收藏则先按短按同链路收藏、再替换式归类；**下滑 / 点遮罩关闭 = 零副作用**（写库全在 onDone）；③ **重名拦截**：面板内新建、分类管理页新建 / 改名、重命名弹窗三处统一「该分类已存在」（改名排除自身）。`tools/build.ps1` → **BUILD SUCCESSFUL**（39s）；**待真机验收**（详情页长按弹面板并收藏归类、关闭无痕、收藏页移入面板行为与几何逐像素不变、重名提示、手机 / 平板 / 折叠各形态）。
+> 更新：2026-09-18 · **§4.3 收藏归类面板新增常驻搜索框（用户指定「放在面板最顶端」，含面板高度变更）+ 顶端留白对齐左右 + 卡片圆角增大**：用户提出「自定义分类多起来后，希望用搜索快速找到分类并移入」并圈定落点为**面板上沿之上那条横带**（该处原属系统遮罩、应用塞不进内容）→ 方案定「**面板整体加高一条搜索框 + 搜索框置顶**」：① `components/FavCategoryPicker.ets` 面板最顶端插入常驻搜索框（`sys.symbol.magnifyingglass` + `TextInput`，胶囊 40 高、宽 `calc(100% - 32vp)`，与标题行 / 列表同取 `Spacing.lg` 左右外边距；材质与列表条目**同源** `ImmMaterial.cardAction()` + 半透明底 `#B3FFFFFF` / `#B31B1E24`）；② 新增 `@State query` + `filteredRows()`（空串原样返回 → 「未分类恒首位 + 分类顺序」零变化；有词按名称大小写不敏感子串匹配）+ `noMatch()` 空态（列表内插一条 160 高「未找到相关分类」提示，**不替掉整个 List** → 下方常驻「新建分类」入口不被挤掉）；③ `resetCreateState()` 更名 `resetInputs()`（关闭面板一并回收搜索词）；④ **顶端留白 `8 → Spacing.lg`(16)**（同日第二轮，用户真机看图后要求「上间距与左右间距一致、成同心圆观感」）：外层 Column 的 `padding({ top: 8 })` 改为 `Spacing.lg`，与搜索框 / 标题行 / 列表同取左右 `Spacing.lg` → **上 / 左 / 右三边等距**，胶囊圆角（full，40 高 → r20）嵌在面板圆角（r24）内成同心观感；⑤ **面板高度 `62% → 67% → 75%`**（同日两轮，第二轮为用户真机看图后拍板加大）：新增内容净高 ≈ 52vp（框 40 + 与标题行间距 `Spacing.xs` 4 + 顶端留白 +8），远小于档位放大值 → **列表可视区不降反增**，遮罩只剩顶部一条，**高度与留白都是本次的刻意变更而非回归**；⑥ **卡片圆角 `Radius.lg`(16) → 组件内常量 `PICKER_CARD_RADIUS`(20)**（同日第三轮，用户要求「移入分类下面收藏夹卡片的圆角增大，并给出可微调的参数」）：三处卡片（分类条目行 / 新建分类输入行 / 「＋ 新建分类」入口行）改为共用文件级常量 `const PICKER_CARD_RADIUS: number = 20`，**改这一个数即三处同步**（**不引全局 `Radius.lg`**：面板卡片要比全局卡片更饱满且要能随时回调，全局 token 不动以免波及其它页）；取值依据 = 与面板顶部搜索胶囊同值（40 高全圆角 → r20）、与面板自身顶圆角（系统半模态 24）成 24 / 20 / 20 的递减梯度；卡高 76（内容 44 + 上下 padding 16×2）→ 半径上限 38 才变胶囊，20 仍在圆角矩形区间，可调档位 16 / 20 / 24；⑦ 刻意不设 `defaultFocus`（打开面板默认不起键盘，列表浏览不被遮挡）。**遗留（挂真机门）**：面板 **75%** + 键盘 ≈38% 已远超整窗，系统顶起 / 压缩 sheet 时最顶端的搜索框有被顶出屏的风险 —— 复现即回退「搜索框挪到标题行之下 + 高度回调 62%」或「高度退回 67%」（已写入代码注释）。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机验收**。
 > 更新：2026-09-14 · **§4.3 渐显带终版方案（弃整页 DST_IN 遮罩，改 Stack 顶层背景色渐变条）**：Refresh 全宽修复后手机仍缺块（平板正常）→ 判定「整页 DST_IN 遮罩 + blendMode OFFSCREEN」的**离屏层宽度在手机上解析异常**，挂点怎么调都不可靠 → **弃用该方案**：`BottomFadeOverlay`（整页 DST_IN）删除，新增 **`TopFadeBand`**——FavContent Stack 顶层满宽（zIndex 8）**背景色渐变条**（高 132 = TopBar 98 + 分段区 ~34；`Theme.bg` → 透明三段渐变，ThreadList TopFadeBand 成品同款思路；下层是纯背景色故视觉等价渐隐），宽度跟随 Stack（全宽已被页面背景实证），彻底不依赖列表宿主宽度解析；8 处列表上的 `.overlay(BottomFadeOverlay)` + `.blendMode` 全部移除（expandSafeArea / clip 保留）。层级：盖列表内容，低于 EditBar(15) / 兜底胶囊行(13)，槽位顶栏在 Navigation title 层更高；`hitTestBehavior(None)` 不挡交互。`tools/build.ps1` → **BUILD SUCCESSFUL**（31s）；**lint 0**；**待真机复验**（四界面渐显带满宽无缺块、只盖按钮与标题区、暗色模式渐变色同步、点击不被遮挡）。
 > 更新：2026-09-14 · **§4.3 渐显带三次修复（Refresh 显式全宽，缺块真因）**：用户再次截图实证四界面渐显带右缘均有竖直分界线（右侧无渐隐）。真因：四个列表的 `Refresh` 均未挂显式宽度 → 内部 `width('100%')` 相对 Refresh 测量成循环、解析为**内容固有宽** → 遮罩 / 列表不满屏。修复：4 处 `Refresh` 统一补 `.width('100%')`（挂在 Refresh 链上，与 onRefreshing 同层）。**教训**：`Refresh` / `Tabs` 等包裹型容器作滚动列表宿主时必须显式 `width('100%')`，不得依赖百分比子项反向撑宽。`tools/build.ps1` → **BUILD SUCCESSFUL**（1m02s）；**lint 0**。
 > 更新：2026-09-14 · **§4.3 渐显带二次修复（滚动条 + 覆盖区收窄）**：① ForumThreadsView 的 Scroll 丢失 `.scrollBar(BarState.Off)`（改写时被吞）→ 默认滚动条绘制在遮罩之上 → 右缘竖条 + 渐显带「右边缺一块」观感，已补；② `topFadeStop()` 手机原按视口高 20%（≈160vp > 首卡顶 110vp）盖到首卡 → **全设备统一收窄**为 `min(0.20, 132 / 长边)`（只盖顶部按钮 / 标题 + 分段切换区，用户要求），fadeCoverVp 未就绪回退 0.20。`tools/build.ps1` → **BUILD SUCCESSFUL**（56s）；**lint 0**。
@@ -102,6 +103,8 @@
 > 更新：2026-09-13 · **§4.9 帖子详情（`ThreadDetail.ets`）+ §4.10 楼中楼详情（`SubPostDetail.ets`）已落地（构建通过、待真机验收，承接"被打断的任务"）**。**§4.9 DT-A / DT-G / DT-H / DT-I / DT-J**：`isLandscape()` / `replyColumns()` / `splitMode()` + `DetailRoot.onAreaChange` 同点取高 + `aboutToAppear` 首帧同步取值；整页 `WaterFlow({ scroller: this.scroller, sections: this.sections })` 三段（让位+主楼+回复表头 / 楼层 / 哨兵）+ `FloorFlowItems()` + `FooterFlowItem()`（哨兵恒渲染）；楼层定位 `.id('floor_' + floorId)` + 高亮底 + 圆角 26 + `clip(true)` **四项一起进 FlowItem**；横屏分栏左栏固定 `DETAIL_MAIN_WIDTH = 420` + `scrollerLeft` 独立、右栏 `WaterFlow` 保留全部机制 → 楼层定位零改动；`ImageGrid` 一改三处共用调用点加 `.constraintSize({ maxWidth: DETAIL_IMAGE_GRID_MAX_WIDTH = 336 })` → 手机档 296 < 336 不生效（零回归）；沉沁四项上移到分栏外层 `Column`（与右栏 `WaterFlow` 同渲染层配对 → 真机复验顶部渐隐）；拍板值采用：#5 `DETAIL_MAIN_WIDTH = 420` / #6 `DETAIL_IMAGE_GRID_MAX_WIDTH = 336` / #7 维持右栏三列 + 真机复核。**§4.10 SP-A / SP-B / SP-D / SP-E / SP-G ~ SP-K**：判据函数 / `syncSections()`（**两段** = 让位+父楼层+回复表头 / 回复三列；与 §4.9 三段不同——本页无「加载更多」UI、无触底哨兵）+ 三挂点（`aboutToAppear` / `onCommentsChanged` / 形态变化，`locateNotifyTarget()` 追加 `commentsState` 由 `@Watch` 自动触发 → `itemsCount` 与子节点数严格一致）；`CommentFlowItems()`：空态补 0 高占位、`ForEach` 渲染所有 `FlowItem`；楼中楼定位 `.id('spc_' + commentId)` 随卡进 `FlowItem`、`flashHighlightComment()` 公式（`targetY - 120`）零改动；横屏左栏固定 `SUBPOST_MAIN_WIDTH = 420`（与 §4.9 同口径）；本页 `ImageGrid`（独立实现）单独加 `.constraintSize({ maxWidth: SUBPOST_IMAGE_GRID_MAX_WIDTH = 336 })`；分栏时 `overlay(BottomFadeOverlay)` + `blendMode(SRC_OVER, OFFSCREEN)` **两项**上移到外层 `Column`（根 `Stack` 的 `backgroundColor(Theme.bg)` 留在原处——差异 3）→ 真机复验底部渐隐。**三处不可照抄点（执行红线）兑现**：① 底部留白 = `Spacing.xl`(20)（不是 §4.9 的 160）；② 间距语言 = `Spacing.sm`(8)（不是 `Spacing.md`12）；③ 卡内间距判定重算（推荐写法：把间距挪到 `WaterFlow.rowsGap(Spacing.sm * 2)`、卡内追加的 8vp 按列内下标判断）。**§三 第 9 / 10 项状态列**：移除「受 §4.6 H-B 前置阻塞」标记，改为「已落地（构建通过、待真机验收）」；§4.9 / §4.10 状态行同步刷新、§6.1 / §6.2 视需要跟进。`tools/build.ps1` → **BUILD SUCCESSFUL**（53s）；**lint 0**；**待真机验收**：① 横屏分栏左栏 420 / 右栏三列窄列观感；② 竖屏三列在 1024 下的紧凑性 + 楼层定位 `getRectangleById` 可读时机；③ `WaterFlow` `itemsCount` 与 `floors` / `commentsState` 条数严格一致（含 `locateNotifyTarget()` 定位翻页追加路径）；④ 顶部渐隐带 / 底部渐隐带在分栏后是否仍正确；⑤ 楼层定位高亮底色圆角与楼层卡一致；⑥ 手机单列（含手机横屏 / 分屏 / 自由多窗窄窗）**逐像素不变**。
 > 更新：2026-09-18 · **「列数调整」全局档位落地（个性化页 + 8 个多列页）**：用户拍板 5 点（只含大屏档 / 不做最小卡宽护栏 / 切档**强制回顶** / 按推荐方案 / 三档位文案固定「默认 · 竖二横三 · 竖三横四」）→ 新增 AppStorage `columnMode` + `CACHE_KEY.COLUMN_MODE`(`tieba_column_mode`) 持久化，**唯一写入口** `UsageHabitsManager.setColumnMode()`（写值 + bump `columnModeTick` + 落盘）；`common/Theme.ets` 新增策略层 4 函数 `readColumnMode` / `columnModeLabel` / `isLargeScreenForm` / `overrideColumns`（`0` = 不覆盖、`1` = 横 3 竖 2、`2` = 横 4 竖 3）；8 个多列页（HomeTab / ForumsTab / Favorite / MessagesTab / PersonalContent / UserProfile / ThreadList / Search）列数函数在**窗口闸门（`<600`）之后**插覆盖块、`@StorageLink('columnModeTick') @Watch` 回写本地档位并**强制 `scrollTo({xOffset:0, yOffset:0})` 回顶**（ForumsTab / PersonalContent 原无 scroller，为此新增 `Scroller` 字段）、各页 `aboutToAppear` 直读档位补冷启动首帧（init 的 bump 可能早于页面构造）；`PersonalizedPage` 新增「列数调整」设置行 + `ColumnModeDialog` 三选一弹窗（`ImmMaterial.dialog()` + 数值宽 `dialogCardWidth()` = `max(200, min(400, 屏宽−48))`【`Dimension` 不接受 `overlayCardWidth()` 的 calc 字符串】 + `offset.dy -110` + 选中项 `checkmark_circle`）。文档新增 **§4.13**，§6.2 已过检记录同步追加一行。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验**（平板三档逐档列数、切档强制回顶、阔直屏与大折叠展开态三档、自由小窗 `<600` 不覆盖、手机全屏逐像素不变、重启后档位保持）。
 > 更新：2026-09-18 · **「列数调整」对阔直屏（Pura X View / 型号 VOL-AL00，2232×1320，16:9.5）加「全屏白名单」**：用户反馈阔直屏切档**竖屏无变化**（横屏有效）→ 根因 = 覆盖块的第二个条件（`isLargeScreenForm` 已含 `isWideBarDevice()`，型号白名单 `WIDE_BAR_MODEL='VOL-AL00'`）本来就成立，真正拦住的是 8 页列数函数**首行窄窗闸门** `pageWidth < 600`——阔直屏**竖屏全屏**窗口宽仅约 **440vp**（屏短边 1320px ÷ density），被误判成自由小窗而回落单列，走不到覆盖块（横屏 ≈744vp ≥ 600）。新增 `Theme.isWideBarFullscreen(pageWidth)` 作**唯一放行口**：阔直屏档设备（`isWideBarDevice()`：型号白名单 VOL-AL00 / 物理比例带 (1.4,1.85)，同档含 Pura X 展开、Pura X Max 展开）**且** 窗口宽 ≈ 屏幕短边 vp（容差 24vp，即窗口占满屏宽 = 全屏）→ 放行；自由小窗 / 左右分屏的窗口宽必然小于屏短边 → 仍拦，**09-17「小窗 <600 一律回落 1 列」结论不被破坏**。8 页闸门统一追加 `&& !isWideBarFullscreen(this.pageWidth)` + 各页补导入；个性化页设置行副标题改「平板 / 阔直屏 / 折叠屏展开的列表列数」。零回归：默认档（`ov=0`）放行后落到阔直屏恒值分支（`updateColumns()` 竖 1 / 横 3），与改前同值、逐像素不变。文档 §4.13 追加小节，§6.2 已过检记录同步追加一行。
+> 更新：2026-09-18 · **§4.9 帖子详情楼层区「单列档卡间距收口」（12 → 8）**：用户真机反馈「帖子详细页，回复区域在单列的情况下，卡片与卡片之间的间距有点大」→ 根因 = 单列档 `FloorColumnsBlock()` 直接展开 `ForEach`，被**外层通栏 `Column({ space: Spacing.md })`（=12）**一并套用 —— 该 12 本是给**主楼 / 回复表头 / 哨兵之间**用的，楼层卡之间顺带偏松。修法 = 单列分支包一层**独立 `Column({ space: Spacing.sm })`（=8）**，与 §4.10 楼中楼页单列档间距语言（`Spacing.sm`）统一口径；**多列档 `Row space=md` 与列内 `Column space=md` 未动、主楼 / 表头 / 哨兵间距 12 未动**。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验**（单列档卡间距收紧后观感、多列档与表头间距不变、手机单列同款收口是否可接受）。
+> 更新：2026-09-22 · **新增 §4.14 精选二级分类页（`pages/GoodCategoryPage.ets`）平板适配落地（已执行 + 构建通过）**：用户平板真机反馈长按「精选」进入的分类页**多列档卡片拉超长 / 卡片不对齐 / 图区大块空白** → 根因 = 多列档 `WaterFlow + WaterFlowSections` 虚拟容器在**双常驻槽位（translate 停靠屏外）+ 沉浸布局**下的 item 测量不可靠（21 轮迭代未根治，§4.4 / §4.2 记录过的虚拟容器风险在本页叠加双槽后放大）→ **弃用 WaterFlow，多列档收敛为「`Scroll` + 列分桶 `Row` + 最短列滞回分桶」全量渲染**（§4.11 P-B / §4.4 消息页同款已验证范式）：外层 `ForEach` 只遍历列索引、内层直读 **@State 分桶镜像**（`syncSlotColumns()` 在 `ds.onMutate` 与列数变化双触发点主动重算写入，MessagesTab「分桶结果必须写 @State」教训同源）；删除 `sections0/1`、`syncSlotSections`、`goodColumnsTemplate` 与「0 高占位格」凑数逻辑；单列档 `Scroll + Column` 结构不变、数据源同切分桶镜像 `[0]`；新增 `estimateGoodCardHeight()`（与 `ThreadCard` 渲染同式的估算高：底数 118 + 标题 ≤2 行 + 摘要 ≤2 行 + 图区〔单图 `min(列宽/1.6, 220)` / 宫格 2·4 张两列 ≤140、其余三列 ≤100〕）与 `GOOD_COL_BALANCE_THRESHOLD = 240` 滞回阈值。双槽常驻 + translate 停靠屏外 + Refresh + 左右滑切分类手势 + `onReachEnd` 翻页全部保留。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验**（平板多列卡片不再拉长/错位/空白、竖 2 横 3 各形态档、切分类平移动画与图片不闪、手机单列逐像素回归）。
 > 说明：本文件按「界面」逐一记录平板适配需求与对应方案，已确认的界面方案沉淀在下方对应小节，未确认的保留在清单中。
 
 ## 一、官方适配能力基线（调研结论）
@@ -206,8 +209,8 @@
 | 6 | 宿主壳 | `pages/Index.ets` | 宿主 | **已确认（见 4.6）** |
 | 7 | 全吧搜索（首页入口） | `pages/Search.ets` | 二级 | **已落地（2026-09-15 重定方案并开工，见 4.7）**：搜贴瀑布流竖 3 / 横 4（列内独立堆叠 + 方案 B）、搜吧 / 搜人 3 / 4 列、底栏平板档锁 480 不拉伸；多列例外页 |
 | 8 | 吧内帖子列表 | `pages/ThreadList.ets` | 二级 | **已确认（见 4.8；多列二级页，受 §4.6 H-B 前置阻塞）** |
-| 9 | 帖子详情 | `pages/ThreadDetail.ets` | 二级 | **已落地（见 4.9；DT-A/G/H/I/J 已落地、构建通过、待真机验收；`DETAIL_MAIN_WIDTH=420` / `DETAIL_IMAGE_GRID_MAX_WIDTH=336` / 右栏维持三列）** |
-| 10 | 楼中楼详情 | `pages/SubPostDetail.ets` | 二级 | **已落地**（见 4.10；SP-A/B/D/E/G-K 已落地、构建通过、待真机验收；`SUBPOST_MAIN_WIDTH=420` / `SUBPOST_IMAGE_GRID_MAX_WIDTH=336`、段数=2、间距=8、底部留白=20 三处差异兑现） |
+| 9 | 帖子详情 | `pages/ThreadDetail.ets` | 二级 | **已落地（见 4.9；DT-A/G/H/I/J 已落地、构建通过、待真机验收；`DETAIL_MAIN_WIDTH=420` / `DETAIL_IMAGE_GRID_MAX_WIDTH=336` / 右栏维持三列；**2026-09-18 新增 DT-L「帖子沉浸式阅读」顶栏 / 底栏自动显隐**）** |
+| 10 | 楼中楼详情 | `pages/SubPostDetail.ets` | 二级 | **已落地**（见 4.10；SP-A/B/D/E/G-K 已落地、构建通过、待真机验收；`SUBPOST_MAIN_WIDTH=420` / `SUBPOST_IMAGE_GRID_MAX_WIDTH=336`、段数=2、间距=8、底部留白=20 三处差异兑现；**2026-09-18 新增 SP-L「帖子沉浸式阅读」顶栏（吧名 + 返回钮）自动隐藏**） |
 | 11 | 个人内容 | `pages/PersonalContent.ets` | 二级 | **已落地（2026-09-14，见 4.12 二次拍板）**：用户拍板「首页同款瀑布流竖 3 / 横 4」推翻原 lanes 方案 → 列内独立堆叠 + 方案 B 分桶落地，构建通过待真机验收；命名易混：本页**无用户信息区**，只有槽位标题栏 + 单一 `List` |
 | 12 | 用户主页 | `pages/UserProfile.ets` | 二级 | **已落地（2026-09-15 重定方案并开工，见 4.11 二次拍板）**：发布帖 + 关注吧瀑布流竖 3 / 横 4（列内独立堆叠 + 方案 B）、确认弹窗封顶 400 不拉伸；用户信息 Header 保持通栏居中 |
 | 13 | 关注列表 | `pages/FollowList.ets` | 二级 | 待补充 |
@@ -2672,6 +2675,120 @@ Column                                  // 新增的外层容器：承载 bg / o
 - **真机错位修复（2026-09-13 追加）**：用户真机反馈**竖屏 / 横屏回复区均有明显卡片重叠、横屏第三列溢出屏幕**，要求参考首页瀑布流（成品）修复。根因 = **`ImageGrid` 是 `Grid`（可滚动容器），嵌在 `FlowItem` 内只有格高（120）、无总高** → 布局期 Grid 自测量高度与渲染期不一致，WaterFlow 按错高摆放后续 FlowItem → 重叠；首页成品无此问题是因为首页卡片所有图片尺寸（aspectRatio / maxHeight）**测量期即终值**。修复三条：① `ImageGrid` **显式总高** `Math.ceil(n/3) × 120 + (ceil(n/3)−1) × 6`；② `ImageGrid` 加 `capMaxWidth` 参数 —— **仅通栏主楼传 true**（336 封顶防拉伸），楼层 / 楼中楼列内卡传 false（`maxWidth: '100%'` 跟随列宽，杜绝窄列交叉轴测量歧义）；③ 横屏右栏 `WaterFlow` 补 `.width('100%')`（显式引用 layoutWeight 分配宽，防列宽按接近全屏值计算导致第三列溢出）。
 - `tools/build.ps1` → **BUILD SUCCESSFUL**（53s，错位修复后 55s）；**lint 0**。
 
+#### DT-L 「帖子沉浸式阅读」顶栏 / 底栏自动显隐（2026-09-18 已落地，构建通过，待真机验收）
+
+**需求**（用户 2026-09-18 四项决定）：新增全局设置项「帖子沉浸式阅读」（设置 → 个性化），开启后**向下滚动自动收起顶栏三钮 / 排序胶囊 / 评论底栏**；阈值**不对称**（向下 24vp 藏、向上 12vp 露），**在最顶部时不隐藏**；评论岛**先试 T1**（官方悬浮条 `barBottomMargin` 拉负沉岛），观感不达标再走 T2。
+
+**实现三件套**
+
+| 层 | 落点 |
+|---|---|
+| 状态 | `AppStorage 'immersiveReading'` 为真源；`CACHE_KEY.IMMERSIVE_READ`（`tieba_immersive_read`）持久化，缺省 `null` → 关，老用户零行为变化；`UsageHabitsManager.init()` 冷启动恢复 + `setImmersiveReading()` 落盘；页面 `@StorageLink @Watch` 同步，关开关立即复位 |
+| 判定 | `onDetailScroll()` 挂点 = **内容主滚动区**（竖屏 `Scroll` / 横屏分栏右栏，共用 `this.scroller`）；**分栏左栏主楼不挂**（通常不满一屏，且与右栏共用累计器会互相污染基线）。① 不对称阈值 24 / 12；② `IMMERSIVE_READ_TOP_KEEP = 8` 置顶保护（含顶部回弹负值）；③ `IMMERSIVE_READ_JUMP_LIMIT = 240` 跳变丢弃（命令式 `scrollTo` 楼层定位 / 旋转分栏切换）；④ 触底 `onReachEnd` / `onPageShow` / 关开关三处复位 |
+| 动效 | 顶栏（官方槽位 `DetailTitleBar` 与兜底 `LegacyTopBar` **双路径同款**）`.translate(y: immersiveTopSink())` = −114 + `.opacity(0)` + `.enabled(false)` + `.animation(220ms FastOutSlowIn)`；排序胶囊 `SortPillShell` / 兜底 `SortRowOverlay` / 兜底底栏 `BottomDock` 同款向下位移 `immersiveBottomSink()`。沉浸态 `immersiveHidden` **只存页面局部 `@State`，绝不写 AppStorage**（否则切页 / 换帖残留隐藏态，D1 类）。**注：动效时长与位移量已被 DT-N（三轮）收口 —— 藏 180ms `EaseIn` / 唤 260ms spring、位移改约 0.6 倍自身高** |
+
+**底部官方评论岛 = T1 沉岛**（用户拍板先试）：官方悬浮条是系统节点，应用层挂不上 `translate` / `opacity`（`Tabs` 壳里装着内容层，整壳位移会连内容一起走），唯一可控入参就是定位量 → `barBottomMargin: dockBottomMargin() + dockNudge * 0.5 + (immersiveHidden ? immersiveIslandSink() : 0)`，其中 `immersiveIslandSink() = −(dockPillHeight() + dockBottomMargin() + 24)`（手机档 −120），把岛整体沉出屏幕下沿。**代价 = 无隐式动画**（由系统重新布局悬浮条，与顶栏 220ms 位移不同步）。若真机观感不可接受 → T2「纯岛壳」重构（内容层移出 `Tabs`，整壳 `translate`）。
+
+**几何零改动声明**：顶栏槽位高 98 与 `Scroll` 首项 98 占位不变；排序胶囊 `margin.bottom` 与底部让位 **160** 不变；显隐只改 `translate` / `opacity` / `enabled` / `barBottomMargin` 四项，**均不参与布局测量** → 列数 / 列宽 / 卡片几何 / 间距逐像素不变。
+
+**风险自检（§6.2）**
+- **A 错位 → 无**：零布局属性改动；`translate` 不影响测量与兄弟节点排布；顶栏 98 占位与网格 / 通栏项无关；不引入 `maxWidth`、不动左右外边距（A1 / A2 / A4 均不适用）。
+- **B 出屏 → 无**：顶栏上移 `−114`（> 栏高 98）、底部浮层下沉 `immersiveBottomSink()` = 底距 + 岛高 + 200 = **296**（> 最高底部堆叠：兜底底栏顶沿 208）→ 均为「移出后不可见」的定向位移，无新增横向溢出；位移量由 `dockPillHeight()` / `dockBottomMargin()` 推导，**平板 / 阔直屏 / 大折叠 / Pura X Max 各形态档自动同源**（岛高 66 / 大折叠 62）。
+- **C 重叠 → 有 1 处（已规避）**：`opacity(0)` 的组件**仍参与命中测试**，隐藏后顶栏三钮 / 排序胶囊会残留不可见可点区 → 处置 = 一律叠 `.enabled(false)` 关闭整棵子树命中。另：官方岛由 `barBottomMargin` 沉出，系统节点无需（也无法）挂 `enabled`，沉岛后几何上已出屏、无触区。无新增遮挡（让位 160 未动）。
+- **D 手机回归 → 无**：`onDetailScroll()` 首行 `if (!this.immersiveReading) return`，设置默认关 → **手机 / 平板 / 全形态零路径进入**；即便开启也只改三个渲染属性 + 一个官方定位量，手机列数恒 1、卡片几何 / 顶栏 98 占位 / 底部让位 160 **全部逐像素不变**；显隐态为页面局部 `@State`、**不写任何全局标记** → 无 D1 / D6 残留面；本页不涉及 `columns` 入参（无 D3）。**必测** = 手机竖 / 横 × 开关关 / 开两态、向下 24 / 向上 12 阈值、置顶不隐藏、触底复位、滑到底再回顶能看到返回钮、切页 / 换帖不残留隐藏态、平板与大折叠分栏右栏滚动驱动、Pura X Max 展开态、官方岛 T1 沉岛观感（不达标转 T2）、**折叠屏展开↔折叠**。
+
+**状态**：**已落地**（`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**）。
+
+##### DT-M 评论岛隐藏二轮修正（2026-09-18，T1 沉岛实测无效 → 改走应用层）
+
+**真机反馈**（用户截图）：顶栏与排序胶囊都藏了，但**底部评论岛（点赞 27 / 收藏 / 跳转到官方贴吧 / 发送）纹丝不动**。
+
+**根因**：T1 的唯一手段 `barFloatingStyle.barBottomMargin` 虽在同层且有响应式（此前靠「首帧 0.5vp nudge 触发系统重排」验证过），但**负值被系统钳掉**——官方悬浮条不允许移出窗口下沿，`−89.5` 被当作 0 处理。**结论：官方悬浮条的位置是系统独占的，应用层无法把它移出屏幕**，T1 方案在「沉岛」这一含义上不成立（未达 T2，但也不是原计划里的「观感问题」，而是**根本无效**）。
+
+**修正**（两条应用层可确定控制的杠杆，双保险）
+
+| 杠杆 | 落点 | 作用 |
+|---|---|---|
+| 官方胶囊宽度收 0 | `barWidth: { small/medium/large: immersiveHidden ? 0 : dockPillWidth() }` | 胶囊零宽 ⇒ **无面积**，系统玻璃（`systemMaterial`）自然无从渲染。`barWidth` 的响应式与 `barBottomMargin` 同层同源，已由既有 nudge 机制验证 |
+| 槽内内容下沉淡出 | `FloatingDock()` 根 Column：`translate(y: immersiveBottomSink())` + `opacity(0)` + `enabled(false)` + 220ms | `FloatingDock` 是 **tabBar 槽位里的应用节点**（不是系统节点），`translate` / `opacity` / `enabled` 与普通浮层一样确定生效 |
+
+`barBottomMargin` 的负值**保留为无害冗余**（被钳到 0 即等于原值；若某版本系统开始接受负值可顺带沉岛）。
+
+**遗留（DT-N 已按 P0 缓解，根因未解）**：官方胶囊玻璃的消失是**系统参数瞬时生效、没有 220ms 过渡**（槽内内容有滑动，玻璃是硬切），二者不同步。DT-N 的 P0 改**时序编排**（玻璃晚撤 / 早回），把那一记硬切藏到内容已不可见之后；要让**玻璃本体也位移**，唯一出路是 **T2「纯岛壳」重构**（内容层移出 `Tabs`，整壳 `translate`：官方材质可保留，但需真机验证「父节点 transform 是否作用于系统悬浮条」）；T2 变体「自绘玻璃岛」动画 100% 可控，代价是**放弃官方 `systemMaterial` 沉浸玻璃**（页面主体拿不到官方材质，见 §6.1 材质范围限制）。
+
+**风险自检（§6.2，仅列本轮新增面）**
+- **A 错位 → 无**：`barWidth` 是官方悬浮条的**宽度参数**，不参与内容层测量（`barOverlap` 下内容层不受悬浮条几何影响）；`translate` / `opacity` / `enabled` 三项仍不参与布局测量；顶栏 98 占位、底部让位 160 / 20、排序胶囊 `margin.bottom` 全部原样。
+- **B 出屏 → 无**：宽度收 0 是「收缩到居中线」而非外扩，更不会溢出；内容位移复用 `immersiveBottomSink()`（各形态档同源）。
+- **C 重叠 → 无新增**：`enabled(false)` 已覆盖（新增的这一处正是为了让「看不见的点赞 / 收藏 / 发送」不可点）；宽度 0 的胶囊无触区。
+- **D 手机回归 → 无**：两条杠杆都包在 `immersiveHidden`（默认关 + 设置项默认关的双重门）内；岛「显示态」的 `dockPillWidth()` / `dockPillHeight()` / `barBottomMargin` 与改前**逐值相同**，手机单列 / 平板 / 大折叠 / Pura X Max 的岛几何零变化。**必测补充** = 开启沉浸阅读后滑到底，确认点赞 / 收藏 / 跳转 / 发送**整条消失且不可点**、上滑 12vp 能整条回来、关闭设置项立即整条复现（含玻璃），以及隐藏态下点原岛位置不会误触。
+
+**状态**：**已落地**（`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**），**待真机复验**（重点：玻璃是否随宽度收 0 一起消失；若玻璃仍可见或硬切观感不可接受 → 转 T2）。
+
+##### DT-N 隐藏过程 P0 时序编排 + 显隐参数级收口（2026-09-18 三轮，零风险不重构）
+
+**拍板**：用户选择「先试 P0」—— 不碰几何 / 材质 / 结构，只编排「玻璃什么时候消失」，并同批做显隐参数级收口（藏起 / 唤出不再同一条曲线）。
+
+**背景**：DT-M 的遗留项 = 官方胶囊玻璃由系统绘制，`barWidth` / `systemMaterial` 改参瞬时生效、应用层插不进动画；原实现玻璃与内容**同时**触发 → **玻璃抢跑**，内容还在往下滑，那一记硬切格外显眼。
+
+**时序（三件，不动几何 / 材质 / 结构）**
+
+| 件 | 落点 | 说明 |
+|---|---|---|
+| 玻璃侧独立状态位 | `@State immersiveGlassHidden` + `immersiveGlassTimer` / `immersiveShowPending` | 只驱动 `barFloatingStyle` 三参（`barWidth` / `barBottomMargin` / `systemMaterial`），与内容侧 `immersiveHidden` **不同步** |
+| 藏起「晚撤玻璃」 | `hideImmersive()`：内容立即起步（180ms）→ `setTimeout(IMMERSIVE_GLASS_LAG_MS = 180)` 后再撤玻璃 | 撤玻璃那一刻槽内已 `opacity(0)` + 位移到位 = **空槽** → 硬切被藏到不可见之后（原实现是两者同帧抢跑） |
+| 唤出「早给玻璃」 | `showImmersive()`：先恢复玻璃 → 下一帧（`IMMERSIVE_GLASS_LEAD_MS = 16`）再放内容滑回 | 顺序不可反：内容先滑回时玻璃会在归位途中凭空出现，那一帧的「内容悬空」更扎眼。`immersiveShowPending` 幂等位防**置顶保护分支每帧调用**把内容无限顺延（症状：回顶后要等弹跳结束才滑回来） |
+
+**参数级收口**
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 藏起 | 220ms `FastOutSlowIn` | **180ms `Curve.EaseIn`**（收起要利落） |
+| 唤出 | 220ms `FastOutSlowIn` | **260ms + `curves.springMotion(0.28, 0.86)`**（轻回弹；spring 自带时长，`duration` 仅作标称值） |
+| 顶栏位移 | `−(栏高 98 + 16)` = −114（整条出屏） | **−58.8 = 98 × `IMMERSIVE_FLY_SCALE`(0.6)** |
+| 底部位移 | `dockBottomMargin() + dockPillHeight() + 200`（手机档 ≈ 296，整体出屏） | **`−((底距 + 岛高) × 0.6)`**（手机档 ≈ **−58**；各形态档按自身几何等比收敛） |
+
+位移收口后观感由「嗖地飞走」变**「收回去」**（其余不可见性由 `opacity(0)` 保证，与位移量无关）。**六个挂点同款**：顶栏官方槽 / 兜底顶栏 / 岛内评论条 / 排序壳 / 排序兜底 / 兜底底栏；四个底部挂点共用 `immersiveBottomSink()` 保持同节奏。定时器清理三处：`hideImmersive` / `showImmersive` 重排前 + 新增 `aboutToDisappear()`（藏起 180ms 内退页时，回调不再落到已销毁组件）。
+
+**P0 买不到的**：玻璃本体仍不参与位移（系统节点无应用层可控入参）—— 要「玻璃一起滑走」须转 **T2 纯岛壳**（见上「遗留」段）。
+
+**风险自检（§6.2，仅列本轮新增面）**
+- **A 错位 → 无**：零布局属性改动，本轮新增的只是**时间维度**（玻璃晚撤 / 早回 + 曲线 + 位移量），`translate` / `opacity` / `enabled` / `barFloatingStyle` 三参仍是同批渲染属性；顶栏 98 占位、底部让位 160 / 20、排序胶囊 `margin.bottom` 全部原样。
+- **B 出屏 → 无（本轮刻意反向收口）**：位移不再追求「整体出屏」（296 → 58），不可见改由 `opacity(0)` 保证、触区由 `enabled(false)` 保证（均与位移量无关）。**这是有意的口径变化**：若真机认为「位移不够、像没动」，只调 `IMMERSIVE_FLY_SCALE`（0.6 → 0.8 / 1.0）即可，不必动结构。
+- **C 重叠 → 无新增**：`enabled(false)` 覆盖未动；新增的 180ms「玻璃空槽」只是玻璃中无内容，无触区、不遮挡正文。
+- **D 手机回归 → 无**：全部改动包在 `immersiveReading`（设置项默认关）内；关闭态 `immersiveHidden` / `immersiveGlassHidden` 恒 false → 三参与位移逐值等于改前；新增的 `aboutToDisappear` 只清一个默认为 `−1` 的定时器。**必测补充** = ①藏起时玻璃是否在内容不可见**之后**才消失（不再抢跑）；②唤出时玻璃是否**先于**内容出现；③连续快速下滚 / 上滚翻转无误藏误显；④回顶 / 触底 / 子页返回三处复位不留空槽残留；⑤藏起 180ms 内退页无异常日志；⑥手机竖 / 横 + 平板 / 大折叠 / Pura X Max 分栏右栏各档位移观感（0.6 倍是否够「收」）。
+
+**状态**：**已落地**（`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**），**待真机复验**（重点：玻璃「晚撤」是否真把硬切藏住；若观感仍不达标 → 转 T2 纯岛壳）。
+
+##### DT-O P-A / P-B / P-B′ 三步试验与回退（2026-09-19，用户拍板回退）
+
+**动机（承接 DT-N 遗留）**：DT-N 把「玻璃瞬撤」的硬切藏住了，但**玻璃本体仍不位移**；要玻璃一起滑走，本文档只给了 T2 一条出路。用户拍板「试 T2」。
+
+**三步试验（同日，均未成为稳定态）**
+1. **P-A**：往「撑掉系统胶囊」方向试（撤材质 / 负 `barBottomMargin` 强行把胶囊推下去）→ 实测 **P-A 高地板 18**：系统把胶囊高度钳到最小 18，胶囊仍在，只是变矮。
+2. **P-B**：保留系统胶囊当空壳、撤掉材质 → 系统**回落默认白背板**，比负距更难看。
+3. **P-B′「玻璃归位」**：不再借系统空壳画玻璃，改由槽内应用节点自绘 —— `Stack` + `Button.systemMaterial(ImmMaterial.floatingBar())`（定宽定高 = `dockPillWidth()` × `dockPillHeight()`），并整体删掉 `barFloatingStyle` 与 `dockNudge`。
+
+**P-B′ 三条实测收益（「定稿」由来）**：① 摆脱系统双向最小尺寸地板（A1 宽 56 / P-A 高 18）；② 玻璃几何（宽 / 高 / 圆角）回到应用层可控；③ 玻璃与内容同处一个应用节点 → 显隐同帧、动画 100% 可控，DT-N 的错帧编排随之退役。
+
+**回退原因（用户真机反馈 2026-09-19）**：**平板出问题**。机制（回退时从代码结构反推确认）：P-B′ 删掉 `barFloatingStyle` 后，**槽内容不再受 `barWidth` 约束** —— 槽宽 = 屏宽，岛内元素（点赞 / 收藏 / 跳转 / 发送）改由 `CommentBar` 自身 `justifyContent` 居中，平板等宽屏下与岛宽（`dockPillWidth()` = `min(屏宽−64, 400)`）**脱钩**，元素铺到屏宽两侧；且玻璃改由应用层绘制后，沉浸隐藏的错帧编排一并失效。
+
+**回退内容（本次落地）**
+- `ImmersiveDockShell()`：恢复 `barFloatingStyle({ barWidth: immersiveGlassHidden ? 0 : dockPillWidth()（三档同源）, barBottomMargin: dockBottomMargin() + dockNudge × 0.5, systemMaterial: ImmMaterial.floatingBar() })` —— 系统侧玻璃回来，**槽宽重新由 `barWidth` 约束**（平板岛宽恢复）。
+- `FloatingDock()`：删 `Stack` + 自绘玻璃 `Button`，恢复「单列 + `justifyContent(FlexAlign.Center)` + `padding 8` + 沉浸四属性（`translate` / `opacity` / `enabled` / `animation`）」。
+- 恢复 `@State dockNudge` + `aboutToAppear` 300ms nudge（首帧重排触发，2026-09-13 那套）。
+- 恢复 DT-N 错帧编排：`immersiveGlassHidden` / `immersiveGlassTimer` / `immersiveShowPending` / `IMMERSIVE_GLASS_LAG_MS = 180` / `IMMERSIVE_GLASS_LEAD_MS = 16` + `clearImmersiveGlassTimer()` + `aboutToDisappear()`。
+- **保留不回退**（与 P-B′ 无关）：§P0-4 首屏免骨架屏 120ms 延时、沉浸阅读其余六挂点与全部参数收口。
+
+**代价（已知并接受）**：DT-N 的**根因遗留回归** —— 系统胶囊有最小宽地板（A1 实测 56），隐藏态会残留一枚约 56×18 的小胶囊。根治仍只有 T2「纯岛壳」（内容层移出 `Tabs`）一条路，且**必须先解决 P-B′ 暴露的那条**：内容层一旦脱离 `Tabs` 槽位就不再受 `barWidth` 约束 → 需槽内容自行 `constraintSize({ maxWidth: this.dockPillWidth() })` 居中，否则平板重演同一问题。
+
+**风险自检（§6.2，仅列本轮新增面）**
+- **A 错位 → 无**：恢复的全是既有属性（`barFloatingStyle` 三参 / `translate` / `opacity` / `enabled` / `justifyContent` / `padding`），无新增列宽与网格语义；`FloatingDock()` 结构与回退前（DT-N 态）同源。
+- **B 出屏 → 无**：岛宽回到 `barWidth` 约束（平板 400 封顶），比 P-B′ 的「全宽铺开」更收敛。
+- **C 重叠 → 无**：自绘玻璃层已删（它原本铺满槽位且 `hitTestBehavior(HitTestMode.None)`），删后槽内只剩内容层；`enabled(!immersiveHidden)` 触区防护保留。
+- **D 手机回归 → 无**：手机档 `dockPillWidth()` 恒 296（= 上限）→ 岛几何逐像素等于改前；`dockNudge` 是 2026-09-13 起手机同款的 0.5vp 无感微变；玻璃侧错帧与 `aboutToDisappear` 只在 `immersiveReading`（设置项默认关）开启后才可能产生状态变化。**必测** = 平板横 / 竖帖子详情岛宽与岛内元素是否收回岛内、隐藏态是否带回 56 小胶囊、藏起 / 唤出时玻璃与内容的前后关系、手机竖 / 横岛几何逐像素、大折叠 / Pura X Max 展开态、藏起 180ms 内退页无异常日志、折叠屏展开↔折叠。
+
+**状态**：**已落地**（`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**），**待真机复验**（首要：平板岛宽与岛内元素是否恢复正常；次要：DT-N 的 56 小胶囊是否可接受）。
+
 ### 4.10 楼中楼详情（`pages/SubPostDetail.ets`）
 
 **适配需求（用户指示，2026-09-13）**
@@ -2936,6 +3053,23 @@ Stack（本页原根容器：保留 backgroundColor(Theme.bg) / expandSafeArea /
     - ③ **卡内间距判定重算**：原「`commentIndex < commentsState.length - 1` 全局下标」多列后会让每列末条多 8vp → 列底空洞。已采用推荐写法：把间距挪到 `WaterFlow.rowsGap(Spacing.sm * 2)`（`Column({ space: Spacing.sm })` 卡外 + 卡内追加 8vp → 等价于行间距 16），并把 `ForEach` 内单个 `FlowItem` 内的卡内追加 8vp 删掉 / 改为按列内下标判断（具体代码以落地版为准）。
 - **真机错位修复（2026-09-13 追加，与 §4.9 同批同源）**：本页 `ImageGrid` 同样是「`Grid` 嵌 `FlowItem` 且无总高」→ 同款修复：① **显式总高** `Math.ceil(n/3) × 120 + (ceil(n/3)−1) × 6`；② 加 `capMaxWidth` 参数 —— 父楼层卡（竖屏通栏 / 横屏左栏 420）传 true（336 封顶），列内回复卡传 false（`'100%'` 跟随列宽）；③ 横屏右栏 `WaterFlow` 补 `.width('100%')`。
 - `tools/build.ps1` → **BUILD SUCCESSFUL**（53s，错位修复后 55s）；**lint 0**。
+
+#### SP-L 「帖子沉浸式阅读」顶栏隐藏（2026-09-18 已落地，构建通过，待真机验收）
+
+**需求**（用户 2026-09-18 决定 3）：「楼中楼详细页做隐藏顶栏吧标题和返回按钮，**在最顶部时不隐藏**」。本页**无底部悬浮层**（无评论岛 / 无排序胶囊 / 无兜底底栏）→ 只做**顶栏**侧，无底栏逻辑。
+
+**实现**
+- 常量五项 `SUBPOST_IMMERSIVE_HIDE_DIST / REVEAL_DIST / TOP_KEEP / JUMP_LIMIT / ANIM_MS`（24 / 12 / 8 / 240 / 220）与 §4.9 的 `IMMERSIVE_READ_*` **逐项同源**，带交叉引用注释（**改一处须两处同步**）。**未抽公共文件**：沿用本工程既有惯例（同款阈值按页各留一份 + 注释指向另一页，见 `SUBPOST_COL_BALANCE_THRESHOLD` ↔ `DETAIL_COL_BALANCE_THRESHOLD`），避免为 5 个常量新建共享模块。
+- 判定 `onSubPostScroll()`：挂点 = 竖屏 `Scroll` / 横屏分栏右栏（共用 `this.scroller`）；左栏父楼层卡不挂。规则与 §4.9 逐项同源（24 藏 / 12 露 / 置顶 8 恒显示 / 跳变 240 丢弃 / 返回本页 + 关开关复位；本页无触底哨兵，故无触底复位项）。
+- 动效：官方槽位 `SubPostTitleBar` 与兜底 `LegacyTopBar` **双路径同款**上移 `−114` + `.opacity(0)` + `.enabled(false)` + `.animation(220ms FastOutSlowIn)`；沉浸态同样只存页面局部 `@State`。
+
+**风险自检（§6.2）**
+- **A 错位 → 无**：零布局属性改动（同 §4.9）；本页非行分组、无末行拉伸 / 无补空位需求；不引入 `maxWidth`；顶栏双路径几何（98 高 + 44 顶部让位）与 `Scroll` 首项 98 占位均不动。
+- **B 出屏 → 无**：仅上移 `−114`（> 栏高 98），无横向位移、无新增溢出；本页无底部浮层，不涉及岛高 / 底距推导。
+- **C 重叠 → 有 1 处（已规避）**：同 §4.9 —— `opacity(0)` 仍参与命中，故顶栏（吧名胶囊 + 返回钮）隐藏时一律叠 `.enabled(false)`，杜绝「看不见但能点到返回」。C2：本页无底部悬浮层 → 无让位冲突（底部留白仍 20）。
+- **D 手机回归 → 无**：`onSubPostScroll()` 首行 `if (!this.immersiveReading) return`，默认关 → 全形态零路径进入；即便开启也只改渲染属性，单列 / 分栏两分支的 `layoutWeight` / 卡片几何 / 顶栏 98 占位逐像素不变；**本页不写 `cardColumns`** → 无 D1 / D6 残留面；`CommentCard` 为本页私有 Builder，不构成 D3。**必测** = 手机竖 / 横 × 开关两态、向下 24 / 向上 12 阈值、**置顶不隐藏**、向上滚动唤出返回钮、**消息楼层定位 `scrollTo` 不误藏**、切页返回不残留隐藏态、折叠屏展开↔折叠。
+
+**状态**：**已落地**（`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**），**待真机验收**。
 
 ### 4.11 用户主页（`pages/UserProfile.ets`）
 
@@ -3379,6 +3513,31 @@ List() {
   - **已知取舍**：阔直屏竖屏（窗口宽 ~440vp）选「竖二横三 / 竖三横四」后单列宽约 210vp / 140vp，属**用户主动选择**的窄卡档（默认档完全不受影响）；`ThreadCard.actionCompact()` 的「估算卡宽 <240 收紧」会兜住胶囊排布，观感需真机确认。
 - **状态**：**已落地**（2026-09-18 用户拍板 5 点后实施：① 只含大屏档；② 不做最小卡宽护栏；③ 切档强制回顶；④ 按推荐技术方案；⑤ 三档位文案固定「默认 / 竖二横三 / 竖三横四」；同日追加阔直屏全屏白名单 `isWideBarFullscreen`）。
 
+### 4.14 精选二级分类页（`pages/GoodCategoryPage.ets`，2026-09-22 已落地）
+
+- **适配需求**：本页（吧主页 ThreadList 底栏「精选」钮长按 350ms 进入，顶部分类胶囊 + 双常驻槽位左右滑切分类）在平板多列档真机表现为「**单个卡片拉特别长 / 卡片不对齐 / 图区大块空白 / 图片位置异常**」，用户要求参考吧主页（§4.8）与推荐页（§4.2）的平板适配收敛。
+- **根因定位（本页 21 轮迭代收敛结论）**：多列档原采用 `WaterFlow + WaterFlowSections`（吧主页 §4.8 T-G 同款容器），但本页比吧主页多两个叠加因素 → 虚拟容器 item 测量不可靠：
+  1. **双常驻槽位**：两个列表**永久存活**，非活跃槽先 `Visibility.Hidden`、后改 `translate -100%` 停靠屏外——但两类方案下 WaterFlow 的离屏测量 / 缓存主尺寸在槽位轮换（数据 reload + sections splice 同帧）时都会产生坏尺寸并被沿用（真机：FlowItem 拉超长、卡片内容跨卡错位、图区空白）；
+  2. **沉浸布局 + `clip(false)`**：与 §4.2 / §4.4 记录过的「虚拟滚动视口剔除 / floor-vanish」同源风险。
+  吧主页单槽 + 数据常驻所以同一容器没问题；本页同容器 + 双槽轮换即坏 → **结论：问题不在参数调优，在「虚拟容器 × 双常驻槽位」这个组合本身**，与消息页（§4.4）/ 个人内容页（§4.12）当年弃虚拟容器改全量渲染的决策同因。
+- **设计方案（最终落地）**：**多列档弃用 `WaterFlow`，收敛为「`Scroll` + 列分桶 `Row` + 最短列滞回分桶」全量渲染**（§4.11 P-B / §4.4 同款已验证范式；与单列档的 `Scroll + Column` 同为 Scroll 系全量渲染，双槽 translate 停靠不参与测量 → 测量约束与可见态完全一致）：
+  - 外层 `ForEach` **只遍历列索引**（key `gcol_${slot}_${colIdx}` 稳定 → 列容器复用）；内层数据源**直读 @State 分桶镜像** `slotCols(slot)[colIdx]`（MessagesTab §4.4 教训：不用外层传入、更不直读 `ds.data`——@State 观察不到类内字段重赋值）；
+  - 分桶 = **方案 B「带滞回的最短列」**：默认 `i % 列数` 轮转保序，轮转列与最短列估算高差 > `GOOD_COL_BALANCE_THRESHOLD`(240vp) 才补位；前缀稳定贪心 → 追加只影响尾部、旧卡不跳位；
+  - **分桶镜像主动算好写入 @State**：`syncSlotColumns(slot)` 在 `ds.onMutate`（reload / appendAll）与 `syncCardColumns()`（横竖屏 / 列数调整档变化）双触发点重算 `slotCols0/1`；
+  - `estimateGoodCardHeight(item, colW)`：与 `ThreadCard` 渲染同式的估算高（底数 118 + 标题 ≤2 行 ×24 + 摘要 ≤2 行 ×20 + 图区：单图 `min(列宽/1.6, 220)`、宫格 2/4 张两列格高 `min(格宽,140)`、其余三列 `min(格宽,100)`）——只求相对准（分桶均衡），不求像素准；
+  - 几何：顶让位 88 独立占位（列 Row 之外）；列间 / 列内间距 = `Spacing.md`(12)（原 WaterFlow `columnsGap/rowsGap` 同值）；左右边距 = `Spacing.lg`(16) 挂分桶 Row 的 padding（原 section margin 同值）；卡片 `ThreadCardItem` 与 key 规则原样保留。
+  - **删除**：`sections0/sections1`、`lastSectionKey0/1`、`syncSlotSections()`、`goodColumnsTemplate()`、「0 高占位格」凑数逻辑、`cachedCount`（全量渲染无虚拟化窗口）。
+  - **保留不动**：双常驻槽位角色轮换 / translate 停靠屏外（挂外层普通容器，`Refresh` 上不生效的坑注释原样）/ `Refresh` 下拉刷新 / 左右滑切分类 PanGesture + 滑动锁 / `onReachEnd` 翻页 / 分类胶囊行官方槽位 / 渐显带 / 列数函数 `goodColumns()` 全口径（窗口闸门 → 列数调整覆盖块 → 大折叠 / 阔直屏 / 平板恒值分支）。
+  - 单列档：容器与结构不变，数据源由 `ds.data` 同切分桶镜像 `[0]`（单桶 = 全量列表，同一驱动源，避免两档数据链分叉）。
+- **涉及改动点（1 文件）**：`pages/GoodCategoryPage.ets`（字段 / `aboutToAppear` 回调 / `syncCardColumns` / 分桶与估算方法 / `SlotLayer` 多列分支容器重建 / 相关注释；无其它文件、无共享组件改动）。
+- **断点 / 阈值**：列数口径与全工程单点同源（`goodColumns()`：窗口 `<600` 闸门〔阔直屏全屏白名单放行〕→ 列数调整覆盖块 → 大折叠竖 2 横 3 → 阔直屏竖 1 横 3 → 平板竖 2 横 3）；列均衡阈值 240vp；间距 12 / 16 与改前完全同值。
+- **风险与回归项**：
+  1. 全量渲染的内存 / 首帧成本：与消息页 / 个人内容页同款取舍（会话快照 LRU cap 8、槽位仅 2 个常驻，量级受控）；长列表（数百条）滚动帧率挂真机观察。
+  2. 双槽同时全量渲染（停靠槽不参与测量但仍在树上）：图片解码量 ×2 —— 与改造前一致（双槽本就常驻），非新增面。
+  3. `Scroll.onReachEnd` 翻页语义与原 WaterFlow 相同（触底触发、`loadingMore` 防抖）。
+- **风险自检（§6.2，强制）**：A 错位 → **无**（列宽 `layoutWeight(1)` 均分、卡片 `width('100%')`；通栏项〔顶让位 88〕在分桶 Row 之外不进列；分桶镜像与列数函数同帧同步，无「列数消费方直绑中间值」）；B 出屏 → **无**（列宽均分无像素列宽、无横向滚动；左右边距 `Spacing.lg` 单一来源）；C 重叠 → **无**（列内独立堆叠天然无行内对齐遮挡；双槽 translate 停靠屏外不叠画；悬浮层〔胶囊行 / 渐显带〕零改动）；D 手机回归 → **无**（手机全屏 `goodColumns()=1` 走单列 `Scroll + Column` 分支，结构与改前逐像素同——仅数据源读取点从 `ds.data` 换为同值的分桶镜像 `[0]`；`syncSlotColumns` 对单列档只是原样拷贝数组；`cardColumns` 无条件写机制未动；必测 = 手机竖 / 横逐像素、平板竖 2 / 横 3、大折叠竖 2 / 横 3、阔直屏竖 1 / 横 3、Pura X Max、自由小窗 `<600` 单列、切分类平移动画与图片零闪、下拉刷新 / 触底翻页 / 长列表滚动帧率、折叠屏展开↔折叠）
+- **状态**：**已落地 + 构建通过**（2026-09-22；待真机复验）。
+
 ## 五、全局改动汇总（待补充）
 
 ## 六、验收与回归清单
@@ -3517,6 +3676,13 @@ A / B / C / D 四类风险的定义与判定依据见 §6.1 的四张表（A 错
 
 | 日期 | 更新内容 | 自检结论 |
 |---|---|---|
+| 2026-09-22（新增 §4.14 精选二级分类页多列档弃 WaterFlow 改「Scroll + 列分桶 + 最短列滞回」全量渲染） | **用户平板真机反馈本页多列档「单个卡片拉特别长 / 卡片不对齐 / 图区大块空白」**→ 根因 = `WaterFlow + WaterFlowSections` 虚拟容器测量在**双常驻槽位（translate 停靠屏外）+ 沉浸布局**下不可靠（21 轮未根治；吧主页单槽同容器没问题，本页双槽轮换即坏 → 问题在组合本身）→ 多列档收敛为 §4.11 P-B / §4.4 消息页同款全量渲染：外层 ForEach 只遍历列索引（key 稳定列容器复用）、内层直读 **@State 分桶镜像**（`syncSlotColumns` 在 `ds.onMutate` 与列数变化双触发点重算写入，MessagesTab「分桶结果必须写 @State」教训同源）；带滞回最短列分桶（阈值 240）+ `estimateGoodCardHeight()` 估算高（与 ThreadCard 渲染同式）；删除 `sections0/1` / `syncSlotSections` / `goodColumnsTemplate` / 0 高占位格 / `cachedCount`；单列档结构不变、数据源同切镜像 `[0]`；双槽轮换 / Refresh / 左右滑手势 / onReachEnd / 列数口径全部保留。仅 `GoodCategoryPage.ets` 1 文件。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（列宽 `layoutWeight(1)` 均分、卡片 `width('100%')`；顶让位 88 通栏项在分桶 Row 之外；镜像与列数函数同帧同步）。B 出屏：**无**（无像素列宽、无横向滚动；左右 `Spacing.lg` 单一来源）。C 重叠：**无**（列内独立堆叠无行内遮挡；双槽 translate 停靠屏外不叠画；悬浮层零改动）。D 手机回归：**无**（手机全屏恒 1 列走原 `Scroll + Column` 分支逐像素同，仅数据源读取点换为同值的镜像 `[0]`；`cardColumns` 无条件写未动；必测 = 手机竖 / 横逐像素、平板竖 2 横 3、大折叠竖 2 横 3、阔直屏竖 1 横 3、Pura X Max、小窗 `<600`、切分类平移与图片零闪、下拉刷新 / 触底翻页、长列表滚动帧率、折叠屏展开↔折叠） |
+| 2026-09-19（沉浸阅读 · 回退 P-B′「自绘玻璃岛」，恢复 DT-N 系统侧玻璃 + 错帧编排，DT-O） | **用户反馈「采用 P-B′ 后平板出问题」→ 拍板回退**。P-B′（同日三步试验 A1 → P-A → P-B → P-B′ 的终点）＝槽内应用节点自绘玻璃（`Stack` + `Button.systemMaterial(ImmMaterial.floatingBar())`）+ 整体删掉 `barFloatingStyle` 与 `dockNudge`。回退原因（代码结构反推确认）：删掉 `barFloatingStyle` 后**槽内容不再受 `barWidth` 约束**（槽宽 = 屏宽，岛内元素改由 `CommentBar` 自身居中）→ 平板等宽屏下与岛宽 `dockPillWidth()`（`min(屏宽−64, 400)`）**脱钩**，点赞 / 收藏 / 跳转 / 发送铺到屏宽两侧；同时玻璃改由应用层绘制后 DT-N 错帧编排失效。回退五件：① `ImmersiveDockShell()` 恢复 `barFloatingStyle`（`barWidth` 三档 = `immersiveGlassHidden ? 0 : dockPillWidth()`、`barBottomMargin` = `dockBottomMargin() + dockNudge × 0.5`、`systemMaterial: ImmMaterial.floatingBar()`）；② `FloatingDock()` 删 `Stack` + 自绘玻璃，恢复单列 + `justifyContent(Center)` + `padding 8` + 沉浸四属性；③ 恢复 `@State dockNudge` + `aboutToAppear` 300ms nudge；④ 恢复 `immersiveGlassHidden` / `immersiveGlassTimer` / `immersiveShowPending` / `IMMERSIVE_GLASS_LAG_MS = 180` / `IMMERSIVE_GLASS_LEAD_MS = 16` / `clearImmersiveGlassTimer()` / `aboutToDisappear()`；⑤ **保留不回退** = §P0-4 首屏免骨架屏 120ms（与 P-B′ 无关，与 nudge 定时器并存）。代价 = DT-N 根因遗留回归（隐藏态残留约 56×18 小胶囊），根治仍只有 T2 纯岛壳一条路，且须先给脱离槽位的内容层自行 `constraintSize({ maxWidth: dockPillWidth() })`。`tools/build.ps1` → **BUILD SUCCESSFUL**（1min6s）；**lint 0**；**待真机复验** | A 错位：**无**（恢复的全是既有属性 —— `barFloatingStyle` 三参 / `translate` / `opacity` / `enabled` / `justifyContent` / `padding`；`FloatingDock()` 结构与回退前 DT-N 态同源，无新增列宽与网格语义）。B 出屏：**无**（岛宽回到 `barWidth` 约束、平板 400 封顶，比 P-B′ 的「全宽铺开」更收敛）。C 重叠：**无**（自绘玻璃层已删 —— 它原本铺满槽位且 `hitTestBehavior(HitTestMode.None)`；删后槽内只剩内容层，`enabled(!immersiveHidden)` 触区防护保留）。D 手机回归：**无**（手机档 `dockPillWidth()` 恒 296 = 上限 → 岛几何逐像素等于改前；`dockNudge` 为 2026-09-13 起手机同款的 0.5vp 无感微变；玻璃侧错帧与新增 `aboutToDisappear` 只在 `immersiveReading` 默认关内产生状态变化。必测 = 平板横 / 竖岛宽与岛内元素收回岛内、隐藏态是否带回 56 小胶囊、藏起 / 唤出玻璃与内容前后关系、手机竖 / 横岛几何逐像素、大折叠 / Pura X Max 展开态、藏起 180ms 内退页无异常日志、折叠屏展开↔折叠） |
+| 2026-09-18（§4.3 收藏归类面板新增常驻搜索框 + 顶端留白对齐左右 + 面板高度 62% → 75% + 卡片圆角 16 → 20） | **用户要求「自定义分类多起来后能靠搜索快速找到分类再移入」，并圈定落点 = 面板上沿之上那条横带**（实测该处属系统遮罩层，`bindSheet` 塞不进内容）→ 定案「**面板整体加高一条搜索框 + 搜索框置顶**」。`components/FavCategoryPicker.ets`：① 面板最顶端插入常驻搜索框（`sys.symbol.magnifyingglass` + `TextInput`，胶囊 40 高、宽 `calc(100% - 32vp)`，与标题行 / 列表同取 `Spacing.lg` 左右外边距）；材质与列表条目**同源** `ImmMaterial.cardAction()` + 半透明底 `#B3FFFFFF` / `#B31B1E24`（**不用不透明底**，守 §8 坑 6）；② 新增 `@State query` + `filteredRows()`（空串原样返回 → 「未分类恒首位 + 分类顺序」零变化；有词按名称大小写不敏感子串匹配）+ `noMatch()` 空态（列表内插一条 160 高「未找到相关分类」提示，**不替掉整个 List** → 下方常驻「新建分类」入口不被挤掉）；③ `resetCreateState()` 更名 `resetInputs()`，关闭面板一并回收搜索词；④ **顶端留白 `8 → Spacing.lg`(16)**（同日第二轮）：外层 Column `padding({ top: 8 })` → `Spacing.lg`，与搜索框 / 标题行 / 列表同取左右 `Spacing.lg` → 上 / 左 / 右三边等距，胶囊圆角（full，40 高 → r20）嵌在面板圆角（r24）内成同心观感；⑤ **面板高度 `62% → 67% → 75%`**（同日两轮，第二轮为用户真机看图后拍板加大）：新增内容净高 ≈ 52vp（框 40 + 与标题行间距 `Spacing.xs` 4 + 顶端留白 +8）；⑥ **卡片圆角 `Radius.lg`(16) → 组件内常量 `PICKER_CARD_RADIUS`(20)**（同日第三轮，用户要求「移入分类下面收藏夹卡片的圆角增大，并给出可微调参数」）：三处卡片（分类条目行 / 新建分类输入行 / 「＋ 新建分类」入口行）由 `.borderRadius(Radius.lg)` 改为 `.borderRadius(PICKER_CARD_RADIUS)`，文件级 `const PICKER_CARD_RADIUS: number = 20`（**单点微调**：只改这一个数即三处同步；**全局 `Radius` token 未动** → 其它页卡片零影响）；取值依据 = 与面板顶部搜索胶囊同值（40 高全圆角 → r20）、与面板自身顶圆角（系统半模态 24）成 24 / 20 / 20 递减梯度；卡高 76（内容 44 + 上下 padding 16×2）→ 半径上限 38 才变胶囊，20 仍在圆角矩形区间，可调档位 16 / 20 / 24；⑦ 刻意不设 `defaultFocus`（打开面板默认不起键盘）。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（搜索框宽 `calc(100% - 32vp)` 即左右各 `Spacing.lg`，与标题行、列表**同一留白来源** → 三者左右边缘对齐；列表 / 条目宽度仍 `100%` / `layoutWeight`，**零新增列宽**；「新建分类」行的「20 宽列 + 文字」结构与分类行 44 图标圆均未动；无通栏项入网格。**卡片圆角 16 → 20 属纯描边参数**：不动宽度 / 留白 / 结构 / 层级，列宽与边距三处单一来源不变，A 类结论不受影响）。B 出屏：**有 1 处（挂真机门，规避已定并写入代码注释）** —— 面板 **75%** + 键盘 ≈38% 已远超整窗，系统顶起 / 压缩 sheet 时**最顶端的搜索框**可能被顶出屏；规避 = 搜索框挪到标题行之下、面板高度回调 62%（两处换位即可）；搜索框自身横向不可能出屏（`calc(100% - 32vp)` < 面板宽）。C 重叠：**无**（搜索框独占面板顶端 ≈44vp，**面板往上长而非压缩内容**；空态提示只作为列表内一项、160 高固定，不与「新建分类」行重叠；遮罩 / 顶部圆角 / 层级 / 勾选互斥全部零改动）。D 手机回归：**有（本次请求的主动变更，非回归）** —— 面板高度 `62% → 75%` + 顶端留白 `8 → 16` + 卡片圆角 `16 → 20` 在手机竖屏同样生效（正是「搜索框落在用户所圈区域」「同心观感」「卡片更饱满」三项请求的实现手段；三条均来自手机端截图，属预期内改动），列表可视区不降反增；搜索词为空串时 `filteredRows()` **逐项等同 `rows()`** → 列表内容 / 顺序 / 勾选互斥 / 新建校验 / 完成按钮零变化；手机档列数恒 1、卡片几何零改动。必测 = 手机竖屏（收藏页多选移入、详情页长按收藏）搜索过滤与空结果、新建分类入口在空态仍可达、**键盘弹起时搜索框是否被顶出屏**、面板 67% 后遮罩观感与列表可视条数、平板 / 大折叠 / Pura X Max 面板宽与胶囊比例观感、折叠屏展开↔折叠、低版本无材质兜底路径观感 |
+| 2026-09-18（§4.9 楼层区单列档卡间距收口） | **真机反馈「帖子详细页回复区域单列时卡片间距有点大」→ 12 → 8**：`ThreadDetail.ets` 的 `FloorColumnsBlock()` 单列分支原为裸 `ForEach`，被外层通栏 `Column({ space: Spacing.md })`（=12）套用 → 卡间距偏松。改为单列分支包一层独立 `Column({ space: Spacing.sm })`（=8，与 §4.10 楼中楼页单列间距语言同口径）；多列档 `Row space=Spacing.md` 与列内 `Column space=Spacing.md` 未动、主楼 / 回复表头 / 哨兵与外层的 12 未动。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（只插入一个 `width('100%')` 纵向容器，子项顺序 / 数量未变、无网格 / 通栏语义新增；`floorColumnsData()` 分桶与 `.id('floor_…')` 定位挂点未动）。B 出屏：**无**（`width('100%')` 满宽纵向堆叠，横向尺寸零变化；外层左右 padding `Spacing.lg`、底部 160 让位未动）。C 重叠：**无**（卡间距 12→8 为**收缩**，不会新增遮挡；容器 / 层级 / 悬浮层（排序胶囊 `margin.bottom`、评论岛）零改动）。D 手机回归：**有（本次请求的主动收口，非回归）** —— 手机单列档同样命中该分支，楼层卡间距由 12 收为 **8**，正是用户要求收紧的目标值；列数（恒 1）/ 卡宽（`layoutWeight`、`width('100%')`）/ 主楼 / 表头 / 哨兵间距 / 左右 padding / 沉浸属性挂点全部逐像素不变；多列档（平板竖 2 横 3、大折叠、阔直屏、Pura X Max）走 `Row space=md` 分支、完全不受影响。必测 = 手机单列档卡间距观感（是否过紧）、平板 / 大折叠 / 阔直屏多列档列内间距回归、楼中楼页单列间距（原本即 8，应与本页观感一致）、折叠屏展开↔折叠 |
+| 2026-09-18（沉浸阅读 · 隐藏过程 P0 时序编排 + 参数级收口，DT-N） | **用户拍板「先试 P0」（零风险，不碰几何 / 材质 / 结构）→ 给隐藏过程加动画 + 同批参数收口**。背景：官方胶囊玻璃改参瞬时生效、应用层插不进动画，原实现玻璃与内容**同帧抢跑**（玻璃已消失、内容还在往下滑）。时序三件：①新增玻璃侧独立状态 `@State immersiveGlassHidden`（只驱动 `barFloatingStyle` 的 `barWidth` / `barBottomMargin` / `systemMaterial`，与内容侧 `immersiveHidden` 不同步）；②**藏起晚撤玻璃** `hideImmersive()` = 内容立即起步 → `setTimeout(IMMERSIVE_GLASS_LAG_MS = 180)` 后再撤玻璃（撤的那一刻槽内已 `opacity(0)` + 位移到位 = 空槽，硬切被藏到不可见之后）；③**唤出早给玻璃** `showImmersive()` = 先恢复玻璃 → 下一帧（16ms）再放内容滑回，并加 `immersiveShowPending` 幂等位（防**置顶保护分支每帧调用**把内容无限顺延 → 回顶后要等弹跳结束才滑回）。参数收口：藏起 220ms `FastOutSlowIn` → **180ms `EaseIn`**；唤出 → **260ms + `curves.springMotion(0.28, 0.86)`** 轻回弹；顶栏位移 −114（栏高+16 出屏）→ **−58.8 = 98 × 0.6**；底部位移 `底距 + 岛高 + 200`（≈296 出屏）→ **`−((底距 + 岛高) × 0.6)`**（手机档 ≈ −58，`IMMERSIVE_FLY_SCALE = 0.6`）→ 观感从「嗖地飞走」变「收回去」，不可见性由 `opacity(0)`、触区由 `enabled(false)` 保证。六挂点同款（顶栏官方槽 / 兜底顶栏 / 岛内评论条 / 排序壳 / 排序兜底 / 兜底底栏）；定时器三处清理（hide / show 重排前 + 新增 `aboutToDisappear`）。**P0 买不到的**：玻璃本体仍不位移，要玻璃一起滑走须转 T2（另见 §4.9 DT-N 遗留段）。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（零布局属性改动，本轮只新增**时间维度** —— 晚撤 / 早回 + 曲线 + 位移量；`translate`/`opacity`/`enabled`/`barFloatingStyle` 三参仍同批渲染属性；顶栏 98 占位、底部让位 160/20、排序胶囊 `margin.bottom` 原样）。B 出屏：**无（本轮刻意反向收口）**（位移不再追求整体出屏 296 → 58，不可见由 `opacity(0)` 保证、触区由 `enabled(false)` 保证，均与位移量无关；若真机觉得位移不够，只调 `IMMERSIVE_FLY_SCALE` 0.6 → 0.8/1.0，不动结构）。C 重叠：**无新增**（`enabled(false)` 覆盖未动；180ms「玻璃空槽」内无内容、无触区、不遮挡正文）。D 手机回归：**无**（全部改动包在 `immersiveReading` 设置项默认关之内；关闭态两个隐藏位恒 false → 三参与位移逐值等于改前；新增 `aboutToDisappear` 只清默认 `−1` 的定时器。必测 = 藏起时玻璃是否在内容不可见**之后**才消失〔不再抢跑〕、唤出时玻璃是否**先于**内容出现、连续快速下滚/上滚无误藏误显、回顶/触底/子页返回复位无空槽残留、藏起 180ms 内退页无异常日志、手机竖横 + 平板/大折叠/Pura X Max 分栏右栏各档位移观感〔0.6 倍是否够「收」〕） |
+| 2026-09-18（沉浸阅读 · 评论岛二轮修正，DT-M） | **真机反馈「底部评论岛（点赞/收藏/跳转到官方贴吧/发送）不隐藏」→ T1 沉岛实测无效，改走应用层两条杠杆**。根因：`barFloatingStyle.barBottomMargin` 负值**被系统钳掉**（官方悬浮条不允许移出窗口下沿），即官方悬浮条位置系统独占、应用层无法沉岛 —— T1 在「沉岛」语义上不成立，且不是观感问题而是**根本无效**。修正 ①`barWidth` 三档在 `immersiveHidden` 时收 **0**（零宽胶囊无面积 ⇒ 系统玻璃 `systemMaterial` 无从渲染；响应式与 `barBottomMargin` 同层同源，由既有首帧 nudge 机制验证）；②`FloatingDock()` 根 Column（**tabBar 槽位里的应用节点**）叠 `translate(y: immersiveBottomSink())` + `opacity(0)` + `enabled(false)` + 220ms。`barBottomMargin` 负值保留为**无害冗余**。遗留：官方胶囊玻璃消失是**系统参数瞬时生效、无 220ms 过渡**，与槽内内容滑动不同步；要玻璃也滑走只能转 **T2 纯岛壳**（代价=放弃官方 `systemMaterial`，见 §4.9 DT-M）。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（`barWidth` 是悬浮条宽度参数，`barOverlap` 下不参与内容层测量；`translate`/`opacity`/`enabled` 仍不参与测量；顶栏 98 占位、底部让位 160/20、排序胶囊 `margin.bottom` 原样）。B 出屏：**无**（宽度收 0 是向居中收缩、非外扩；内容位移复用 `immersiveBottomSink()`，各形态档同源）。C 重叠：**无新增**（`enabled(false)` 正是为杜绝「看不见的点赞/收藏/发送」可点；零宽胶囊无触区）。D 手机回归：**无**（两条杠杆都在 `immersiveHidden` = 设置项默认关 + 隐藏态默认 false 的双重门内；岛显示态的 `dockPillWidth()`/`dockPillHeight()`/`barBottomMargin` 与改前逐值相同，手机单列/平板/大折叠/Pura X Max 岛几何零变化。必测补充 = 开启后滑到底确认整条消失且不可点、上滑 12vp 整条回来〔含玻璃〕、关设置项立即复现、隐藏态点原岛位置不误触） |
+| 2026-09-18（沉浸阅读） | **新增「帖子沉浸式阅读」全局设置项 + §4.9 / §4.10 顶栏 / 底栏自动显隐（DT-L / SP-L）**：个性化页新增开关行（`sys.symbol.book_pages`），`AppStorage 'immersiveReading'` 为真源 + `CACHE_KEY.IMMERSIVE_READ` 持久化 + `UsageHabitsManager.init()` 恢复 / `setImmersiveReading()` 落盘（缺省 `null` → 关，老用户零行为变化）；两页各加 5 个同源常量（24 藏 / 12 露 / 置顶 8 / 跳变 240 / 动画 220ms）+ `onDetailScroll()` / `onSubPostScroll()`（挂点 = 竖屏 `Scroll` 与横屏分栏右栏共用的 `this.scroller`，左栏主楼不挂）+ `onPageShow` / 触底 / 关开关三处复位；顶栏（官方槽位与兜底**双路径同款**）上移 −114 + `opacity(0)` + `enabled(false)` + 220ms 隐式动画，排序胶囊 / 兜底底栏同款下沉 `immersiveBottomSink()` = 296；**底部官方评论岛走 T1 沉岛**（用户拍板先试）= `barBottomMargin` 叠加 `−(岛高 + 底距 + 24)`（手机档 −120），不达标转 T2 纯岛壳。沉浸态只存页面局部 `@State`、不写任何全局标记。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验**（含 T1 沉岛观感拍板） | A 错位：**无**（零布局属性改动 —— `translate` / `opacity` / `enabled` / `barBottomMargin` 四项均不参与布局测量；顶栏 98 槽位与 `Scroll` 首项 98 占位、底部让位 160 / 20、排序胶囊 `margin.bottom` 全部原样；无通栏项进网格、无末行补位需求）。B 出屏：**无**（顶栏上移 114 > 栏高 98；底部浮层下沉 296 > 最高底部堆叠顶沿 208；均为定向「移出后不可见」位移，无新增横向溢出；位移量由 `dockPillHeight()` / `dockBottomMargin()` 推导 → 平板 66 / 大折叠 62 / Pura X Max 各档自动同源）。C 重叠：**有 1 处（已规避）** —— `opacity(0)` 的组件**仍参与命中测试**，会留下不可见可点区 → 顶栏 / 排序胶囊 / 兜底底栏一律叠 `enabled(false)` 关整树命中；官方岛是系统节点、挂不上 `enabled`，但沉岛后几何已出屏无触区；让位未动、无新增遮挡。D 手机回归：**无**（两页判定函数首行 `if (!this.immersiveReading) return`，设置默认关 → 手机 / 平板 / 全形态**零路径进入**；即便开启也只改三个渲染属性 + 一个官方定位量，手机列数恒 1、卡片几何 / 顶栏 98 占位 / 底部让位 160 与 20 **逐像素不变**；沉浸态为页面局部 `@State`、不写全局标记 → 无 D1 / D6 残留面；本页不涉 `columns` 入参 → 无 D3。必测 = 手机竖 / 横 × 开关关 / 开两态、24 藏 / 12 露阈值、**置顶不隐藏**、触底复位、滑到底再回顶能看到返回钮、切页 / 换帖 / 子页返回不残留隐藏态、楼中楼消息定位 `scrollTo` 不误藏、平板与大折叠分栏右栏滚动驱动、Pura X Max 展开态、官方岛 T1 沉岛观感〔不达标转 T2〕、**折叠屏展开↔折叠**） |
 | 2026-09-18（追加） | **「列数调整」对阔直屏加「全屏白名单」**：用户反馈 Pura X View（型号 VOL-AL00，2232×1320，16:9.5 阔型屏）切档**竖屏无变化** → 根因 = 覆盖块第二个条件本就成立（`isLargeScreenForm` 已含 `isWideBarDevice()`，型号白名单 `WIDE_BAR_MODEL='VOL-AL00'` + 比例带 (1.4,1.85)），真正拦住的是 8 页列数函数**首行窄窗闸门** `<600` 把阔直屏**竖屏全屏**（窗口宽仅 ~440vp = 屏短边 1320px ÷ density）误判成自由小窗而回落单列。新增 `Theme.isWideBarFullscreen(pageWidth)`（① 阔直屏档设备 ② 窗口宽 ≥ 屏短边 vp − 24vp，即窗口占满屏宽 = 全屏）；8 页闸门统一追加 `&& !isWideBarFullscreen(this.pageWidth)` 并补导入；个性化页设置行副标题改「平板 / 阔直屏 / 折叠屏展开的列表列数」。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（闸门仅新增一个「阔直屏且全屏」的例外放行，列数出口与所有消费方调用次序未变）。B 出屏：**无**（放行后走既有覆盖块 / 设备恒值分支，列宽仍 `1fr` / `layoutWeight(1)`；阔直屏竖屏选 2 列单列宽 ~210vp、选 3 列 ~140vp 属用户主动选择档，默认档形态不变）。C 重叠：**无**（零几何改动，容器 / 层级 / 悬浮层 / 让位未动）。D 手机回归：**无**（`isWideBarFullscreen` 首行 `isWideBarDevice()` 对手机恒 false；手机与窄窗仍由 `<600` 闸门拦；平板 / 大折叠竖屏窗口宽 ≥600 本就不进闸门；阔直屏默认档放行后落 `updateColumns()` 的竖 1 → 与改前同值逐像素不变。必测 = 阔直屏竖屏三档切换、阔直屏横屏三档、阔直屏自由小窗与左右分屏仍 1 列、平板与大折叠三档回归、手机全屏竖 / 横逐像素、Pura X 展开态竖屏三档、折叠屏展开↔折叠） |
 | 2026-09-18 | **新增 §4.13「列数调整」全局档位（个性化页 + 8 个多列页）**：AppStorage `columnMode` + `CACHE_KEY.COLUMN_MODE` 持久化、`UsageHabitsManager.setColumnMode()` 单一写入口（写值 + bump `columnModeTick` + 落盘）；`Theme` 新增 `readColumnMode` / `columnModeLabel` / `isLargeScreenForm` / `overrideColumns`（`0` 不覆盖 / `1` 横 3 竖 2 / `2` 横 4 竖 3）；8 页列数函数在窗口闸门之后插覆盖块 + `@Watch` 回写 + **强制回顶**（ForumsTab / PersonalContent 新增 `Scroller`）；个性化页新增设置行与三选一 `ColumnModeDialog`。`tools/build.ps1` → **BUILD SUCCESSFUL**；**lint 0**；**待真机复验** | A 错位：**无**（覆盖块插在 `pageWidth < 600` 闸门之后、各页原分支之前，列数单点出口与调用方次序均未变；块内只 `return` 整数，零新几何）。B 出屏：**无**（列宽仍 `1fr` / `layoutWeight(1)`，仅换列数；`4` 列档只在横屏宽窗命中，平板横屏 ~1280 → 列宽 ≈ 300vp）。C 重叠：**无**（容器 / 层级 / 悬浮层 / 让位零改动）。D 手机回归：**无**（`isLargeScreenForm` 对手机恒 false、窄窗闸门在覆盖块之前，两条路径都不进覆盖块；默认档 `overrideColumns` 返回 0 → 平板也落回原自动适配分支；必测 = 手机全屏竖 / 横逐像素、平板三档逐档列数、阔直屏与大折叠展开态三档、自由小窗 `<600` 不覆盖、切档强制回顶、重启后档位保持、折叠屏展开↔折叠） |
 | 2026-09-17 | **§4.9 宫格单格高收口**：`gridCellHeight()` 只用于 `Grid` 总高、内层 `Stack` / `ThreadGridImage` 仍硬编码 120 → 大折叠 / Pura X Max 的 72 档防拉伸失效；改三处同源（+ 估算器 `imgRows × 格高` + 注释）。`tools/build.ps1` → **BUILD SUCCESSFUL**（34.5s）；**lint 0**；**待真机复验**（大折叠 / Pura X Max 展开态宫格比例） | A 错位：**无**（总高与格子同源后一致，错位面反而消除）。B 出屏：**无**（72 档格子更矮，总高同步收窄）。C 重叠：**无**（只改尺寸取值来源，层级 / 容器未动）。D 手机回归：**无**（手机档 `gridCellHeight()=120`，与该函数落地前逐像素相同；平板 / 阔直屏同为 120；必测 = 手机详情页宫格、平板宫格、大折叠 / Pura X Max 展开态宫格比例、折叠屏展开↔折叠） |

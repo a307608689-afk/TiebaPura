@@ -470,6 +470,20 @@ export class ImmMaterial {
   static floatingBarFlat(): uiMaterial.ImmersiveMaterial | undefined {
     return ensureFloatingBarFlat();
   }
+  /**
+   * 空材质档（官方「关材质」语义，2026-09-19 DT-P / 实验 L1）：`uiMaterial.Material.empty`。
+   *
+   * 与「不传材质 / 传 undefined」**语义不同**：后者是「不设置」，系统会回落它自己的默认材质
+   * （真机实测 = 一层白背板，即 P-B 那次的现象）；本档是官方文档明写的「关闭某个组件的沉浸
+   * 系统材质效果」（*disable the immersive system material effect for a component*），
+   * 用于让槽位**不渲染任何材质层**。目前唯一消费点 = 帖子详情悬浮岛的沉浸隐藏态。
+   *
+   * 注：`FloatingTabBarStyle.systemMaterial` 声明为 `ImmersiveMaterial`，而 `Material.empty`
+   * 返回基类 `Material`，故必须向下 as 一次 —— 运行时对象仍是官方那颗「空材质」，语义不丢。
+   */
+  static empty(): uiMaterial.ImmersiveMaterial | undefined {
+    return uiMaterial.Material.empty as uiMaterial.ImmersiveMaterial;
+  }
   /** 胶囊 Tab 按钮。REGULAR + 按压弹性形变 + 光感反馈。 */
   static tab(): uiMaterial.Material | undefined {
     return ensureTab();

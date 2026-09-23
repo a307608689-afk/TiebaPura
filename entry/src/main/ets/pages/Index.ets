@@ -412,6 +412,13 @@ struct Index {
       // 切到收藏页：通知常驻的 FavoriteTab 无感刷新（本地回流 + 云端首页增量）
       this.notifyFavoriteEnter();
     }
+    if (index === TabIndex.Forums) {
+      // 切到进吧页：广播刷新（足迹本地直出 + 关注吧列表节流静默对账，2026-09-22）。
+      // 切 Tab 不触发 onPageShow，此前进吧页关注列表整个会话只在挂载时拉一次，
+      // 应用内/外部（官网、官方 App）的关注变更都不刷新
+      console.info(`[FORUMS-FOLLOW] index switchTab forums tickWillSet`);
+      AppStorage.setOrCreate<number>('forumsRefreshRequest', (AppStorage.get<number>('forumsRefreshRequest') ?? 0) + 1);
+    }
     // 初始位置（无动画赋值）：新页从 dir 方向侧外进入，旧页原位准备退场
     this.inOffset = dir * 100;
     this.outOffset = 0;
@@ -494,8 +501,17 @@ struct Index {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .onAreaChange((oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
-      this.currentWidth = width;
-      this.currentHeight = newValue.height as number;
+      const height = newValue.height as number;
+      // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期本回调逐帧触发，无条件写 @State 会让宿主壳
+      // 整树重渲染（底栏几何 + 五个 Tab 容器 + PagesStack 全跟着 build）。
+      // ⚠️ isWideScreen 的重算必须留在短路**之外**：它依赖 isLargeFoldDevice()/isPuraXMaxDevice()
+      // 的运行时折叠状态（display.getFoldStatus()），折叠态变化时尺寸可能完全不变
+      // （Theme.ets 注释明确「展开↔折叠切换由各页 onAreaChange 触发重渲染自动翻档」），
+      // 若一并提前 return 会把真档位一起吞掉。
+      if (width !== this.currentWidth || height !== this.currentHeight) {
+        this.currentWidth = width;
+        this.currentHeight = height;
+      }
       // 大折叠展开态（2026-09-15 用户拍板「底栏限宽不拉伸」）：并入平板档，底栏 480 居中 + 平板档几何；
       // 折叠态 isLargeFoldDevice 为 false，回落手机档不受影响。
       // Pura X Max（阔折叠展开 ~860vp）同口径并入：底栏 400 不拉伸（2026-09-17 立项）

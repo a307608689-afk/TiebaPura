@@ -355,7 +355,7 @@ struct Settings {
         $r('sys.symbol.ellipsis_circle'),
         '更多',
         '其他杂项',
-        () => this.openItem('更多')
+        () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/SettingsMore' }).catch(() => {}); }
       )
     }
     .width('100%')

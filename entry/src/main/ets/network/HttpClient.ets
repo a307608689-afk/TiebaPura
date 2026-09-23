@@ -26,6 +26,22 @@ import { AuthManager } from '../service/AuthManager';
 
 const TAG: string = 'HttpClient';
 
+/**
+ * §IMGQ（2026-09-19）图片专用 Session 开关。
+ * 背景：详情页楼层全量渲染（Scroll+Column+ForEach，见 ThreadDetail §弃用 WaterFlow 注释），
+ * 进帖瞬间上百张图同时下载（实测单帖 17~27MB / 均值 152KB / 最大 3.84MB），
+ * 与接口请求共用同一个 rcp Session → 实测接口耗时被拖到 3.5~5.0s（无竞争时 0.9s）。
+ * 置 false 即回退「图片与接口共用一个 Session」（改造前行为），供真机 A/B 对照。
+ */
+const IMAGE_SEPARATE_SESSION: boolean = true;
+
+/**
+ * §NETQ 网络排队探针开关（2026-09-19，**临时诊断用，取证后整体删除**）。
+ * 只打 4 类日志：图片洪峰起止 / 接口请求发出与完成时的在飞图片数，
+ * 用于证实「图片洪峰是否与接口请求抢同一条会话」。零行为影响。
+ */
+const NETQ_PROBE: boolean = true;
+
 /** 重定向探测结果 */
 export interface RedirectResult {
   finalUrl: string;
@@ -37,26 +53,75 @@ export interface RedirectResult {
  */
 export class HttpClient {
   private static session: rcp.Session | null = null;
+  private static imageSession: rcp.Session | null = null;
+
+  // §NETQ：在飞图片请求数 / 本次洪峰峰值 / 累计张数 / 洪峰起点
+  private static imgInflight: number = 0;
+  private static imgPeak: number = 0;
+  private static imgTotal: number = 0;
+  private static imgFloodAt: number = 0;
+
+  /** 两份 Session 共用同一套 transfer 配置（超时/重定向），保证 A/B 只差「是否独立连接池」 */
+  private static newSession(): rcp.Session {
+    return rcp.createSession({
+      requestConfiguration: {
+        transfer: {
+          autoRedirect: true,
+          maxAutoRedirects: 10,
+          timeout: {
+            connectMs: 15000,
+            transferMs: 30000,
+          },
+        },
+      },
+    });
+  }
 
   private static getSession(): rcp.Session {
     if (HttpClient.session === null) {
-      HttpClient.session = rcp.createSession({
-        requestConfiguration: {
-          transfer: {
-            autoRedirect: true,
-            maxAutoRedirects: 10,
-            timeout: {
-              connectMs: 15000,
-              transferMs: 30000,
-            },
-          },
-        },
-      });
+      HttpClient.session = HttpClient.newSession();
     }
     return HttpClient.session;
   }
 
-  private static buildHeaders(extra?: Record<string, string>): Record<string, string> {
+  /**
+   * 图片专用 Session（§IMGQ）：独立连接池，使后台图片下载洪峰不再挤占接口请求的排队位。
+   * IMAGE_SEPARATE_SESSION=false 时直接复用接口 Session（改造前行为）。
+   */
+  private static getImageSession(): rcp.Session {
+    if (!IMAGE_SEPARATE_SESSION) {
+      return HttpClient.getSession();
+    }
+    if (HttpClient.imageSession === null) {
+      HttpClient.imageSession = HttpClient.newSession();
+    }
+    return HttpClient.imageSession;
+  }
+
+  // §NETQ 探针：图片请求进出计数（洪峰起点/终点各打一条，中间不打，避免上百行刷屏）
+  private static probeImgBegin(): void {
+    HttpClient.imgTotal++;
+    HttpClient.imgInflight++;
+    if (HttpClient.imgInflight > HttpClient.imgPeak) {
+      HttpClient.imgPeak = HttpClient.imgInflight;
+    }
+    if (HttpClient.imgInflight === 1) {
+      HttpClient.imgFloodAt = Date.now();
+      console.info(`[NETQ] img-flood START`);
+    }
+  }
+
+  private static probeImgEnd(): void {
+    HttpClient.imgInflight--;
+    if (HttpClient.imgInflight <= 0) {
+      HttpClient.imgInflight = 0;
+      console.info(`[NETQ] img-flood END total=${HttpClient.imgTotal} peak=${HttpClient.imgPeak} span=${Date.now() - HttpClient.imgFloodAt}ms`);
+      HttpClient.imgPeak = 0;
+      HttpClient.imgTotal = 0;
+    }
+  }
+
+  private static buildHeaders(extra?: Record<string, string>, withCookie: boolean = true): Record<string, string> {
     // 先放入调用方传入的 headers（如 User-Agent、Content-Type），
     // 再用默认值填充缺失项，确保调用方自定义值不被覆盖
     const headers: Record<string, string> = {};
@@ -78,16 +143,45 @@ export class HttpClient {
     if (!headers['Referer']) {
       headers['Referer'] = 'https://tieba.baidu.com/';
     }
-    // 注入 Cookie（含 BDUSS），确保写接口携带登录态
+    // 注入 Cookie（含 BDUSS），确保写接口携带登录态；withCookie=false 时跳过（web 搜索游客态）
     const cookie = AuthManager.getInstance().getCookieHeader();
-    if (cookie.length > 0 && !headers['Cookie']) {
+    if (withCookie && cookie.length > 0 && !headers['Cookie']) {
       headers['Cookie'] = cookie;
     }
     return headers;
   }
 
-  static async get(url: string, extraHeaders?: Record<string, string>): Promise<string> {
-    return HttpClient.request(url, 'GET', undefined, extraHeaders);
+  static async get(url: string, extraHeaders?: Record<string, string>, withCookie: boolean = true): Promise<string> {
+    return HttpClient.request(url, 'GET', undefined, extraHeaders, withCookie);
+  }
+
+  /**
+   * 网络栈降级 GET（NetworkKit http，独立于 rcp 指纹）。
+   * 用途：web 端点风控按请求指纹判空（success + 空数据 + blank_type:1）时，换栈重试。
+   * 只给全站搜索用：2xx 返回响应原文；失败/非 2xx 返回 null（调用方沿用 rcp 原结果）。
+   */
+  static async httpStackGet(url: string, headers: Record<string, string>): Promise<string | null> {
+    const httpRequest = http.createHttp();
+    try {
+      const response = await httpRequest.request(url, {
+        method: http.RequestMethod.GET,
+        header: headers,
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 15000,
+        readTimeout: 30000,
+      });
+      if (response.responseCode >= 200 && response.responseCode < 300) {
+        const data: Object = response.result as Object;
+        return typeof data === 'string' ? data as string : '';
+      }
+      return null;
+    } catch (e) {
+      const biz = e as BusinessError;
+      console.info(`[http-stack] GET fail url=${url} code=${biz.code ?? -1} msg=${biz.message ?? ''}`);
+      return null;
+    } finally {
+      httpRequest.destroy();
+    }
   }
 
   static async getBinary(url: string, extraHeaders?: Record<string, string>): Promise<ArrayBuffer> {
@@ -172,10 +266,14 @@ export class HttpClient {
   }
 
   private static async requestBinaryGet(url: string, headers?: Record<string, string>): Promise<ArrayBuffer> {
+    if (NETQ_PROBE) {
+      HttpClient.probeImgBegin();
+    }
     try {
       const request = new rcp.Request(url, 'GET');
       request.headers = HttpClient.buildHeaders(headers);
-      const response = await HttpClient.getSession().fetch(request);
+      // §IMGQ：图片走独立 Session，与接口请求各自独立连接池
+      const response = await HttpClient.getImageSession().fetch(request);
       if (response.statusCode >= 200 && response.statusCode < 300) {
         return response.body ?? new ArrayBuffer(0);
       }
@@ -186,10 +284,19 @@ export class HttpClient {
         throw error;
       }
       throw new BizError(businessError.code ?? -1, businessError.message ?? '图片下载失败');
+    } finally {
+      if (NETQ_PROBE) {
+        HttpClient.probeImgEnd();
+      }
     }
   }
 
   private static async requestBinary(url: string, body: ArrayBuffer, headers?: Record<string, string>): Promise<ArrayBuffer> {
+    // §NETQ 探针：接口请求（含 pb/page 详情）发出/完成时的在飞图片数
+    const __nq0: number = Date.now();
+    if (NETQ_PROBE) {
+      console.info(`[NETQ] api-SEND imgInflight=${HttpClient.imgInflight}`);
+    }
     try {
       const request = new rcp.Request(url, 'POST');
       request.headers = HttpClient.buildHeaders(headers);
@@ -205,6 +312,10 @@ export class HttpClient {
         throw error;
       }
       throw new BizError(businessError.code ?? -1, businessError.message ?? '二进制请求失败');
+    } finally {
+      if (NETQ_PROBE) {
+        console.info(`[NETQ] api-DONE cost=${Date.now() - __nq0}ms imgInflight=${HttpClient.imgInflight}`);
+      }
     }
   }
 
@@ -559,10 +670,10 @@ export class HttpClient {
     }
   }
 
-  private static async request(url: string, method: string, body: string | ArrayBuffer | undefined, headers?: Record<string, string>): Promise<string> {
+  private static async request(url: string, method: string, body: string | ArrayBuffer | undefined, headers?: Record<string, string>, withCookie: boolean = true): Promise<string> {
     try {
       const request = new rcp.Request(url, method);
-      request.headers = HttpClient.buildHeaders(headers);
+      request.headers = HttpClient.buildHeaders(headers, withCookie);
       if (body !== undefined && method === 'POST') {
         request.content = body;
       }

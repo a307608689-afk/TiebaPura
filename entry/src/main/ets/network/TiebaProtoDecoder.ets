@@ -21,7 +21,7 @@ import { ProtoReader } from './ProtobufCodec';
 import {
   AbstractMessage, AgreeMessage, AntiMessage, CommonRequestMessage, ConcernDataMessage,
   DislikeInfoMessage, DislikeReasonMessage, ErrorMessage, FrsForumMessage,
-  FrsPageResponseDataMessage, FrsPageResponseMessage, FrsTabInfoMessage,
+  FrsPageResponseDataMessage, FrsPageResponseMessage, FrsTabInfoMessage, GoodClassifyMessage,
   IconMessage, LikeForumInfoMessage, MediaMessage, MemeInfoMessage, PageMessage,
   PbContentMessage, PbPageResponseDataMessage, PbPageResponseMessage, PostDataMessage,
   PostMessage, PrivSetsMessage, SimpleForumMessage, SimpleUserMessage, ThreadInfoMessage,
@@ -638,6 +638,12 @@ export class TiebaProtoDecoder {
     while (reader.hasNext()) {
       const tag = reader.readTag(); if (tag === null) break;
       if (tag.wireType === 2) {
+        // field 21 = good_classify（repeated Classify 嵌套消息），须 readBytes 走消息解码，
+        // 不能落进下面的 readString 分支（会产出乱码字符串）
+        if (tag.fieldNumber === 21) {
+          result.goodClassify = TiebaProtoDecoder.append(result.goodClassify, TiebaProtoDecoder.decodeGoodClassify(reader.readBytes()));
+          continue;
+        }
         const value = reader.readString();
         if (tag.fieldNumber === 2) result.name = value;
         else if (tag.fieldNumber === 3) result.firstClass = value;
@@ -659,6 +665,29 @@ export class TiebaProtoDecoder {
         else if (tag.fieldNumber === 12) result.hasFrsStar = value;
         else if (tag.fieldNumber === 13) result.curScore = value;
         else if (tag.fieldNumber === 14) result.levelupScore = value;
+      } else reader.skip(tag.wireType);
+    }
+    return result;
+  }
+
+  /**
+   * 精选二级分类项（ForumInfo.good_classify，field 21）。
+   * 2026-09-20 探针实测（tools/good_classify_probe.js，百合吧 guest 响应）：项内只下发
+   * class_id(field 3) 与 class_name(field 4)；name(1)/id(2) 兼容解析但不依赖。
+   */
+  static decodeGoodClassify(data: ArrayBuffer): GoodClassifyMessage {
+    const result: GoodClassifyMessage = {};
+    const reader = new ProtoReader(data);
+    while (reader.hasNext()) {
+      const tag = reader.readTag(); if (tag === null) break;
+      if (tag.wireType === 2) {
+        const value = reader.readString();
+        if (tag.fieldNumber === 1) result.name = value;
+        else if (tag.fieldNumber === 4) result.className = value;
+      } else if (tag.wireType === 0) {
+        const value = reader.readVarint();
+        if (tag.fieldNumber === 2) result.id = value;
+        else if (tag.fieldNumber === 3) result.classId = value;
       } else reader.skip(tag.wireType);
     }
     return result;

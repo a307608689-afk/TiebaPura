@@ -32,6 +32,16 @@ interface PickerRow {
 }
 
 /**
+ * 「移入分类」面板卡片圆角（vp）—— 下方收藏夹分类卡片的**唯一微调入口**。
+ * 改这一个数即三处卡片同步：① 分类条目行（未分类 / 自定义分类）；② 新建分类输入行；③「＋ 新建分类」入口行。
+ * 不直接引 `Radius.lg`：面板卡片要比全局卡片更饱满，且需要能随时回调，故在此单独成参（全局 token 不动）。
+ * 取 20 的依据：与面板顶部的搜索胶囊同值（40 高全圆角 → r20），往下与面板自身顶圆角（系统半模态 24）形成 24 / 20 / 20 的递减梯度；
+ * 卡高 76（内容 44 + 上下 padding 16×2）→ 半径上限 38 才开始变成胶囊，20 仍在「圆角矩形」区间内。
+ * 可微调档位：16（改前 / 全局 `Radius.lg`）、20（当前）、24（与面板顶圆角齐平，观感最饱满）。
+ */
+const PICKER_CARD_RADIUS: number = 20;
+
+/**
  * 移入分类选择面板（系统半模态 bindSheet 承载，属官方沉浸光感 A 档槽位）。
  *
  * 单一来源：收藏页编辑态「移入」与帖子详情页「长按收藏钮」共用同一套面板 UI 与勾选逻辑。
@@ -62,6 +72,8 @@ export struct FavCategoryPicker {
 
   /** 面板内新建分类的输入值 */
   @State newName: string = '';
+  /** 面板内搜索词：按名称过滤分类条目（空串 = 全量；关闭面板时一并回收） */
+  @State query: string = '';
 
   /** 面板条目：未分类恒在首位，其余按分类列表顺序 */
   private rows(): PickerRow[] {
@@ -81,6 +93,26 @@ export struct FavCategoryPicker {
       list.push({ id: c.id, icon: c.icon, name: c.name, included: includedOf(c.id) });
     }
     return list;
+  }
+
+  /**
+   * 关键字过滤后的条目：空关键字原样返回 → 「未分类恒首位 + 分类列表顺序」零变化；
+   * 有词则按名称做大小写不敏感子串匹配（分类名为中文时等价于包含判断，不引入拼音索引）。
+   */
+  private filteredRows(): PickerRow[] {
+    const q: string = this.query.trim().toLowerCase();
+    if (q.length === 0) {
+      return this.rows();
+    }
+    return this.rows().filter((r: PickerRow): boolean => r.name.toLowerCase().indexOf(q) >= 0);
+  }
+
+  /**
+   * 是否处于「有词但一条不中」的空结果态。
+   * 新建输入行展开时不进空态：否则输入行会被空态提示替掉，用户刚点开的输入框凭空消失。
+   */
+  private noMatch(): boolean {
+    return !this.creating && this.query.trim().length > 0 && this.filteredRows().length === 0;
   }
 
   private isChecked(id: string): boolean {
@@ -118,10 +150,11 @@ export struct FavCategoryPicker {
     this.newName = '';
   }
 
-  /** 关闭面板时回收输入态（下滑 / 点遮罩 / 宿主返回键共用同一收尾） */
-  private resetCreateState(): void {
+  /** 关闭面板时回收输入态（新建输入行 + 搜索词；下滑 / 点遮罩 / 宿主返回键共用同一收尾） */
+  private resetInputs(): void {
     this.creating = false;
     this.newName = '';
+    this.query = '';
   }
 
   /**
@@ -172,11 +205,17 @@ export struct FavCategoryPicker {
     .height(0)
     /**
      * 材质走 options.systemMaterial（页面 body 内的自绘浮层拿不到官方材质）。
-     * 几何逐项对齐收藏页改造前：高度 62% / 遮罩 #66000000 / 顶部圆角 24 / 无拖拽条 / 无系统关闭按钮。
+     * 几何逐项对齐收藏页改造前：遮罩 #66000000 / 顶部圆角 24 / 无拖拽条 / 无系统关闭按钮。
+     * 高度 62% → 67% → 75%（2026-09-18 两轮）：① 用户指定「搜索框放在面板最顶端」→ 面板加高一条
+     * 搜索框（净增 ≈ 44vp = 框高 40 + 与标题行间距 Spacing.xs 4）；② 真机看图后用户再拍板加大面板
+     * → 67% 提到 75%（竖屏整窗再 +≈67vp），同时顶端留白 8 → Spacing.lg 与左右一致（净增 8vp）。
+     * 合计新增 ≈ 52vp 远小于档位放大值 → **列表可视区不降反增**，遮罩只剩顶部一条。
+     * 待真机复核：面板 75% + 键盘约 38% 已远超整窗，系统顶起 / 压缩面板时最顶端的搜索框是否被顶出屏；
+     * 若复现，回退 = 搜索框挪到标题行之下（面板高度即可回调 62%）或高度退回 67%。
      * `$$` 双向绑定：用户下滑手势关闭时系统会回写 show = false。
      */
     .bindSheet($$this.show, this.PickerContent(), {
-      height: '62%',
+      height: '75%',
       preferType: SheetType.BOTTOM,
       showClose: false,
       dragBar: false,
@@ -185,8 +224,8 @@ export struct FavCategoryPicker {
       systemMaterial: ImmMaterial.sheet(),
       onDisappear: () => {
         this.show = false;
-        // 下滑 / 点遮罩关闭：一并回收输入态，避免下次打开残留输入行（宿主返回键走同一收尾）
-        this.resetCreateState();
+        // 下滑 / 点遮罩关闭：一并回收输入态，避免下次打开残留输入行 / 残留搜索词
+        this.resetInputs();
       }
     })
   }
@@ -194,12 +233,44 @@ export struct FavCategoryPicker {
   /**
    * 面板内容（系统半模态 `bindSheet` 的内容 builder）。
    * 遮罩 / 玻璃 / 高度 / 圆角 / 拖拽条全在 options 里，此处只保留内容本体：
-   * 标题行 + 分类列表（含新建分类入口）+ 完成按钮 —— 尺寸、间距、文案与收藏页原实现零改动
+   * 搜索框 + 标题行 + 分类列表（含新建分类入口）+ 完成按钮。
+   * 搜索框为 2026-09-18 新增（面板最顶端），标题行以下尺寸、间距、文案与收藏页原实现零改动
    * （多帖场景逐字不变；单帖场景把「N 条已选」改述为「当前帖子」，语义更自然）。
    */
   @Builder
   PickerContent() {
     Column() {
+      /**
+       * 搜索框（面板最顶端，常驻）：自定义分类多起来后，用关键字快速定位目标分类再勾选。
+       * 视觉与列表条目同源 —— cardAction 材质 + 半透明底（§8 坑 6：不透明底会在面板玻璃上叠出白块），
+       * 胶囊形 / 40 高，宽度 calc(100% - 32vp) 与标题行、列表同取 Spacing.lg 左右外边距 → 三者边缘严格对齐；
+       * 顶端留白同取 Spacing.lg（外层 Column padding）→ 上 / 左 / 右三边等距，圆角嵌套成同心观感。
+       * 刻意不设 defaultFocus：打开面板默认不起键盘（列表浏览不被键盘遮挡），点一下搜索框才起键盘。
+       */
+      Row({ space: Spacing.sm }) {
+        SymbolGlyph($r('sys.symbol.magnifyingglass'))
+          .fontSize(fs(18, this.fontScale))
+          .fontColor([Theme.textTertiary(this.isDark)])
+        TextInput({ placeholder: '搜索分类', text: this.query })
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(fs(15, this.fontScale))
+          .fontColor(Theme.textPrimary(this.isDark))
+          .placeholderColor(Theme.textTertiary(this.isDark))
+          .placeholderFont({ size: fs(14, this.fontScale) })
+          .backgroundColor(Color.Transparent)
+          .padding({ left: 0, right: 0 })
+          .caretColor(Theme.brand())
+          .onChange((v: string) => { this.query = v; })
+      }
+      .width('calc(100% - 32vp)')
+      .height(40)
+      .padding({ left: Spacing.md, right: Spacing.md })
+      .systemMaterial(ImmMaterial.cardAction())
+      .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
+      .borderRadius(Radius.full)
+      .margin({ bottom: Spacing.xs })
+
       Row() {
         Text('移入分类')
           .fontSize(fs(16, this.fontScale))
@@ -214,7 +285,27 @@ export struct FavCategoryPicker {
       .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.sm })
 
       List({ space: Spacing.md }) {
-        ForEach(this.rows(), (t: PickerRow) => {
+        /**
+         * 有词无结果：空态提示（图标 / 文案语言与收藏页搜索空态同款）。
+         * 放在列表内而非替掉整个 List —— 下一条常驻的「新建分类」入口不被挤掉（搜不到正好可当场新建）。
+         */
+        if (this.noMatch()) {
+          ListItem() {
+            Column({ space: Spacing.md }) {
+              SymbolGlyph($r('sys.symbol.magnifyingglass'))
+                .fontColor([$r('sys.color.icon_tertiary')])
+                .fontSize(fs(40, this.fontScale))
+              Text('未找到相关分类')
+                .fontSize(fs(14, this.fontScale))
+                .fontColor(Theme.textSecondary(this.isDark))
+            }
+            .width('100%')
+            .height(160)
+            .justifyContent(FlexAlign.Center)
+          }
+        }
+
+        ForEach(this.filteredRows(), (t: PickerRow) => {
           ListItem() {
             Row({ space: Spacing.md }) {
               Stack() {
@@ -269,7 +360,7 @@ export struct FavCategoryPicker {
             // §9 注：卡内条目也吃官方材质 + 半透明底（原来的不透明卡片会在玻璃面板上叠出白块，§8 坑 6）
             .systemMaterial(ImmMaterial.cardAction())
             .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
-            .borderRadius(Radius.lg)
+            .borderRadius(PICKER_CARD_RADIUS)
             .accessibilityText(`${t.name}${t.included > 0 ? `，已含 ${t.included} 条` : ''}`)
             .onClick(() => { this.toggleTarget(t.id); })
           }
@@ -325,7 +416,7 @@ export struct FavCategoryPicker {
             // 与上方分类条目同款玻璃底（不透明底会在面板玻璃上叠出白块，§8 坑 6）
             .systemMaterial(ImmMaterial.cardAction())
             .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
-            .borderRadius(Radius.lg)
+            .borderRadius(PICKER_CARD_RADIUS)
           } else {
             Row({ space: Spacing.md }) {
               /**
@@ -352,7 +443,7 @@ export struct FavCategoryPicker {
             .padding(Spacing.lg)
             .systemMaterial(ImmMaterial.cardAction())
             .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
-            .borderRadius(Radius.lg)
+            .borderRadius(PICKER_CARD_RADIUS)
             .accessibilityText('新建分类')
             .onClick(() => { this.beginCreate(); })
           }
@@ -383,7 +474,9 @@ export struct FavCategoryPicker {
     }
     .width('100%')
     .height('100%')
-    .padding({ top: 8 })
+    // 顶端留白 = 左右留白（Spacing.lg 16）：搜索框（calc(100% - 32vp)）与面板上沿、左右两侧等距
+    // → 胶囊圆角嵌在面板圆角内成同心观感（原来上 8 / 左右 16，视觉上「上窄旁宽」）
+    .padding({ top: Spacing.lg })
     // 容器节点不设 backgroundColor / border / shadow / backgroundBlurStyle：四项由 options.systemMaterial 接管（§4.4）
   }
 }

@@ -27,10 +27,11 @@ import { AuthManager } from '../service/AuthManager';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY } from '../common/Constants';
 import { FavoriteStore, CATEGORY_DEFAULT_ID } from '../service/FavoriteStore';
+import { HistoryStore } from '../service/HistoryStore';
 import { ThreadDetail as ThreadDetailModel, FloorItem, CommentItem, SubPostDetail, PersonalContentItem, ContentFragment, ContentFragmentType, FavCategory, CategoryMapping } from '../model/DataModel';
 import { ThreadDetailResult } from '../service/TiebaService';
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, isWideBarDevice, isLargeFoldDevice, isPuraXMaxDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
-import { ErrorView, ThreadSharePayload } from '../components/CommonComponents';
+import { ErrorView, ThreadSharePayload, acquireImagePreloadSlot, releaseImagePreloadSlot } from '../components/CommonComponents';
 import { ThreadDetailSkeleton } from '../components/Skeleton';
 import { FavCategoryPicker } from '../components/FavCategoryPicker';
 import { EmojiLoader } from '../network/EmojiLoader';
@@ -64,6 +65,17 @@ const THREAD_DETAIL_OFFICIAL_TITLE_BAR: boolean = true;
  * 顶部渐显带 TOP_FADE_BAND_HEIGHT(88) 与之独立，保持原值不变。
  */
 const THREAD_DETAIL_TITLE_BAR_HEIGHT: number = 98;
+
+/** 2026-09-20（A+C 加载过渡打磨）：骨架屏最短停留时长——早到的数据等骨架站稳再交接，避免"骨架一闪而过"的廉价感 */
+const SKELETON_MIN_DISPLAY_MS: number = 180;
+/** 2026-09-20（A+C）：内容进场初始上浮量（vp），随淡入归零形成"落定"运动感，消除纯透明度开关的"闪现"感 */
+const CONTENT_RISE_VP: number = 14;
+/** 2026-09-20（分区上屏）：数据落地后楼主卡先独立绘制的等待时长，之后构建楼层区 */
+const FLOORS_REVEAL_DELAY_MS: number = 50;
+/** 2026-09-20（分区上屏）：楼层区进场淡入时长 */
+const FLOORS_FADE_IN_MS: number = 200;
+/** 2026-09-20（分区上屏）：楼层区淡入的启动延迟——楼主卡先落定，回复流随后进场 */
+const FLOORS_FADE_DELAY_MS: number = 120;
 
 /**
  * 排序胶囊（正序 / 只看全部）官方槽位开关（2026-09-10）：
@@ -113,22 +125,82 @@ const DETAIL_DOCK_TABLET_WIDTH: number = 400;
  */
 const DETAIL_COL_BALANCE_THRESHOLD: number = 240;
 
+/**
+ * 「帖子沉浸式阅读」（设置 → 个性化，AppStorage `immersiveReading`，2026-09-18）：
+ * 向下滑累计 24vp → 藏起顶栏三钮 / 排序胶囊 / 评论底栏；向上滑累计 12vp → 恢复显示。
+ * 阈值不对称（24 / 12，用户拍板）：上滑更容易唤出，符合「要操作就先给我 UI」的预期。
+ */
+const IMMERSIVE_READ_HIDE_DIST: number = 24;
+const IMMERSIVE_READ_REVEAL_DIST: number = 12;
+/**
+ * 置顶保护阈值（vp）：滚动位置 ≤ 该值视为「在顶部」，恒显示不隐藏（用户 2026-09-18 明确要求）。
+ * 含回弹负值；没有这条保护，滑到底后再回顶会看不到返回钮（本页唯一返回入口）。
+ */
+const IMMERSIVE_READ_TOP_KEEP: number = 8;
+/**
+ * 跳变保护阈值（vp）：单次回调位移超过该值视为命令式滚动（消息楼层定位 scrollTo）或形态切换
+ * （旋转 / 分栏切换 / 小窗翻档）造成的跳变，丢弃本次方向判定，避免误藏 / 误露。
+ */
+const IMMERSIVE_READ_JUMP_LIMIT: number = 240;
+/**
+ * 沉浸阅读显隐动画（2026-09-18 三轮 / DT-N，用户拍板）：藏起 / 唤出**不对称** ——
+ * 向下滚是「把 UI 收起来」，要利落：180ms EaseIn（起步快、收尾缓）；
+ * 向上滑是「把 UI 要回来」，可以稍长且带一点过冲：260ms + springMotion 轻回弹。
+ */
+const IMMERSIVE_HIDE_MS: number = 180;
+const IMMERSIVE_SHOW_MS: number = 260;
+/** 唤出弹簧（curves.springMotion）：response 越小越快；dampingFraction < 1 才回弹（0.86 ≈ 轻微过冲） */
+const IMMERSIVE_SHOW_SPRING_RESPONSE: number = 0.28;
+const IMMERSIVE_SHOW_SPRING_DAMPING: number = 0.86;
+/**
+ * 沉浸位移比例（2026-09-18 三轮）：位移不再「飞出屏」，改为约 **0.6 倍自身高**，
+ * 余下部分交给 `opacity(0)` 淡掉 —— 观感从「嗖地飞走」变成「收回去」；
+ * 顺带把位移量与各形态档几何解耦（原来一个 +200 余量把所有档都拉到同一个出屏量）。
+ */
+const IMMERSIVE_FLY_SCALE: number = 0.6;
+/**
+ * 沉浸阅读「玻璃侧」错帧编排（DT-N，2026-09-18 三轮，2026-09-19 回退 P-B′ 后恢复）：
+ * 官方悬浮岛的玻璃由**系统**绘制（`barFloatingStyle.systemMaterial`），改参瞬时生效、应用层插不进动画，
+ * 与槽内容（应用节点，180ms / 260ms）**不同步**。故把玻璃侧的「撤 / 给」与内容侧错开：
+ * 藏起 = 内容先起步、玻璃晚撤 `IMMERSIVE_GLASS_LAG_MS`（撤玻璃那一刻槽内已不可见 ⇒ 空槽，硬切被藏住）；
+ * 唤出 = 玻璃先给、内容延后 `IMMERSIVE_GLASS_LEAD_MS`（顺序不可反：内容先滑回时玻璃会在归位途中凭空出现）。
+ */
+const IMMERSIVE_GLASS_LAG_MS: number = 180;
+const IMMERSIVE_GLASS_LEAD_MS: number = 16;
+
+/**
+ * 楼中楼预览点赞补齐（§Z4a，2026-09-19）：
+ * 首屏补齐延后起跑，让首屏渲染与下一页预取先占住连接池；补齐锁被占时按重试间隔轮询，
+ * 保证被 loadMore 抢先的首页楼层最终仍会被补齐（预览点赞不会永久停在 0）。
+ */
+const SUBPOST_ENRICH_DELAY_MS: number = 400;
+const SUBPOST_ENRICH_RETRY_MS: number = 400;
+
+/**
+ * 帖子详情「滚动预取」（2026-09-19，无感翻页）：滚动位置距底部不足该值（vp）时提前消费/触发下一页，
+ * 让「触底」这一刻数据已在列表里 —— 用户滑到底看到的是内容直接续上，而不是等加载。
+ * 取 1600 > 列表页 1200：详情楼层卡更高、单页请求更重，需要更长的提前量。
+ */
+const DETAIL_PREFETCH_DISTANCE: number = 1600;
+/** 滚动预取节流步长（vp）：偏移变化超过该值才允许再次触发，避免同一轮滚动连续请求（口径同 ThreadList） */
+const DETAIL_PREFETCH_THROTTLE: number = 120;
+/**
+ * 尾部加载提示延迟（ms，折中口径）：后台预取路径先静默（不显形、不转圈），超过该时长仍未返回才浮出
+ * loading 文案 —— 绝大多数请求 300~600ms 返回，用户永远看不到"正在加载"。
+ */
+const DETAIL_LOAD_HINT_DELAY: number = 1200;
+/** 尾部哨兵固定高度（vp）：三态（静默占位 / loading / 失败重试）等高，追加内容时视口不位移 */
+const DETAIL_FOOTER_SENTINEL_H: number = 56;
+
 // 官方贴吧（鸿蒙版）包名与帖子页 URL 模板：跳转仅携带 tid，不含任何登录态参数
 const TIEBA_OFFICIAL_BUNDLE: string = 'com.baidu.tiebaapp';
 const TIEBA_MARKET_URL: string = 'https://appgallery.huawei.com/app/detail?id=com.baidu.tiebaapp';
 
-// 贴吧图片缩略图 URL：仅对自带宽度参数的 CDN 图做缩小替换，避免触发防盗链。
-// 重要：不再向 /forum/pic/item/ 原图路径注入 w%3D200——
-// 贴吧 CDN 对注入后的非标准路径可能返回防盗链占位图（HTTP 200 + logo 图片），
-// Image 会将其当作正常图片加载完成直接显示，导致九宫格整片变成贴吧 logo。
-// 因此 originSrc（原图，无 w 参数）原样返回，bigCdnSrc 类的 580 宽图替换为 200 宽。
+// 贴吧图片缩略图 URL 归一：实现自 v1.26 起移至 ImageCache.toThumbUrl ——
+// 服务层「点击即预热」（TiebaService.warmDetailPreviewImages）必须与页面显示侧对同一 URL 形态做缓存，
+// 否则预热下载的文件在这里永远命不中。此处保留同名薄壳，本文件调用点零改动。
 function resolveThumbUrl(url: string): string {
-  if (url.length === 0) return url;
-  const encoded: string = url.replace(/w%3D\d+/g, 'w%3D200');
-  if (encoded !== url) return encoded;
-  const plain: string = url.replace(/w=\d+/g, 'w=200');
-  if (plain !== url) return plain;
-  return url;
+  return ImageCache.toThumbUrl(url);
 }
 
 // 楼层数据源（原 LazyForEach 数据提供器）。楼层现改为 Scroll + ForEach 全量渲染，
@@ -185,52 +257,113 @@ class FloorDataSource implements IDataSource {
   }
 }
 
-// 楼层/九宫格缩略图组件：网格用 200 宽缩略图，接入 ImageCache（本地缓存 + 防盗链下载），
-// 命中缓存立即渲染 file:// 本地图；未命中先 Image 直连缩略图兜底，同时后台下载，成功后替换
+// 楼层/九宫格缩略图组件：网格用 200 宽缩略图。
+// 显示优先级：① 本地真图（ImageCache 缓存 / resolve 落地）→ ② 直连缩略图（挂载即发，快速上屏）→ ③ 灰底占位。
 // v1.20：新增阶梯延迟重试（2s + 8s）。新帖子 pic/item 路径 CDN 同步延迟可达 10~30s，
-// 首次 Image 直连被防盗链拦截 + ImageCache 候选镜像全返回 4262 占位时，
+// 首次直连被防盗链拦截 + ImageCache 候选镜像全返回 4262 占位时，
 // 不立即锁死降级，等镜像同步后再次 resolve 多数能命中。
+// v1.25（2026-09-19）：直连结果先过「占位遮罩」（见 build）——保住直连的速度，同时绝不让贴吧 logo 上屏。
+// v1.24：resolve（落地缓存 / 自愈）改为**进入视口才发起**；直连不受此门控（见 aboutToAppear）。
+
+/**
+ * v1.24（2026-09-19）详情页「按需 resolve」安全网探针：
+ * 任一处 onVisibleAreaChange 回调触发即置 true。若挂载 1.5s 后仍为 false —— 说明可见性回调在本页
+ * 环境（全量渲染 + expandSafeArea + clip(false)）里没生效 —— 则所有尚未发起 resolve 的图片退回
+ * 「挂载即发起」的旧行为，保证缓存不会因为门控失效而永不落地。
+ * 回调只要生效就必定由首屏那几张先置位，故正常路径下这个兜底永不触发。
+ */
+let GRID_VISIBILITY_PROBE_FIRED: boolean = false;
+const GRID_VISIBILITY_FALLBACK_MS: number = 1500;
+
 @Component
 struct ThreadGridImage {
   @Prop src: string = '';
-  @State current: string = '';
   @Prop isDark: boolean = false;
+  /** 本地真图（file://）—— 显示优先级最高 */
+  @State current: string = '';
+  /** 直连图已确认为真图（未被贴吧占位模板命中）→ 撤除遮罩 */
+  @State directOk: boolean = false;
+  /** 直连用的 CDN URL（挂载即取，快速上屏；空表示不走直连） */
+  private directUrl: string = '';
   private retryScheduled: boolean = false;
-  private fallbackTriggered: boolean = false;
+  /** 已落地本地真图：终态，重试链就此收工 */
+  private resolvedLocal: boolean = false;
+  /** 解析在途：重试链不得重复占闸门槽位（否则同一张图在队列里排两次） */
+  private resolving: boolean = false;
+  /** v1.24：resolve 是否已发起（视口门控：见 startResolve 与 build 内 onVisibleAreaChange） */
+  private started: boolean = false;
 
-  private async attemptResolve(thumb: string): Promise<void> {
-    if (this.fallbackTriggered) {
-      return;
+  /** 返回是否已拿到本地真图。priority=1（视口内插队）时闸门优先发放槽位（2026-09-20 P2） */
+  private async attemptResolve(thumb: string, priority: number = 0): Promise<boolean> {
+    if (this.resolvedLocal) {
+      return true;
     }
-    const local: string = await ImageCache.resolve(thumb);
-    if (this.fallbackTriggered) {
-      return;
+    if (this.resolving) {
+      return false;
     }
-    if (local === '') {
-      // 占位识别：保留直连原图（Image 自身会触发 onError → 进入重试节奏）
-      this.current = this.src;
-      return;
+    this.resolving = true;
+    // §IMGQ：楼层宫格是全量渲染出来的（Scroll + ForEach 一次建出上百个本组件），
+    // 此前只有列表卡片走全局闸门、详情页完全裸奔 → 进帖瞬间上百个下载同时涌出，
+    // 与接口请求抢同一条会话（实测接口 0.9s → 3.5~5.0s）。
+    // 现接入列表同款全局闸门（8 并发，FIFO 发放），即楼层从上到下依次到图。
+    let local: string = '';
+    try {
+      await acquireImagePreloadSlot(priority);
+      try {
+        local = await ImageCache.resolve(thumb);
+      } finally {
+        releaseImagePreloadSlot();
+      }
+    } catch (e) {
+      local = '';
+    } finally {
+      this.resolving = false;
     }
-    if (local && local.length > 0 && local !== thumb) {
+    // v1.22 修复（首次进帖宫格图不显示、返回重进才正常）：
+    // 这里原先是 `if (this.fallbackTriggered) return;`。直连失败 / 200×200 防盗链占位是在
+    // Image 组件侧百毫秒内就置位的，而闸门后的 resolve 要排队数秒才返回 —— 于是解析出来的
+    // 本地真图被这行闸刀丢弃，current 停在灰色占位图上；重试链又被同一个标记短路成空转
+    // （tick → attemptResolve 首行即 return），首次进帖永不恢复。
+    // 返回重进时 aboutToAppear 走 getCachedPath 命中，才「正常」。
+    // 现在只认「拿到本地文件」为终态，直连失败不再阻断解析结果落地。
+    if (local.length > 0 && local !== thumb) {
+      this.resolvedLocal = true;
       this.current = local;
+      return true;
     }
+    // v1.23（2026-09-19）：解析未拿到本地真图时**不再回退到 CDN 直连原图** ——
+    // 直连 URL 交给 Image 的后果是贴吧图床返回 200×200 logo 占位图（HTTP 200、被当作加载成功），
+    // 表现为宫格「先显示贴吧 logo、随后才被真图替换」。现统一保持灰底，只等 ImageCache 真图。
+    return false;
   }
 
-  private scheduleStaggeredRetry(thumb: string): void {
-    if (this.retryScheduled || this.fallbackTriggered) {
+  /**
+   * v1.24：进入视口（或安全网兜底）后发起 resolve；同一实例只发起一次。
+   * 2026-09-20（P2）：视口回调路径 priority=1（插队，用户刚滚到的格子最先落地）；
+   * 1.5s 安全网兜底路径 priority=0（与后台预取同档）。
+   */
+  private startResolve(priority: number = 1): void {
+    if (this.started || this.resolvedLocal) {
+      return;
+    }
+    this.started = true;
+    this.attemptResolve(resolveThumbUrl(this.src), priority).catch(() => { /* 失败由阶梯重试兜底 */ });
+  }
+
+  private scheduleStaggeredRetry(url: string): void {
+    if (this.retryScheduled || this.resolvedLocal) {
       return;
     }
     this.retryScheduled = true;
     const delays: number[] = [2000, 8000];
     let idx: number = 0;
     const tick = (): void => {
-      if (this.fallbackTriggered) {
+      if (this.resolvedLocal) {
         return;
       }
-      this.attemptResolve(thumb).then(() => {
-        const cur: string = this.current;
-        // 切到 file:// 视为成功（Image 已可加载本地）
-        if (cur.length > 0 && cur !== this.src && !cur.startsWith('http')) {
+      this.attemptResolve(url).then((ok: boolean) => {
+        // 拿到本地真图即成功（Image 已可加载 file://）
+        if (ok || this.resolvedLocal) {
           return;
         }
         idx++;
@@ -244,73 +377,162 @@ struct ThreadGridImage {
 
   aboutToAppear(): void {
     const thumb: string = resolveThumbUrl(this.src);
-    this.current = thumb;
-    if (thumb.startsWith('http://') || thumb.startsWith('https://')) {
-      // 命中本地缓存（磁盘/内存）→ 直接渲染本地文件，不再触发网络
-      const cached: string | null = ImageCache.getCachedPath(thumb);
-      if (cached !== null) {
-        this.current = cached;
-        return;
+    if (!thumb.startsWith('http://') && !thumb.startsWith('https://')) {
+      // 非 http（理论上的本地路径）：原样渲染并视为终态
+      if (thumb.length > 0) {
+        this.resolvedLocal = true;
+        this.current = thumb;
       }
-      // 未命中 → 先直连缩略图兜底，同时 ImageCache 带防盗链头下载，成功后替换为 file://
-      this.attemptResolve(thumb).catch(() => { /* 与现状一致 */ });
+      return;
     }
+    // Z1 同步命中（比 getCachedPath 多一道「文件大小已达灰阶校验豁免档」判定，语义是 resolve 的子集）
+    // → 直接渲染本地真图，零等待
+    const cached: string | null = ImageCache.getVerifiedCachedPath(thumb);
+    if (cached !== null) {
+      this.resolvedLocal = true;
+      this.current = cached;
+      return;
+    }
+    // v1.25（2026-09-19）「宫格图秒加载」修复：**直连挂载即发起**，不等可见性回调。
+    // 直连（系统 Image 自己抓缩略图）就是原版「进门就出图」的那条路，保留它最快；
+    // 直连若拿到贴吧 logo 占位图，会被 build 里的遮罩挡住、不上屏（v1.23 目标不变）。
+    // resolve（落地缓存 + 防盗链自愈）仍按视口门控发起 —— 它才是与接口争抢 rcp 会话的那部分，
+    // 上百张同时发起会把接口拖慢（§IMGQ 要压的洪峰）；可见性回调失效时由 1.5s 安全网兜底。
+    this.directUrl = thumb;
+    setTimeout(() => {
+      if (!GRID_VISIBILITY_PROBE_FIRED) {
+        // 安全网兜底：非视口路径，与后台预取同档（不插队）
+        this.startResolve(0);
+      }
+    }, GRID_VISIBILITY_FALLBACK_MS);
   }
 
   build() {
-    Image(this.current.length > 0 ? this.current : this.src)
+    if (this.current.length > 0) {
+      // ① 本地真图（缓存命中 / resolve 成功）：优先级最高
+      Image(this.current)
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Cover)
+        // 图片网格圆角 18：卡片为 26，网格单格仅约屏宽 1/3，26 显得过圆，故单独收一档；
+        // 不借用全局 Radius.md（=12）；本组件仅供本文件 ImageGrid 使用（楼主卡、楼层卡、楼中楼三处共用）
+        .borderRadius(18)
+        .alt(this.isDark ? '#2A2A2E' : '#E9E9EB')
+        .onError(() => {
+          // 本地文件损坏（读不出）→ 退回「直连 + 遮罩」态并解除终态，交给阶梯重试重新解析；
+          // 重试链本身封顶两档（2s/8s），不会因此兜圈。
+          this.resolvedLocal = false;
+          this.current = '';
+          this.directUrl = resolveThumbUrl(this.src);
+          this.scheduleStaggeredRetry(this.src);
+        })
+    } else {
+      // ② 直连（快速上屏）+ ③ 灰底遮罩：直连结果只有「确认为真图」才撤遮罩
+      Stack() {
+        if (this.directUrl.length > 0) {
+          Image(this.directUrl)
+            .width('100%')
+            .height('100%')
+            .objectFit(ImageFit.Cover)
+            .borderRadius(18)
+            .onComplete((event) => {
+              if (!event || event.loadingStatus !== 1) {
+                return;
+              }
+              // 贴吧图床对无 Referer/UA 的直连请求返回 200×200 / 238×238 logo 占位图（HTTP 200，
+              // 不是错误码）→ 命中即**保持遮罩**，绝不把 logo 画上屏；真图则撤遮罩（这一帧即见）。
+              // 直连因此既保住「秒出图」的速度，又不会闪 logo（v1.23 目标不变）。
+              const ph: boolean = (event.width === 200 && event.height === 200)
+                || (event.width === 238 && event.height === 238);
+              if (!ph) {
+                this.directOk = true;
+              }
+            })
+            .onError(() => { /* 直连失败：保持遮罩，等 resolve */ })
+        }
+        if (!this.directOk) {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor(this.isDark ? '#2A2A2E' : '#E9E9EB')
+            .borderRadius(18)
+        }
+      }
       .width('100%')
       .height('100%')
-      .objectFit(ImageFit.Cover)
-      // 图片网格圆角 18：卡片为 26，网格单格仅约屏宽 1/3，26 显得过圆，故单独收一档；
-      // 不借用全局 Radius.md（=12）；本组件仅供本文件 ImageGrid 使用（楼主卡、楼层卡、楼中楼三处共用）
-      .borderRadius(18)
-      .alt(this.isDark ? '#2A2A2E' : '#E9E9EB')
-      .onError(() => {
-        // 本地缓存/缩略图加载失败 → 回退原图重试
-        if (this.current !== this.src) {
-          this.current = this.src;
-        }
-        this.fallbackTriggered = true;
-        this.scheduleStaggeredRetry(this.src);
-      })
-      .onComplete((event) => {
-        if (!event || event.loadingStatus !== 1) {
-          return;
-        }
-        // 贴吧 CDN 对 Image 组件（非移动 UA）的失效图返回 200×200 / 238×238 占位：
-        // 命中则启动阶梯延迟重试，等 CDN 同步后重下，多数能自愈。
-        if ((event.width === 200 && event.height === 200) ||
-            (event.width === 238 && event.height === 238)) {
-          this.fallbackTriggered = true;
-          this.scheduleStaggeredRetry(this.src);
+      .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean, ratio: number) => {
+        // v1.24：resolve 的视口门控挂在**始终存在**的 Stack 上 —— 不能挂在遮罩上，
+        // 否则「撤遮罩」会把门控节点一并摘掉，导致缓存永不落地
+        GRID_VISIBILITY_PROBE_FIRED = true;
+        if (isVisible) {
+          this.startResolve();
         }
       })
+    }
   }
 }
 
-// 头像组件：接入 ImageCache，命中缓存直接渲染本地图；未命中先直连兜底，下载成功后替换
+// 头像组件：接入 ImageCache，命中本地缓存直接渲染；未命中显示外层首字母占位，等 ImageCache 取回真图
 @Component
 struct AvatarImage {
   @Prop url: string = '';
   @Prop avatarSize: number = 36;
   @State current: string = '';
+  /** v1.23：本地文件损坏后只允许重解析一次，避免与图片刷新互相兜圈 */
+  private retried: boolean = false;
+  /** v1.24：resolve 是否已发起（视口门控，见 startResolve 与 build 内 onVisibleAreaChange） */
+  private started: boolean = false;
+  /** v1.25：直连图已确认为真图 → 撤除首字母遮罩 */
+  @State directOk: boolean = false;
+  /** v1.25：直连用的 CDN URL（挂载即取，快速上屏） */
+  private directUrl: string = '';
 
   aboutToAppear(): void {
-    this.current = this.url;
     if (this.url.startsWith('http://') || this.url.startsWith('https://')) {
-      const cached: string | null = ImageCache.getCachedPath(this.url);
+      // Z1 同步命中 → 直接渲染本地真图，零等待
+      const cached: string | null = ImageCache.getVerifiedCachedPath(this.url);
       if (cached !== null) {
         this.current = cached;
         return;
       }
-      ImageCache.resolve(this.url).then((local: string) => {
-        if (local === '') {
-          this.current = ''; // 确认占位图：保持空，显示外层首字母
-        } else if (local && local.length > 0 && local !== this.url) {
-          this.current = local;
+      // v1.25：直连**挂载即发起**（原版时序，最快上屏）；直连若拿到贴吧 logo 占位图，
+      // 会被 build 里那层「首字母遮罩」挡住、不上屏。
+      this.directUrl = this.url;
+      // resolve（落地缓存）仍按视口门控发起 —— 头像数量与楼层同级，全量挂载时同样是几十上百个
+      // 并发占住闸门槽位、把首屏宫格挤到队尾；可见性回调失效时由 1.5s 安全网兜底。
+      setTimeout(() => {
+        if (!GRID_VISIBILITY_PROBE_FIRED) {
+          this.startResolve();
         }
-      }).catch(() => { /* 失败保留直连，与现状一致 */ });
+      }, GRID_VISIBILITY_FALLBACK_MS);
+    } else if (this.url.length > 0) {
+      // 非 http（理论上的本地路径）：原样渲染
+      this.current = this.url;
+    }
+  }
+
+  /** v1.24：进入视口（或安全网兜底）后发起 resolve；同一实例只发起一次 */
+  private startResolve(): void {
+    if (this.started || this.current.length > 0) {
+      return;
+    }
+    this.started = true;
+    this.resolveGated().catch(() => { /* 失败保持首字母占位 */ });
+  }
+
+  /** §IMGQ：头像同样并入全局图片闸门 —— 楼层与楼中楼各有头像，29 楼一次性就是几十个并发 */
+  private async resolveGated(): Promise<void> {
+    await acquireImagePreloadSlot();
+    let local: string = '';
+    try {
+      local = await ImageCache.resolve(this.url);
+    } finally {
+      releaseImagePreloadSlot();
+    }
+    if (local === '') {
+      this.current = ''; // 确认占位图：保持空，显示外层首字母
+    } else if (local.length > 0 && local !== this.url) {
+      this.current = local;
     }
   }
 
@@ -322,13 +544,49 @@ struct AvatarImage {
         .borderRadius(Radius.full)
         .objectFit(ImageFit.Cover)
         .onError(() => {
-          if (this.current !== this.url) {
-            this.current = this.url;
+          // 本地文件损坏 → 退回「直连 + 首字母遮罩」态，并允许重解析一次（有界不兜圈）
+          this.current = '';
+          this.directUrl = this.url;
+          if (!this.retried) {
+            this.retried = true;
+            this.resolveGated().catch(() => { /* 失败保持首字母 */ });
           }
         })
     } else {
-      // 无可用图：透明占位，让外层首字母底可见
-      Column().width(this.avatarSize).height(this.avatarSize).borderRadius(Radius.full)
+      Stack() {
+        if (this.directUrl.length > 0) {
+          Image(this.directUrl)
+            .width(this.avatarSize)
+            .height(this.avatarSize)
+            .borderRadius(Radius.full)
+            .objectFit(ImageFit.Cover)
+            .onComplete((event) => {
+              if (!event || event.loadingStatus !== 1) {
+                return;
+              }
+              // 贴吧占位模板（200×200 / 238×238）→ 保持首字母遮罩，不上屏
+              const ph: boolean = (event.width === 200 && event.height === 200)
+                || (event.width === 238 && event.height === 238);
+              if (!ph) {
+                this.directOk = true;
+              }
+            })
+            .onError(() => { /* 直连失败：保持首字母遮罩，等 resolve */ })
+        }
+        if (!this.directOk) {
+          // 首字母占位层（透明）：外层首字母底可见，同时充当直连占位图的遮罩
+          Column().width(this.avatarSize).height(this.avatarSize).borderRadius(Radius.full)
+        }
+      }
+      .width(this.avatarSize)
+      .height(this.avatarSize)
+      .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean, ratio: number) => {
+        // v1.24：门控挂在始终存在的 Stack 上（撤遮罩不会摘掉门控节点）
+        GRID_VISIBILITY_PROBE_FIRED = true;
+        if (isVisible) {
+          this.startResolve();
+        }
+      })
     }
   }
 }
@@ -453,6 +711,32 @@ struct ThreadDetail {
   @State pendingReply: boolean = false;
   @State readyEmojiUrls: string[] = []; // EmojiLoader 下载转 PixelMap 成功的 URL（有这个就有 PixelMap 可 ImageSpan 渲染）
   @State failedEmojiUrls: string[] = []; // EmojiLoader 下载失败的 URL → 兜底显示中文文本
+  /**
+   * 长按复制（docs/帖子详细页长按复制文字功能补全.md）：各正文 Text 的「复制重建纪元」。
+   * 复制完成后自增对应 key → RichTextContent 内单元素 ForEach 的 key 变化 → Text 节点整体重建
+   * → 选中态随节点销毁清除。用 per-region key 而非共享 selection(start,end) 绑定：
+   * selection 属性绑共享 @State 会把同一段选中范围套到所有绑定 Text 上（跨楼层串扰）；
+   * 纪元重建只重建被复制的那一个节点。Record 更新须整体赋新对象触发重渲染（同 gridThumbFallbacks 口径）。
+   */
+  @State copyEpochs: Record<string, number> = {};
+
+  /** 读取某正文区域的复制重建纪元（缺省 0；ForEach key 生成用） */
+  private copyEpochOf(regionKey: string): number {
+    return this.copyEpochs[regionKey] ?? 0;
+  }
+
+  /** 复制成功回调：toast 提示 + 自增纪元清除该 Text 的选中态 */
+  private onTextCopied(regionKey: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: '复制成功' });
+    // ArkTS 禁止对象展开（arkts-no-spread），Record 拷贝走 Object.keys 逐键赋值；
+    // 其余 key 保留原值（纪元不变 → 对应 Text 节点不重建），只有被复制的区域自增
+    const next: Record<string, number> = {};
+    Object.keys(this.copyEpochs).forEach((k: string) => {
+      next[k] = this.copyEpochs[k];
+    });
+    next[regionKey] = (this.copyEpochs[regionKey] ?? 0) + 1;
+    this.copyEpochs = next;
+  }
 
   private hasReadyEmoji(url: string): boolean {
     return EmojiLoader.has(url) || (this.readyEmojiUrls.indexOf(url) !== -1);
@@ -535,17 +819,51 @@ struct ThreadDetail {
   // 楼中楼预览点赞补齐：本会话已通过 pb/floor 校正过点赞的楼层集合（避免重复请求）
   private subPostLikesFetched: Set<string> = new Set<string>();
   private enrichingSubPostLikes: boolean = false;
+  // §Z4a：首屏缺赞补齐的延后调度器（-1 表示空闲）
+  private enrichTimer: number = -1;
   // 分页加载楼层：currentPage 追踪当前已加载到第几页，loadingMore 防止重复请求
   @State currentPage: number = 1;
   @State loadingMore: boolean = false;
   @State hasMoreFloors: boolean = true;
   @State totalFloorPage: number = 1;
+  // ===== 无感翻页（2026-09-19）：滚动预取 + 尾部哨兵折中 =====
+  /** 尾部加载提示是否浮出：后台预取路径超时（DETAIL_LOAD_HINT_DELAY）才置 true，用户显式触发/已触底立即置 true */
+  @State loadingHintVisible: boolean = false;
+  /** 尾部加载失败态：仅用户显式路径置位（后台预取失败保持静默，由触底兜底重试） */
+  @State loadMoreFailed: boolean = false;
+  /** 尾部提示延时器句柄（setTimeout 返回值，-1 = 空闲）：退页时必须清理，防回调落到已销毁组件 */
+  private loadingHintTimer: number = -1;
+  /** 内容高 / 视口高（vp）：滚动预取剩余距离 = 内容高 - 视口高 - 当前偏移，口径同 HomeTab / ThreadList */
+  private detailContentH: number = 0;
+  private detailViewportH: number = 0;
+  /** 上次触发预取的滚动偏移（-1 = 未触发过）：节流用 */
+  private lastPrefetchY: number = -1;
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
-  // 骨架屏→内容交叉淡入淡出（方案A）：内容初始透明淡入，骨架屏淡出后由 loadState 切换移除
+  // 骨架屏→内容过渡（2026-09-20 A+C 接力式）：内容初始透明 + 上浮，骨架退场后落定进场
   @State contentOpacity: number = 0.0;
   @State skeletonOpacity: number = 1.0;
+  /** 内容进场初始上浮量（vp）：随淡入归零形成"落定"运动感；缓存直出路径直接置 0 */
+  @State contentTranslateY: number = CONTENT_RISE_VP;
+  /** 骨架屏实际可见时刻（C：最短停留计算用） */
+  private skeletonShownAt: number = 0;
+  /** 接力过渡进行中标记（防重入：fadeInContent 可能被结果路径与缓存回落路径先后触发） */
+  private fadeRelayRunning: boolean = false;
+  /** 接力动画代次：loadDetail（切排序/只看楼主/刷新）递增作废在途定时器，防止旧过渡打断新一轮 */
+  private fadeGeneration: number = 0;
+  /** 2026-09-20（分区上屏）：楼层区构建闸门——false 时楼层/回复头/尾哨兵不进组件树，楼主卡先独立绘制 */
+  @State floorsReady: boolean = false;
+  /** 2026-09-20（分区上屏）：楼层区进场淡入透明度（随楼主卡落定后 120ms 启动） */
+  @State floorsOpacity: number = 0;
+  private floorsRevealTimer: number = -1;
+  /**
+   * 骨架屏是否已获准出现（§P0-4 首屏免骨架屏）：
+   * 首屏 open 时先按住 120ms —— 这段窗口内命中缓存（预取/内存/磁盘）就直接出内容，
+   * 全程不出现骨架屏，也就没有"骨架屏一闪 → 内容"的白等；超时未出内容才放行骨架屏。
+   * 已有内容后的重新加载（切排序 / 只看楼主 / 强制刷新）立即置 true，骨架屏表现与改造前一致。
+   */
+  @State skeletonVisible: boolean = false;
   /**
    * 形态切换平滑化（2026-09-13）：缓存 `splitMode()` 的**结果**，只在真正跨形态（横↔竖）时
    * 写一次 —— 避免旋转过程中 `currentWidth` / `pageHeight` 每帧变化导致布局分支反复求值、
@@ -557,11 +875,37 @@ struct ThreadDetail {
   // .tabBar() 槽位，材质由 barFloatingStyle.systemMaterial 悬浮条本体渲染）；其余走原手写叠放路径。
   @State materialSupported: boolean = false;
   /**
-   * 官方悬浮条首帧重排触发器（2026-09-13）：`aboutToAppear` 后 300ms 置 1，令 `barBottomMargin`
-   * 产生一次 0.5vp 微变 → 触发系统对悬浮条重新布局，**等效于用户手动旋转**（旋转之所以能修好
-   * 首帧不齐，本质就是布局参数变化引发了系统重排）。0.5vp 视觉不可察。
+   * 官方悬浮条首帧重排触发（2026-09-13；P-B′ 期间随 barFloatingStyle 一并移除，2026-09-19 回退恢复）：
+   * 官方悬浮条存在首帧时序问题 —— 首次进入时槽内内容不随岛视觉居中（点赞/收藏/跳转/发送整体偏上、
+   * 参差），**旋转一下触发系统重排后才正常**（用户真机复现）。修复 = 进页后对 `barBottomMargin`
+   * 施加一次 0.5vp 微变（视觉不可察），模拟旋转的「布局参数变化 → 系统重排悬浮条」。
+   * 手机同样会 nudge 一次，0.5vp 无感；若 300ms 不够（数据慢）可再调时机。
    */
   @State dockNudge: number = 0;
+  // ===== 「帖子沉浸式阅读」（设置 → 个性化，2026-09-18）=====
+  /** 设置项真源：AppStorage `immersiveReading`（UsageHabitsManager 冷启动恢复 / 设置页写入），默认关 */
+  @StorageLink('immersiveReading') @Watch('onImmersiveReadingChanged') immersiveReading: boolean = false;
+  /**
+   * 沉浸态：true = 顶栏三钮 / 排序胶囊 / 评论底栏已藏起。
+   * **只存页面局部 @State，绝不写 AppStorage** —— 写全局会让切页 / 换帖残留隐藏态（文档 §6.1 D1 类风险）。
+   * 由 onDetailScroll 的方向阈值翻转；关闭开关 / 返回本页 / 触底时立即复位。
+   */
+  @State immersiveHidden: boolean = false;
+  /** 同方向滚动累计量（vp，私有，不参与渲染 —— 逐帧写 @State 会在高刷档掉帧） */
+  private immersiveAccum: number = 0;
+  /** 上一次滚动位置（vp）：本工程 onScroll 第二参按「累计滚动位置」使用，增量须自算 */
+  private immersiveLastY: number = 0;
+  /** 滚动位置是否已初始化（首帧只记录不判定，避免拿别处残留值算增量） */
+  private immersiveLastReady: boolean = false;
+  /**
+   * 玻璃侧独立状态位（DT-N）：与内容侧 `immersiveHidden` **不同步**，只驱动 `barFloatingStyle` 的
+   * `barWidth`（隐藏态收 0 ⇒ 胶囊无面积 ⇒ 系统不渲染玻璃）。错帧时机见 hideImmersive / showImmersive。
+   */
+  @State immersiveGlassHidden: boolean = false;
+  /** 玻璃侧延时器句柄（setTimeout 返回值，-1 = 空闲）：重排前与退页时清理 */
+  private immersiveGlassTimer: number = -1;
+  /** 唤出幂等位：置顶保护分支每帧都会调 showImmersive，防止把内容无限顺延（回顶后要等弹跳结束才回来） */
+  private immersiveShowPending: boolean = false;
   // 壳分支悬浮岛宽度依赖的屏宽（onAreaChange 实时更新）
   @State currentWidth: number = 360;
   // ===== 平板适配（docs/TiebaPura平板适配.md §4.9）=====
@@ -583,6 +927,8 @@ struct ThreadDetail {
   @State notifyMsgPostId: string = '';
   /** 楼中楼自动定位已触发标志（避免返回本页时重复拉起） */
   private notifySubPostHandled: boolean = false;
+  /** 浏览历史本页只写一次（applyDetailResult 会被缓存 / 网络 / 身份补齐多次调用） */
+  private historyRecorded: boolean = false;
   /** 楼中楼目标解析已尝试标志（一次性，避免重复探测） */
   private notifyResolveHandled: boolean = false;
   /** 楼层自动定位到底未命中的提示是否已弹出（只提示一次） */
@@ -610,8 +956,16 @@ struct ThreadDetail {
     // 形态切换平滑化：首帧就固化分栏结果（横屏冷启动直接走分栏，不会先竖后跳）
     this.isSplit = this.splitMode();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
-    // 官方悬浮条首帧重排触发：首帧渲染完成后对 barBottomMargin 施加 0.5vp 微变，模拟旋转的
-    // 系统重排（等效用户手动旋转修复首帧不齐）。300ms = 首帧布局已稳定、且早于用户读完内容。
+    // §P0-4 首屏免骨架屏：120ms 内拿到内容（预取合流 / 内存 / 磁盘缓存命中）则本次打开全程不挂骨架屏；
+    // 超时仍无内容才放行。已有内容后的重新加载走 loadDetail 内的立即置位，不进这条延时。
+    setTimeout(() => {
+      if (this.loadState === LoadState.Loading) {
+        this.skeletonVisible = true;
+        // C：记录骨架可见时刻，供 fadeInContent 计算最短停留
+        this.skeletonShownAt = Date.now();
+      }
+    }, 120);
+    // 首帧重排触发（2026-09-13，回退 P-B′ 后恢复）：300ms = 首帧布局已稳定、且早于用户读完内容。
     setTimeout(() => {
       this.dockNudge = 1;
     }, 300);
@@ -695,6 +1049,30 @@ struct ThreadDetail {
     }
     // 若从消息页带入了目标楼层，内容就位后延迟重试滚动高亮（首帧几何信息可能未就绪）
     this.scheduleScrollToTargetFloor();
+    // 浏览历史：数据一落地就记录（内存缓存秒开 / 磁盘缓存秒开 / 网络返回三条路径共用）。
+    // 旧实现只在网络成功分支里记录 → 命中缓存且网络异常时该帖不进历史、浏览历史列表看不到。
+    this.recordHistoryOnce();
+  }
+
+  /**
+   * 写一次浏览历史（页面实例内只写一次：applyDetailResult 会被内存缓存 / 磁盘缓存 /
+   * 网络结果 / 身份补齐回调多次调用，重复写没必要且增加磁盘 IO）。
+   */
+  private recordHistoryOnce(): void {
+    if (this.historyRecorded) {
+      return;
+    }
+    const detail: ThreadDetailModel | null = this.detail;
+    if (detail === null) {
+      return;
+    }
+    const tid: string = `${detail.tid ?? ''}`.trim().length > 0 ? `${detail.tid}`.trim() : this.tid.trim();
+    if (tid.length === 0) {
+      return;
+    }
+    this.historyRecorded = true;
+    this.recordThreadHistory(detail, tid).catch((): void => {
+    });
   }
 
   // v68: 详情接口未解析 isCollected，改用本地收藏缓存判断（缓存与云端同步，收藏/取消时都会更新）
@@ -800,77 +1178,226 @@ struct ThreadDetail {
   }
 
   /**
-   * 骨架屏→内容交叉淡入淡出（方案A）：
-   * animateTo 内同时让内容 0→1、骨架屏 1→0；动画结束后再把 loadState 切到 Success，
-   * 使骨架屏分支移除时已完全透明，消除"骨架屏瞬间消失+内容瞬间整体出现"的生硬感。
-   * 已淡入完成（缓存秒开/后台合并）时直接跳过，避免重复动画。
+   * 2026-09-20（分区上屏）：楼层区延迟构建 + 分区淡入。
+   * 数据落地后楼主卡先独立构建/绘制（首帧构建成本从"楼主卡+整页楼层"降为"楼主卡"），
+   * 约 50ms 后再构建楼层区并以 120ms 延迟淡入——"楼主帖先落定、回复流随后进场"的阅读层次。
+   * 楼层构建闸门 floorsReady 同时是消息/跳楼定位的隐式同步点（定位延迟 250ms > 50ms+一帧构建）。
+   * gen 校验：切排序/刷新打断时作废在途 reveal。
    */
-  private fadeInContent(): void {
-    if (this.loadState === LoadState.Error || this.contentOpacity >= 1) {
+  private scheduleFloorsReveal(): void {
+    if (this.floorsReady || this.floorsRevealTimer >= 0) {
       return;
     }
-    animateTo({ duration: 250, curve: Curve.EaseInOut }, () => {
-      this.contentOpacity = 1;
-      this.skeletonOpacity = 0;
-    });
-    setTimeout(() => {
+    const gen: number = this.fadeGeneration;
+    this.floorsRevealTimer = setTimeout(() => {
+      this.floorsRevealTimer = -1;
+      if (gen !== this.fadeGeneration || this.floorsReady) {
+        return;
+      }
+      this.floorsReady = true;
+      animateTo({ duration: FLOORS_FADE_IN_MS, curve: Curve.EaseOut, delay: FLOORS_FADE_DELAY_MS }, () => {
+        this.floorsOpacity = 1;
+      });
+    }, FLOORS_REVEAL_DELAY_MS);
+  }
+
+  /**
+   * 骨架屏→内容过渡（2026-09-20 A+C 接力式打磨）：
+   * 旧版交叉淡入淡出（内容 0→1 与骨架 1→0 同时 250ms）中段两层各半透明、底色透出，
+   * 观感为"内容中间闪出来"。现改为接力：骨架先完全退场（180ms EaseIn，呼吸动画干净收束），
+   * 内容再带 14vp 上浮进场（240ms EaseOut，"落定"运动感）——每一步都无半透明交叉。
+   * C：骨架屏最短停留 180ms——早到的数据等骨架站稳再交接，避免"骨架一闪而过"。
+   * 已淡入完成（缓存秒开/后台合并）时直接跳过；进行中重入由 fadeRelayRunning 拦截；
+   * 途中 reload（切排序/刷新）递增 fadeGeneration 作废在途定时器。
+   */
+  private fadeInContent(): void {
+    if (this.loadState === LoadState.Error) {
+      return;
+    }
+    // §防永久骨架：contentOpacity 可能被其他路径（如动画回调重入）先行置 1，
+    // 此时若直接 return，下方定时器链永不注册，loadState 会永久停在 Loading，
+    // 骨架屏（loadState===Loading && skeletonVisible）随之永久挂起。
+    // 故此处补一条状态机收敛路径：已淡入完成就只负责把状态推进到 Success。
+    if (this.contentOpacity >= 1) {
       if (this.loadState === LoadState.Loading) {
         this.loadState = LoadState.Success;
       }
-    }, 260);
+      return;
+    }
+    if (this.fadeRelayRunning) {
+      return;
+    }
+    this.fadeRelayRunning = true;
+    const gen: number = this.fadeGeneration;
+    const stale = (): boolean => gen !== this.fadeGeneration;
+    // C：骨架最短停留
+    const shownElapsed: number = this.skeletonShownAt > 0 ? Date.now() - this.skeletonShownAt : 0;
+    const skeletonHold: number = Math.max(0, SKELETON_MIN_DISPLAY_MS - shownElapsed);
+    setTimeout(() => {
+      if (stale()) {
+        this.fadeRelayRunning = false;
+        return;
+      }
+      // A 第一步：骨架完全退场
+      animateTo({ duration: 180, curve: Curve.EaseIn }, () => {
+        this.skeletonOpacity = 0;
+      });
+      // A 第二步：骨架退场后内容上浮进场
+      setTimeout(() => {
+        if (stale()) {
+          this.fadeRelayRunning = false;
+          return;
+        }
+        animateTo({ duration: 240, curve: Curve.EaseOut }, () => {
+          this.contentOpacity = 1;
+          this.contentTranslateY = 0;
+        });
+        setTimeout(() => {
+          this.fadeRelayRunning = false;
+          if (!stale() && this.loadState === LoadState.Loading) {
+            this.loadState = LoadState.Success;
+          }
+        }, 250);
+      }, 185);
+    }, skeletonHold);
+  }
+
+  /**
+   * 缓存命中直出（§P0-2）：命中内存/磁盘缓存时不再走 250ms 交叉淡入 + 260ms 后置切态，
+   * 直接在当帧把内容推到不透明并切 Success，打开即内容、且底栏（排序胶囊/评论岛）同步就位。
+   * 网络首帧路径仍走 fadeInContent()，观感一字未改。
+   * 已出现骨架屏（>120ms 才拿到缓存，如冷启动首次读盘较慢）时回落淡入，避免骨架屏"硬消失"。
+   */
+  private showCachedContent(): void {
+    if (this.loadState === LoadState.Loading && this.skeletonVisible) {
+      this.fadeInContent();
+      return;
+    }
+    this.contentOpacity = 1;
+    this.skeletonOpacity = 0;
+    this.contentTranslateY = 0;
+    this.loadState = LoadState.Success;
+    // 分区上屏：缓存直出同样楼主卡先行，楼层区下一帧补齐
+    this.scheduleFloorsReveal();
+  }
+
+  /**
+   * 发起首屏详情请求（合流版）：单独成方法以便与磁盘缓存读并行发出（§Z1）。
+   * §P0-1：点击时起的预取若仍在途，合流版直接等它，不另发一次同参请求。
+   */
+  private startDetailRequest(): Promise<ThreadDetailResult> {
+    return TiebaService.getInstance().fetchThreadDetailCoalesced(
+      this.tid, 1, this.sortType, this.seeLz, this.forumId, this.commentRn, 0, '',
+      // 身份补齐完成后回调：只刷新身份相关字段，不打断用户浏览
+      (merged: ThreadDetailResult) => { this.applyDetailResult(merged); }
+    );
   }
 
   async loadDetail(force: boolean = false): Promise<void> {
+    // §TD 首屏耗时打点（纯日志，零行为影响）：__td0 为本轮加载起点，
+    // 用于核算「缓存段 + 合流 await 段」各自耗时与骨架屏悬挂时长。
+    const __td0: number = Date.now();
     this.loadState = LoadState.Loading;
     // 每次加载重置过渡透明度：骨架屏覆盖、内容透明，等待淡入
     this.contentOpacity = 0.0;
     this.skeletonOpacity = 1.0;
+    // A+C：内容回到上浮起点；作废在途接力动画（切排序/只看楼主/刷新打断上一轮过渡时，
+    // 旧定时器不得把新骨架提前收掉或把旧内容推上场）
+    this.contentTranslateY = CONTENT_RISE_VP;
+    this.fadeGeneration++;
+    this.fadeRelayRunning = false;
+    // 分区上屏：楼层区回到未构建态（数据落地后楼主卡先绘制，楼层区由 scheduleFloorsReveal 补齐）
+    this.floorsReady = false;
+    this.floorsOpacity = 0;
+    // §P0-4：首屏（本页尚无内容）不立即挂骨架屏，交 aboutToAppear 的 120ms 延时放行；
+    // 已有内容的重新加载（切排序 / 只看楼主 / 强制刷新）立即放行，骨架屏表现与改造前一致。
+    if (this.detail !== null) {
+      this.skeletonVisible = true;
+      // C：重载路径骨架立即放行，同样记录可见时刻
+      this.skeletonShownAt = Date.now();
+    }
     // 重置分页状态
     this.currentPage = 1;
     this.hasMoreFloors = true;
+    // 无感翻页：复位滚动预取节流基线（换帖 / 切排序 / 只看楼主 / 刷新后重新起算，
+    // 避免拿上一份内容的偏移做节流判断），并收回可能残留的尾部提示/失败态
+    this.lastPrefetchY = -1;
+    this.endLoadMoreHint();
+    this.loadMoreFailed = false;
     const cacheKey = this.threadDetailCacheKey();
     // 1. 秒开：非强制刷新时优先内存缓存，其次磁盘缓存（stale 也先显示），网络结果返回后再覆盖
+    //    §P0-2：缓存命中直接直出（不淡入、不等 260ms 后置切态），打开即内容
+    let __tdCache: string = force ? 'force' : 'miss';
+    // §Z1（2026-09-19）：磁盘读（10~150ms）不再阻塞网络请求发出 —— 内存未命中即先起请求再读盘，
+    // 两者并行；磁盘结果仍先落地做秒开、网络结果到达后覆盖，落地顺序与改造前逐帧一致，只是省掉串行等待。
+    let netPromise: Promise<ThreadDetailResult> | null = null;
+    let __ta0: number = 0;
     if (!force) {
       const cached = TiebaService.getInstance().getThreadDetailCache(cacheKey);
       if (cached) {
+        __tdCache = 'mem';
         this.applyDetailResult(cached);
         this.applyCollectedState(cached);
-        this.fadeInContent();
+        this.showCachedContent();
       } else {
+        netPromise = this.startDetailRequest();
+        __ta0 = Date.now();
+        // 并行窗口内先挂一次拒绝兜底：请求若在「发出→await」之间快速失败（断网等）
+        // 不会产生未处理拒绝告警；真实错误仍由下方 try/await 捕获处理。
+        netPromise.catch((): void => {
+        });
         // 冷启动秒开：磁盘缓存（过期数据也先显示），后台网络刷新校正
         const disk = await TiebaService.getInstance().getThreadDetailFromDisk(this.tid, this.sortType, this.seeLz);
         if (disk) {
+          __tdCache = 'disk';
           this.applyDetailResult(disk);
           this.applyCollectedState(disk);
-          this.fadeInContent();
+          this.showCachedContent();
         }
       }
     }
+    console.info(`[TD] page enter tid=${this.tid} force=${force ? '1' : '0'} cache=${__tdCache} elapsed=${Date.now() - __td0}ms`);
     try {
-      const result = await TiebaService.getInstance().fetchThreadDetail(
-        this.tid, 1, this.sortType, this.seeLz, this.forumId, this.commentRn, 0, '',
-        // 身份补齐完成后回调：只刷新身份相关字段，不打断用户浏览
-        (merged: ThreadDetailResult) => { this.applyDetailResult(merged); }
-      );
+      // §Z1：上面已随磁盘读并行发出的直接复用；__ta0 记的是请求发出时刻，
+      // 故 page await cost 仍是整段请求耗时（与改造前同口径，便于 A/B 对比）。
+      if (netPromise === null) {
+        __ta0 = Date.now();
+        netPromise = this.startDetailRequest();
+      }
+      const result = await netPromise;
+      const __ta1: number = Date.now();
       // 残缺空壳刷新判定：接口偶发返回"有标题但正文/楼层全空"的响应，
       // 且页面当前已展示可读内容（通常是缓存秒开成功后的后台刷新）。
       // 此时保留页面现状：不写缓存（service 缓存层同样过滤空壳）、不覆写浏览历史、不预取，
       // 避免好内容被空壳结果二次清空。
       const refreshShell: boolean = !this.hasVisibleDetailContent(result.detail, result.floors)
         && this.hasVisibleDetailContent(this.detail, this.floors);
+      // 读法（2026-09-19 补）：cache=mem/disk 时下面的 cost 是「后台兜底刷新」耗时——
+      // 内容在上一条 page enter 时已直出可见，这不是首屏可交互耗时；
+      // 只有 cache=miss/force 才是用户真正在等的那一段。
+      console.info(`[TD] page await tid=${this.tid} cache=${__tdCache} cost=${__ta1 - __ta0}ms floors=${result.floors.length} refreshShell=${refreshShell ? '1' : '0'} elapsed=${__ta1 - __td0}ms`);
       if (!refreshShell) {
         TiebaService.getInstance().putThreadDetailCache(cacheKey, result);
         // 写磁盘缓存：冷启动重进该帖也能秒开
         TiebaService.getInstance().saveThreadDetailToDisk(result, this.tid, this.sortType, this.seeLz);
         this.applyDetailResult(result);
         this.applyCollectedState(result);
-        // 淡入收尾：内容 0→1、骨架屏 1→0，动画结束后 loadState 由 Loading 切 Success
-        this.fadeInContent();
+        // 2026-09-20 快路径免淡入：数据在 120ms 骨架屏窗口内到达（快网络 / 按下预取及时），
+        // 骨架屏从未出现 → 内容无需 0→1 淡入，直接不透明上屏，省 250ms 感知延迟。
+        // 已有内容后的重载（切排序 / 只看楼主 / 刷新）骨架屏立即放行，仍走交叉淡入，表现与改造前一致；
+        // 数据慢于 120ms 时骨架屏已出现，也回落淡出骨架屏路径，避免硬切。
+        if (this.loadState === LoadState.Loading && !this.skeletonVisible) {
+          this.showCachedContent();
+        } else {
+          this.fadeInContent();
+        }
+        // 分区上屏：楼主卡先绘制，楼层区延迟构建 + 分区淡入
+        this.scheduleFloorsReveal();
         // 楼中楼预览点赞补齐：pb/page 详情接口的楼中楼不含点赞字段，
         // 对含楼中楼的楼层静默调用 pb/floor 校正预览点赞数/已赞状态
-        this.enrichSubPostPreviewLikes(result.floors);
-        // 写浏览历史不阻塞首屏收尾（fire-and-forget，失败静默）
-        this.recordThreadHistory(result.detail).catch(() => { });
+        // §Z4a：延后起跑（见 scheduleSubPostPreviewEnrich），不与首屏渲染/下一页预取抢连接
+        this.scheduleSubPostPreviewEnrich();
+        // 浏览历史已在 applyDetailResult 里记录（覆盖缓存秒开 / 网络两条路径，且每页只写一次）
         // 预取下一页楼层：滚动翻页时直接命中缓存，减少等待
         if (this.hasMoreFloors) {
           TiebaService.getInstance().prefetchThreadNextPage(this.tid, this.currentPage, this.sortType, this.seeLz, this.forumId, this.commentRn);
@@ -992,10 +1519,10 @@ struct ThreadDetail {
     });
   }
 
-  private async recordThreadHistory(detail: ThreadDetailModel): Promise<void> {
+  private async recordThreadHistory(detail: ThreadDetailModel, tid: string): Promise<void> {
     const item: PersonalContentItem = {
-      id: detail.tid,
-      tid: detail.tid,
+      id: tid,
+      tid: tid,
       title: detail.title,
       forumName: detail.forumName,
       forumId: detail.forumId ?? '',
@@ -1005,11 +1532,8 @@ struct ThreadDetail {
       replyNum: detail.replyNum,
       createTime: detail.createTime
     };
-    const accountId: string = AuthManager.getInstance().getUser()?.userId ?? '';
-    if (accountId.length > 0) {
-      item.accountId = accountId;
-      await CacheManager.getInstance().appendJsonItem(`${CACHE_KEY.PERSONAL_HISTORY}_${accountId}`, item);
-    }
+    // 账号 ID / 浏览时间戳 / 同帖去重置顶 / 上限截断统一由 HistoryStore 处理
+    await HistoryStore.getInstance().record(item);
   }
 
   async loadMoreComments(): Promise<void> {
@@ -1029,12 +1553,18 @@ struct ThreadDetail {
   }
 
   // 加载更多楼层（下一页）
-  async loadMoreFloors(): Promise<void> {
+  /**
+   * @param silent 后台预取路径（滚动预取）传 true：尾部先静默、超时才浮出 loading，失败也不打扰用户
+   *               （由触底/滚动兜底重试）；用户显式路径（触底 onReachEnd、点击重试、消息楼层定位）
+   *               保持默认 false：立即浮出 loading，失败给出可点重试。
+   */
+  async loadMoreFloors(silent: boolean = false): Promise<void> {
     // 防重复请求
     if (this.loadingMore || !this.hasMoreFloors) {
       return;
     }
     this.loadingMore = true;
+    this.beginLoadMoreHint(silent);
     try {
       const nextPage = this.currentPage + 1;
       // 优先使用已预取的下一页（秒接），未命中再发网络请求
@@ -1084,11 +1614,88 @@ struct ThreadDetail {
         TiebaService.getInstance().prefetchThreadNextPage(this.tid, this.currentPage, this.sortType, this.seeLz, this.forumId, this.commentRn);
       }
     } catch (e) {
-      // 加载失败时不更新页码，允许重试
+      // 加载失败时不更新页码，允许重试；后台预取失败保持静默（由触底/滚动兜底重试）
+      this.loadMoreFailed = !silent;
       console.error('加载更多楼层失败:', (e as Error).message);
     } finally {
+      this.endLoadMoreHint();
       this.loadingMore = false;
     }
+  }
+
+  /** 尾部加载提示起手：显式路径立即浮出；后台预取路径先静默，超时 DETAIL_LOAD_HINT_DELAY 才浮出 */
+  private beginLoadMoreHint(silent: boolean): void {
+    this.clearLoadingHintTimer();
+    this.loadMoreFailed = false;
+    if (!silent) {
+      this.loadingHintVisible = true;
+      return;
+    }
+    this.loadingHintVisible = false;
+    this.loadingHintTimer = setTimeout(() => {
+      this.loadingHintTimer = -1;
+      this.loadingHintVisible = true;
+    }, DETAIL_LOAD_HINT_DELAY);
+  }
+
+  /** 尾部加载提示收尾：清延时器 + 收回提示（无论成败提示都归于静默，失败态另行置位） */
+  private endLoadMoreHint(): void {
+    this.clearLoadingHintTimer();
+    this.loadingHintVisible = false;
+  }
+
+  /** 清理尾部提示延时器（beginLoadMoreHint 重排前 + aboutToDisappear 退页时调用） */
+  private clearLoadingHintTimer(): void {
+    if (this.loadingHintTimer !== -1) {
+      clearTimeout(this.loadingHintTimer);
+      this.loadingHintTimer = -1;
+    }
+  }
+
+  /**
+   * 用户已触底：若后台预取仍在途，立即浮出提示 —— 用户已经滑到边界在等，不宜再保持静默，
+   * 否则尾部是一片空白占位（比转圈更糟）。
+   */
+  private revealLoadHintOnReachEnd(): void {
+    if (this.loadingMore && !this.loadMoreFailed) {
+      this.clearLoadingHintTimer();
+      this.loadingHintVisible = true;
+    }
+  }
+
+  /**
+   * 帖子详情滚动预取（无感翻页核心）：与沉浸阅读（onDetailScroll）**共用同一个 onScroll 挂点** ——
+   * ArkUI 的 .onScroll 一个组件只能挂一个回调，重复挂会覆盖（新挂一个会让沉浸显隐直接失效），
+   * 故在挂点处串联调用，本方法不碰沉浸任何状态。
+   *
+   * 判定：剩余距离（内容高 - 视口高 - 当前偏移）不足 DETAIL_PREFETCH_DISTANCE 时触发下一页，
+   * 走 loadMoreFloors(true) 静默路径 —— 命中「下一页预取缓存」时同步追加（零等待），
+   * 未命中才发网络请求，请求期间对用户完全不可见。
+   */
+  private onDetailScrollPrefetch(): void {
+    if (this.loadState !== LoadState.Success || this.loadingMore || !this.hasMoreFloors) {
+      return;
+    }
+    if (this.detailContentH <= 0 || this.detailViewportH <= 0) {
+      return;
+    }
+    // 绝对位置取 Scroller 真值（onScroll 入参语义在工具链间有差异，口径同 onDetailScroll）
+    let y: number = 0;
+    try {
+      y = this.scroller.currentOffset().yOffset;
+    } catch (e) {
+      return;
+    }
+    const remaining: number = this.detailContentH - this.detailViewportH - y;
+    if (remaining > DETAIL_PREFETCH_DISTANCE) {
+      return;
+    }
+    // 节流：偏移变化超过 DETAIL_PREFETCH_THROTTLE 才允许再次触发，避免同一轮滚动连续请求
+    if (this.lastPrefetchY >= 0 && Math.abs(y - this.lastPrefetchY) < DETAIL_PREFETCH_THROTTLE) {
+      return;
+    }
+    this.lastPrefetchY = y;
+    this.loadMoreFloors(true);
   }
 
   async doComment(): Promise<void> {
@@ -1180,6 +1787,12 @@ struct ThreadDetail {
     .onAreaChange((_oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
       const height = newValue.height as number;
+      // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期逐帧回调，同尺寸时写 @State 与重算 splitMode()
+      // 都是白做（下方 applySplitSwitch 另有「split 结果未变不切」守卫，这里再省掉每帧的判定开销）。
+      // 注意判据用 currentWidth（下方 width>0 才回填，故 0 = 未初始化时不会误早退）。
+      if (width === this.currentWidth && height === this.pageHeight) {
+        return;
+      }
       if (width > 0) {
         this.currentWidth = width;
       }
@@ -1361,6 +1974,174 @@ struct ThreadDetail {
     return isLargeFoldDevice() ? 62 : 66;
   }
 
+  // ===== 「帖子沉浸式阅读」交互（2026-09-18，设置 → 个性化 / AppStorage `immersiveReading`）=====
+
+  /**
+   * 底部浮层（岛内评论条 / 排序胶囊 / 排序兜底 / 兜底底栏）隐藏位移（vp，向下）。
+   * 2026-09-18 三轮改「收回」口径：= (底距 + 岛高) × 0.6 ≈ −58 —— 只下沉约 0.6 倍自身堆叠高，
+   * 余下部分由 `opacity(0)` 淡掉；触区仍由 `enabled(false)` 保证（与位移量无关）。
+   * 四个底部挂点共用本函数 → 同节奏；位移不再含 +200 出屏余量，各形态档（手机 / 平板 / 大折叠 /
+   * 阔直屏）自动按自身几何等比收敛。
+   */
+  private immersiveBottomSink(): number {
+    return -((this.dockBottomMargin() + this.dockPillHeight()) * IMMERSIVE_FLY_SCALE);
+  }
+
+  /** 顶栏隐藏位移（vp，向上）：= 官方标题栏高 98 × 0.6 ≈ −59（同「收回」口径，其余交给 opacity 淡出） */
+  private immersiveTopSink(): number {
+    return -(THREAD_DETAIL_TITLE_BAR_HEIGHT * IMMERSIVE_FLY_SCALE);
+  }
+
+  /**
+   * 帖子详情滚动 → 沉浸显隐判定。挂点 = 内容主滚动区（竖屏 Scroll / 横屏分栏右栏，共用 `this.scroller`）。
+   * 规则（用户拍板）：
+   * ① **阈值不对称** —— 向下累计 24vp 藏起、向上累计 12vp 恢复（上滑更容易唤出 UI）；
+   * ② **置顶保护** —— 滚动位置 ≤ 8vp（含顶部回弹负值）恒显示，滑到底再回顶一定看得到返回钮；
+   * ③ **跳变保护** —— 单次位移 > 240vp 视为命令式 scrollTo 定位 / 旋转分栏切换，丢弃本次方向判定；
+   * ④ 触底（onReachEnd）/ 返回本页 / 关闭开关三处立即复位。
+   * 分栏左栏（主楼）不挂：主楼通常不满一屏，且与右栏共用一个累计器会互相污染基线。
+   */
+  private onDetailScroll(_x: number, _y: number): void {
+    if (!this.immersiveReading) {
+      return;
+    }
+    // 绝对位置取 Scroller 真值（onScroll 入参语义在工具链间有差异，不作累计位置依赖）
+    let pos: number = this.immersiveLastY;
+    try {
+      pos = this.scroller.currentOffset().yOffset;
+    } catch (e) {
+      return;
+    }
+    if (!this.immersiveLastReady) {
+      this.immersiveLastY = pos;
+      this.immersiveLastReady = true;
+      return;
+    }
+    const delta: number = pos - this.immersiveLastY;
+    this.immersiveLastY = pos;
+    if (delta === 0) {
+      return;
+    }
+    // ② 置顶保护：顶部恒显示
+    if (pos <= IMMERSIVE_READ_TOP_KEEP) {
+      this.immersiveAccum = 0;
+      if (this.immersiveHidden) {
+        this.showImmersive();
+      }
+      return;
+    }
+    // ③ 跳变保护
+    if (Math.abs(delta) > IMMERSIVE_READ_JUMP_LIMIT) {
+      this.immersiveAccum = 0;
+      return;
+    }
+    if (delta > 0) {
+      // 向下滚（看更下方内容）→ 累计 24vp 藏起
+      this.immersiveAccum = this.immersiveAccum > 0 ? this.immersiveAccum + delta : delta;
+      if (!this.immersiveHidden && this.immersiveAccum >= IMMERSIVE_READ_HIDE_DIST) {
+        this.hideImmersive();
+        this.immersiveAccum = 0;
+      }
+    } else {
+      // 向上滚 → 只要 12vp 就恢复
+      this.immersiveAccum = this.immersiveAccum < 0 ? this.immersiveAccum + delta : delta;
+      if (this.immersiveHidden && this.immersiveAccum <= -IMMERSIVE_READ_REVEAL_DIST) {
+        this.showImmersive();
+        this.immersiveAccum = 0;
+      }
+    }
+  }
+
+  /**
+   * 复位沉浸态（展开顶栏 / 底栏）。触底、返回本页、关闭开关三处调用。
+   * `immersiveLastReady` 一并清掉：下一次滚动只记录基线，不拿旧位置算增量（防误藏）。
+   * 复位走 `showImmersive()`：命令式跳转 / 返回是「瞬间到位」的场景，与上滑唤出同一入口。
+   */
+  private resetImmersive(): void {
+    this.immersiveAccum = 0;
+    this.immersiveLastReady = false;
+    if (this.immersiveHidden) {
+      this.showImmersive();
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即复位，避免页面停留在隐藏态 */
+  onImmersiveReadingChanged(): void {
+    if (!this.immersiveReading) {
+      this.resetImmersive();
+    }
+  }
+
+  /**
+   * 藏起（DT-N 错帧编排，2026-09-19 回退 P-B′ 后恢复）：内容**立即**起步（180ms EaseIn 收回），
+   * 玻璃**晚撤** `IMMERSIVE_GLASS_LAG_MS`(180ms) —— 撤玻璃那一刻槽内已 `opacity(0)` + 位移到位 =
+   * 空槽，系统那一记「无过渡硬切」被藏到不可见之后（P-B′ 之前的同帧撤玻璃 = 玻璃抢跑，硬切格外显眼）。
+   */
+  private hideImmersive(): void {
+    this.clearImmersiveGlassTimer();
+    this.immersiveShowPending = false;
+    this.immersiveHidden = true;
+    this.immersiveGlassTimer = setTimeout(() => {
+      this.immersiveGlassTimer = -1;
+      this.immersiveGlassHidden = true;
+    }, IMMERSIVE_GLASS_LAG_MS);
+  }
+
+  /**
+   * 唤出（隐藏过程的反向）：**先给玻璃**，下一帧（`IMMERSIVE_GLASS_LEAD_MS` = 16）再放内容滑回
+   * （260ms + springMotion 轻回弹）。顺序不可反：内容先滑回时玻璃会在归位途中凭空出现，那一帧的
+   * 「内容悬空」更扎眼。幂等：已是可见态直接返回；`immersiveShowPending` 防置顶保护分支每帧调用
+   * 把内容无限顺延（症状：回顶后要等弹跳结束才滑回来）。
+   */
+  private showImmersive(): void {
+    if (!this.immersiveHidden) {
+      return;
+    }
+    this.immersiveGlassHidden = false;
+    if (this.immersiveShowPending) {
+      return;
+    }
+    this.immersiveShowPending = true;
+    this.clearImmersiveGlassTimer();
+    this.immersiveGlassTimer = setTimeout(() => {
+      this.immersiveGlassTimer = -1;
+      this.immersiveShowPending = false;
+      this.immersiveHidden = false;
+    }, IMMERSIVE_GLASS_LEAD_MS);
+  }
+
+  /** 清理玻璃侧延时器（hideImmersive / showImmersive 重排前 + aboutToDisappear 退页时调用） */
+  private clearImmersiveGlassTimer(): void {
+    if (this.immersiveGlassTimer !== -1) {
+      clearTimeout(this.immersiveGlassTimer);
+      this.immersiveGlassTimer = -1;
+    }
+  }
+
+  /** 退页清理：藏起 180ms / 唤出 16ms 窗口内退出本页时，延时回调不再落到已销毁的组件上 */
+  aboutToDisappear(): void {
+    this.clearImmersiveGlassTimer();
+    // 尾部提示延时器同理：预取在途时退页，1.2s 后的浮出回调不能落到已销毁的组件上
+    this.clearLoadingHintTimer();
+    // §Z4a 延后补齐调度器同理：延后/重试窗口内退页，回调不能再落到已销毁的组件上
+    this.clearEnrichTimer();
+  }
+
+  /**
+   * 显隐动画参数（藏 / 唤不对称）：取值以**目标态**为准 —— `immersiveHidden` 在本帧渲染前
+   * 已由 hideImmersive / showImmersive 写入，故藏起拿到 180ms EaseIn、唤出拿到 springMotion 轻回弹。
+   * 注：springMotion 自带时长（由 response 决定），duration 仅对非弹簧曲线生效（保留为可读的标称值）。
+   */
+  private immersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_SHOW_SPRING_RESPONSE, IMMERSIVE_SHOW_SPRING_DAMPING)
+    };
+  }
+
   /**
    * 排序壳宽（vp，A 方案）：壳只占「两枚胶囊这一列」，不再开全宽。
    * 依据：TabBar 页签节点的命中区恒等于自身矩形，壳全宽时该节点横跨整行，空区照样吞走竖向滑动手势
@@ -1399,28 +2180,36 @@ struct ThreadDetail {
     // 不关它会在悬浮岛后方渲染一条全宽磨砂带，上边缘看起来像一条细光感线（坑 26 同源）。
     // 悬浮岛的玻璃由 barFloatingStyle.systemMaterial 承担，与该属性无关，关掉不影响官方材质。
     .barBackgroundBlurStyle(BlurStyle.NONE)
+    // 沉浸阅读（DT-M 杠杆① / DT-N 玻璃侧状态位）：隐藏态把胶囊宽度收 0 ⇒ 零面积 ⇒ 系统玻璃无从渲染；
+    // barWidth 与 barBottomMargin 同层同源，响应式生效已由既有 dockNudge 机制验证。
+    // ⚠️ 已知遗留（根因未解）：系统侧胶囊有最小宽地板（A1 实测宽 56），隐藏态会残留一枚小胶囊（文档 §4.9「遗留」）。
     .barFloatingStyle({
       barWidth: {
-        smallBarWidth: this.dockPillWidth(),
-        mediumBarWidth: this.dockPillWidth(),
-        largeBarWidth: this.dockPillWidth()
+        smallBarWidth: this.immersiveGlassHidden ? 0 : this.dockPillWidth(),
+        mediumBarWidth: this.immersiveGlassHidden ? 0 : this.dockPillWidth(),
+        largeBarWidth: this.immersiveGlassHidden ? 0 : this.dockPillWidth()
       },
-      // 首帧重排触发（2026-09-13）：官方悬浮条存在首帧时序问题 —— 首次进入时槽内内容不随岛视觉
-      // 居中（点赞/收藏/跳转/发送整体偏上、参差），**旋转一下触发系统重排后才正常**（用户真机复现；
-      // 应用层对槽内容做 justifyContent 兜底无效，问题在官方组件内部布局时序）。
-      // 修复 = 进页后对 `barBottomMargin` 施加一次 0.5vp 微变（视觉不可察），**模拟旋转的
-      // 「布局参数变化 → 系统重排悬浮条」**，让槽内内容在首帧后尽快对齐。手机同样会 nudge 一次，
-      // 0.5vp 无感。若 300ms 不够（数据慢）可再调时机。
+      // 首帧重排触发（2026-09-13）：见 dockNudge 声明处的说明，0.5vp 微变触发系统重排悬浮条。
       barBottomMargin: this.dockBottomMargin() + this.dockNudge * 0.5,
-      systemMaterial: ImmMaterial.floatingBar()
+      // 沉浸阅读隐藏态（DT-P / 实验 L1，2026-09-19）：换官方「空材质」⇒ 悬浮条的材质层不再渲染。
+      // 与 P-B 的「撤材质（不传 / 传 undefined）」是两条路 —— 后者是「不设置」，系统回落自己的
+      // 默认材质（真机实测 = 一层白背板）；本档是显式「关材质」，官方语义即「无材质效果」。
+      // 隐藏态 barWidth 收 0 仍被系统最小宽地板钳住（约 56px）留一枚空壳，但空壳此刻无材质可画。
+      // 判读：胶囊彻底消失 = L1 成立；若反而出现更大白板 = 白底是悬浮条自身默认背景 → 转 L2。
+      systemMaterial: this.immersiveGlassHidden ? ImmMaterial.empty() : ImmMaterial.floatingBar()
     })
     .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .clip(false)
   }
 
-  /** 官方悬浮岛内容（tabBar 槽位）：仅评论条（点赞/收藏/回复框/发送），
-   *  内容透明，玻璃胶囊与官方材质由悬浮条本体承担 */
+  /**
+   * 官方悬浮岛（tabBar 槽位）= 评论条内容层。**玻璃由系统侧渲染**（`barFloatingStyle.systemMaterial`），
+   * 槽宽也由系统按 `barWidth`（= `dockPillWidth()`）约束 —— 平板等宽屏下岛内元素照样收在岛宽内。
+   * 2026-09-19：P-B′「自绘玻璃岛」按用户要求回退（平板出问题），恢复系统侧玻璃 + DT-N 错帧编排。
+   * 回退主因记录：P-B′ 期间槽内容变成「全宽铺开、靠 CommentBar 自身居中」，宽屏下与岛宽脱钩 →
+   * 平板岛内元素铺到屏宽两侧；且玻璃改由应用层绘制后，沉浸隐藏的错帧编排一并失效。
+   */
   @Builder
   FloatingDock() {
     Column() {
@@ -1431,10 +2220,16 @@ struct ThreadDetail {
     // 首帧垂直居中兜底（2026-09-13）：官方悬浮条槽位的首帧高度可能被系统临时算大（含安全区等），
     // 而 Column 默认主轴 Start（顶对齐）→ 槽内内容整体顶在槽顶、偏上，且点赞/收藏/发送（42 高）
     // 与跳转胶囊（46 高）偏移量随高度略异 → 真机表现「首帧各元素不齐，旋转一下重排后才正常」。
-    // 改为 justifyContent(Center)：**无论槽首帧多高，内容 Row(66) 始终居中于槽** —— 与官方岛
-    // 视觉胶囊（同样居中于槽）永远重合，首帧即正确；槽高正常（=66）时与顶对齐等价，手机零变化。
+    // 改为 justifyContent(Center)：**无论槽首帧多高，内容 Row(66) 始终居中于槽**，首帧即正确；
+    // 槽高正常（=66）时与顶对齐等价，手机零变化。
     .justifyContent(FlexAlign.Center)
     .padding({ left: 8, right: 8 })
+    // 沉浸阅读（DT-N）：内容侧下沉 + 淡出 + 禁用命中（玻璃侧错帧由 hideImmersive / showImmersive 编排）
+    .translate({ y: this.immersiveHidden ? this.immersiveBottomSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    // opacity 0 的组件仍参与命中测试，必须显式禁用，避免「看不见但能点到点赞/收藏/发送」
+    .enabled(!this.immersiveHidden)
+    .animation(this.immersiveAnim())
   }
 
   /** 排序切换胶囊独立悬浮层（官方壳路径）：正序/只看全部两枚钮不进入悬浮岛，
@@ -1447,6 +2242,11 @@ struct ThreadDetail {
     }
     .width('100%')
     .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight() })
+    // 沉浸阅读（2026-09-18）：兜底路径排序行走同一套下沉显隐
+    .translate({ y: this.immersiveHidden ? this.immersiveBottomSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.immersiveAnim())
   }
 
   /**
@@ -1518,6 +2318,12 @@ struct ThreadDetail {
     // （2026-09-17 用户反馈横屏排序钮离底栏远，回落与竖屏同距）
     .margin({ bottom: this.dockBottomMargin() + this.dockPillHeight()
       + (this.splitMode() && !isLargeFoldDevice() && !isPuraXMaxDevice() && !isWideBarDevice() ? 14 : 0) })
+    // 沉浸阅读（2026-09-18 三轮；2026-09-19 回退 P-B′ 后不变）：约 0.6 倍高下沉 + 淡出。
+    // 本行是应用节点（排序壳兜底叠加层），与底栏岛内容层同帧起步；玻璃侧错帧不改本行。
+    .translate({ y: this.immersiveHidden ? this.immersiveBottomSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.immersiveAnim())
   }
 
   /** 排序行（官方槽位版）：外层 Column 撑满壳宽，内层 Row 塞满 Column，几何与 SortRowOverlay 内
@@ -1652,6 +2458,13 @@ struct ThreadDetail {
     .height(98)
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
+    // 沉浸阅读（2026-09-18 三轮）：整行上移约 0.6 倍高（−59）+ 淡出，藏起 180ms EaseIn / 唤出 260ms 轻回弹。
+    // 槽位高度固定 98 不参与内容布局（Scroll 首项自带 98 占位），故位移不影响正文排布。
+    .translate({ y: this.immersiveHidden ? this.immersiveTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    // opacity 0 的组件仍参与命中测试，必须显式禁用，避免"看不见但能点到返回/分享"
+    .enabled(!this.immersiveHidden)
+    .animation(this.immersiveAnim())
   }
 
   /**
@@ -1720,6 +2533,11 @@ struct ThreadDetail {
     .border({ width: 0, color: Color.Transparent })
     .shadow({ radius: 0, color: Color.Transparent, offsetY: 0 })
     .zIndex(10)
+    // 沉浸阅读（2026-09-18 三轮）：与官方槽位路径 DetailTitleBar 同款（0.6 倍上移 + 淡出 + 禁用命中）
+    .translate({ y: this.immersiveHidden ? this.immersiveTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.immersiveAnim())
   }
 
   /** 内容层（主楼/楼层 Scroll 全量渲染 + 骨架屏/错误态 + 悬浮顶栏），借壳与兜底分支共用 */
@@ -1763,13 +2581,23 @@ struct ThreadDetail {
                 // 弃用 WaterFlow + sections（错位修复二，同竖屏分支）：回归 Scroll + 列内独立堆叠
                 Scroll(this.scroller) {
                   Column({ space: Spacing.md }) {
-                    this.ReplySectionHeader()
-                    this.FloorColumnsBlock()
-                    this.FooterSentinel()
+                    if (this.floorsReady) {
+                      Column({ space: Spacing.md }) {
+                        this.ReplySectionHeader()
+                        this.FloorColumnsBlock()
+                        this.FooterSentinel()
+                      }
+                      .width('100%')
+                      .opacity(this.floorsOpacity)
+                    }
                   }
                   .width('100%')
                   // 回复少时顶对齐（Scroll 对小内容默认垂直居中）
                   .constraintSize({ minHeight: '100%' })
+                  // 无感翻页：内容高采集（滚动预取剩余距离 = 内容高 - 视口高 - 偏移）
+                  .onAreaChange((_oldValue: Area, newValue: Area) => {
+                    this.detailContentH = newValue.height as number;
+                  })
                 }
                 .layoutWeight(1)
                 .width('100%')
@@ -1778,10 +2606,24 @@ struct ThreadDetail {
                 .scrollBar(BarState.Off)
                 .clip(false)
                 .edgeEffect(EdgeEffect.Spring)
+                // 无感翻页：视口高采集
+                .onAreaChange((_oldValue: Area, newValue: Area) => {
+                  this.detailViewportH = newValue.height as number;
+                })
                 .onReachEnd(() => {
+                  // 沉浸阅读：触底即复位（用户到这里多半要用评论栏）
+                  this.resetImmersive();
+                  // 无感翻页：已到边界，后台预取若仍在途则立即浮出提示（不再静默）
+                  this.revealLoadHintOnReachEnd();
                   if (!this.loadingMore && this.hasMoreFloors) {
                     this.loadMoreFloors();
                   }
+                })
+                // 沉浸阅读（2026-09-18）：方向阈值驱动顶栏 / 底栏显隐（左栏主楼不挂，见 onDetailScroll 注释）
+                // 无感翻页（2026-09-19）：同一挂点串联滚动预取（.onScroll 只能挂一个，不能另起挂点）
+                .onScroll((xOffset: number, yOffset: number) => {
+                  this.onDetailScroll(xOffset, yOffset);
+                  this.onDetailScrollPrefetch();
                 })
               }
               .width('100%')
@@ -1795,6 +2637,7 @@ struct ThreadDetail {
             .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
             .backgroundColor(Theme.bg(this.isDark))
             .opacity(this.contentOpacity)
+            .translate({ y: this.contentTranslateY })
           } else {
           // ===== 竖屏 / 手机：Scroll + Column，楼层「列内独立堆叠」多列（2026-09-13 错位修复二）=====
           // 弃用 WaterFlow + sections：真机两轮复现「FlowItem 内容按全宽测量却被按三列摆放」的
@@ -1807,15 +2650,25 @@ struct ThreadDetail {
               Column().width('100%').height(98)
               // 主楼通栏满宽（2026-09-17 二次拍板：等宽仅横屏分栏生效，竖屏不用）
               this.PostHeader()
-              this.ReplySectionHeader()
-              this.FloorColumnsBlock()
-              this.FooterSentinel()
+              if (this.floorsReady) {
+                Column({ space: Spacing.md }) {
+                  this.ReplySectionHeader()
+                  this.FloorColumnsBlock()
+                  this.FooterSentinel()
+                }
+                .width('100%')
+                .opacity(this.floorsOpacity)
+              }
             }
             .width('100%')
             // 内容少时必须顶对齐：Scroll 对「小于视口的内容」默认垂直居中（真机表现为主楼悬在
             // 页面中部、上方大片空白）。Scroll 无 alignment 属性 → 用 minHeight 让列恒占满视口，
             // Column 默认主轴 Start → 内容自上而下；内容多时 minHeight 不生效，滚动照常。
             .constraintSize({ minHeight: '100%' })
+            // 无感翻页：内容高采集（滚动预取剩余距离 = 内容高 - 视口高 - 偏移）
+            .onAreaChange((_oldValue: Area, newValue: Area) => {
+              this.detailContentH = newValue.height as number;
+            })
           }
           .width('100%')
           .height('100%')
@@ -1823,13 +2676,27 @@ struct ThreadDetail {
           // 为底部悬浮回复栏留出滚动空间，最后一项可完整滚入屏幕
           .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: 160 })
           .edgeEffect(EdgeEffect.Spring)
+          // 无感翻页：视口高采集
+          .onAreaChange((_oldValue: Area, newValue: Area) => {
+            this.detailViewportH = newValue.height as number;
+          })
           // 滚动触底：自动加载下一页楼层（loadingMore/hasMore 双防重）
           .onReachEnd(() => {
+            // 沉浸阅读：触底即复位（用户到这里多半要用评论栏）
+            this.resetImmersive();
+            // 无感翻页：已到边界，后台预取若仍在途则立即浮出提示（不再静默）
+            this.revealLoadHintOnReachEnd();
             if (!this.loadingMore && this.hasMoreFloors) {
               this.loadMoreFloors();
             }
           })
           .id('thread_scroll_content')
+          // 沉浸阅读（2026-09-18）：方向阈值驱动顶栏 / 底栏显隐
+          // 无感翻页（2026-09-19）：同一挂点串联滚动预取（.onScroll 只能挂一个，不能另起挂点）
+          .onScroll((xOffset: number, yOffset: number) => {
+            this.onDetailScroll(xOffset, yOffset);
+            this.onDetailScrollPrefetch();
+          })
           // 沉浸：绘制扩展到状态栏与底部安全区，滚动可视区 = 整屏，无独立裁剪层
           .clip(false)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
@@ -1838,10 +2705,12 @@ struct ThreadDetail {
           .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
           .backgroundColor(Theme.bg(this.isDark))
           .opacity(this.contentOpacity)
+          .translate({ y: this.contentTranslateY })
           }
         }
         // 骨架屏覆盖层：Loading 期间盖在内容上方，透明度由 fadeInContent 控制淡出（1→0）
-        if (this.loadState === LoadState.Loading) {
+        // §P0-4：skeletonVisible 未放行（首屏 120ms 窗口内命中缓存）时不挂载，全程无骨架屏
+        if (this.loadState === LoadState.Loading && this.skeletonVisible) {
           ThreadDetailSkeleton()
             .layoutWeight(1)
             .opacity(this.skeletonOpacity)
@@ -1872,6 +2741,11 @@ struct ThreadDetail {
     }
     .width('100%')
     .align(Alignment.Bottom)
+    // 沉浸阅读（2026-09-18 三轮）：兜底底栏（排序行 + 评论条）约 0.6 倍高下沉 + 淡出（该路径无官方玻璃，无时序问题）
+    .translate({ y: this.immersiveHidden ? this.immersiveBottomSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.immersiveAnim())
   }
 
   /** 排序切换行：正序 / 只看全部两枚独立玻璃小胶囊。旧叠放路径贴于评论条上方，
@@ -2151,6 +3025,36 @@ struct ThreadDetail {
    * 将点赞信息合并回预览条目，使预览与楼中楼详情页数据一致。
    * 全程后台静默：失败忽略、串行 + 间隔请求，不打断用户浏览。
    */
+  /**
+   * §Z4a（2026-09-19）：首屏缺赞补齐的延后调度。
+   * 原来紧跟 fadeInContent 立刻开跑，与首屏渲染 / 下一页预取同抢连接池；延后 400ms 起跑，
+   * 预览点赞是次要信息，晚几百毫秒无感。
+   * 延后窗口内 loadMore 若已用即时补齐拿走 enrichingSubPostLikes 锁（行为与改造前一致，未改），
+   * 本次回调不放弃而是按重试间隔轮询：subPostLikesFetched 让每层只补一次，
+   * 故轮询只会挑出「尚未补齐」的楼层（含被抢先的首页楼层），不会重复请求、也不会永久停在 0。
+   */
+  /** §Z4a：清理延后补齐调度器（重排前 + 退页时调用） */
+  private clearEnrichTimer(): void {
+    if (this.enrichTimer !== -1) {
+      clearTimeout(this.enrichTimer);
+      this.enrichTimer = -1;
+    }
+  }
+
+  private scheduleSubPostPreviewEnrich(delayMs: number = SUBPOST_ENRICH_DELAY_MS): void {
+    if (this.enrichTimer !== -1) {
+      return;
+    }
+    this.enrichTimer = setTimeout((): void => {
+      this.enrichTimer = -1;
+      if (this.enrichingSubPostLikes) {
+        this.scheduleSubPostPreviewEnrich(SUBPOST_ENRICH_RETRY_MS);
+        return;
+      }
+      this.enrichSubPostPreviewLikes(this.floors);
+    }, delayMs);
+  }
+
   private enrichSubPostPreviewLikes(floors: FloorItem[]): void {
     if (this.enrichingSubPostLikes) {
       return;
@@ -2558,17 +3462,24 @@ struct ThreadDetail {
       }
       .width('100%')
 
-      Text(this.detail!.title)
-        .fontSize(fs(20, this.fontScale))
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Theme.textPrimary(this.isDark))
-        .width('100%')
+      // 帖子标题同样支持长按选中复制（无 onClick 无手势冲突，独立可选区域）；
+      // 纪元重建清选中（复制成功 → toast + title 纪元自增 → 节点重建）
+      ForEach([this.copyEpochOf('title')], (titleCopyEpoch: number) => {
+        Text(this.detail!.title)
+          .fontSize(fs(20, this.fontScale))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Theme.textPrimary(this.isDark))
+          .copyOption(CopyOptions.LocalDevice)
+          .draggable(false)
+          .width('100%')
+          .onCopy(() => { this.onTextCopied('title'); })
+      }, (titleCopyEpoch: number) => `title_${titleCopyEpoch}`)
 
-      this.RichTextContent(this.detail!.fragments ?? [], this.detail!.contentText || '（楼主未提供正文）', fs(17), Theme.textPrimary(this.isDark), 28)
+      this.RichTextContent(this.detail!.fragments ?? [], this.detail!.contentText || '（楼主未提供正文）', fs(17), Theme.textPrimary(this.isDark), 28, 'main')
 
       if (this.detail!.images.length > 0) {
         // 通栏主楼：capMaxWidth=true（336 封顶防拉伸）
-        this.ImageGrid(this.detail!.images, true)
+        this.ImageGrid(this.detail!.images, true, false)
       }
 
     }
@@ -2641,9 +3552,15 @@ struct ThreadDetail {
       .width('100%')
       .alignItems(VerticalAlign.Top)
     } else {
-      ForEach(this.floors, (floor: FloorItem) => {
-        this.FloorCardItem(floor)
-      }, (floor: FloorItem) => `${floor.floorId}_${floor.floor}`)
+      // 单列档：卡片间距收紧到 Spacing.sm(8)。外层通栏 Column 的 space=md(12) 本是给主楼 / 表头 /
+      // 哨兵之间用的，单列时 ForEach 直接展开会被它一并套用 → 楼层卡之间偏松（2026-09-18 真机反馈）。
+      // 此处独立容器给 sm，只影响单列卡间距；表头 / 哨兵与外层的间距（12）不变，多列档列内间距（md）不变。
+      Column({ space: Spacing.sm }) {
+        ForEach(this.floors, (floor: FloorItem) => {
+          this.FloorCardItem(floor)
+        }, (floor: FloorItem) => `${floor.floorId}_${floor.floor}`)
+      }
+      .width('100%')
     }
   }
 
@@ -2699,7 +3616,8 @@ struct ThreadDetail {
       h += imgRows * this.gridCellHeight() + (imgRows - 1) * 6 + 12;
     }
     if ((floor.comments ?? []).length > 0 || (floor.commentsTotal ?? 0) > 0) {
-      h += 40;
+      // 楼中楼区估算高度：链接态 40→22、无链接态 40→22（容器 bottom 0 + 末条评论 bottom 0），同步校准跳楼定位预估
+      h += 22;
     }
     return h;
   }
@@ -2719,15 +3637,19 @@ struct ThreadDetail {
   }
 
   /**
-   * 触底哨兵（通栏普通节点）：「加载更多 / 正在加载 / 已经到底啦」内部条件渲染。
+   * 触底哨兵（通栏普通节点）：四态条件渲染（2026-09-19 无感翻页改造）。
    * 已回归 Scroll + Column 结构，无 WaterFlow 段计数约束，可自由条件渲染。
+   *
+   * 折中口径：后台预取路径（滚动预取）**先静默** —— 不转圈、不显字，只保留固定高度占位，
+   * 超过 DETAIL_LOAD_HINT_DELAY 仍未返回才浮出 loading；用户显式路径（触底 / 点重试）立即浮出。
+   * 三态统一 DETAIL_FOOTER_SENTINEL_H 等高：内容追加时视口不发生位移，滚动不抽搐。
    */
   @Builder
   FooterSentinel() {
     Column() {
       if (this.hasMoreFloors) {
           Column() {
-            if (this.loadingMore) {
+            if (this.loadingHintVisible) {
               Row({ space: 8 }) {
                 LoadingProgress()
                   .width(20)
@@ -2739,25 +3661,27 @@ struct ThreadDetail {
               }
               .width('100%')
               .justifyContent(FlexAlign.Center)
-              .padding({ top: 12, bottom: 12 })
-            } else {
-              Button('点击加载更多回复')
+            } else if (this.loadMoreFailed) {
+              Button('加载失败，点击重试')
                 .fontSize(fs(13, this.fontScale))
                 .fontColor(Theme.brand())
                 .backgroundColor(Color.Transparent)
                 .padding({ left: 12, right: 12, top: 8, bottom: 8 })
                 .onClick(() => { this.loadMoreFloors(); })
             }
+            // 静默态（后台预取在途且未超时）：不显形、不转圈，仅留等高占位
           }
           .width('100%')
-          .padding({ top: 8, bottom: 16 })
+          .height(DETAIL_FOOTER_SENTINEL_H)
+          .justifyContent(FlexAlign.Center)
         } else if (this.floors.length > 0) {
+          // 与加载态统一等高：最后一批追加完成时哨兵高度不变，视口零位移
           Text('— 已经到底啦 —')
             .fontSize(fs(12, this.fontScale))
             .fontColor(Theme.textTertiary(this.isDark))
             .width('100%')
+            .height(DETAIL_FOOTER_SENTINEL_H)
             .textAlign(TextAlign.Center)
-            .padding({ top: 12, bottom: 16 })
         }
       }
       .width('100%')
@@ -2850,13 +3774,13 @@ struct ThreadDetail {
       .hitTestBehavior(HitTestMode.Transparent)
 
       // 正文
-      this.RichTextContent(floor.fragments ?? [], floor.contentText, fs(16), Theme.textPrimary(this.isDark), 26)
+      this.RichTextContent(floor.fragments ?? [], floor.contentText, fs(16), Theme.textPrimary(this.isDark), 26, `floor_${floor.floorId}`)
 
       if (floor.images.length > 0) {
         // 列内楼层卡：capMaxWidth=true（2026-09-16 拍板「宫格图片不要拉伸」——平板 2 列后列宽 ≈494 > 336，
         // 跟随列宽会把宫格拉宽、格宽 164 vs 格高 120 横向拉伸；封顶 336 后格宽 108/格高 120 ≈ 手机档比例。
         // 3 列 / 单列档列宽 ≤ 336 封顶不生效逐像素不变；楼层卡根 Column 已 alignItems Start → 限宽后靠左）
-        this.ImageGrid(floor.images, true)
+        this.ImageGrid(floor.images, true, false)
       }
       if ((floor.comments ?? []).length > 0 || (floor.commentsTotal ?? 0) > 0) {
         this.CommentList(floor.comments ?? [], floor.commentsTotal ?? (floor.comments ?? []).length, floor.commentsHasMore === true, floor.floorId, floor.floor)
@@ -2930,11 +3854,14 @@ struct ThreadDetail {
                 }
                 .width('100%')
                 .justifyContent(FlexAlign.Start)
-                // 正文
-                this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
+                // 正文（纯图回复去冒号头后无文本片段，整体跳过避免「（无文字内容）」兜底）
+                if ((comment.fragments ?? []).length > 0 || (comment.content ?? '').length > 0) {
+                  this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26, `cmt_${parentPid}_${comment.commentId}`)
+                }
                 if ((comment.images ?? []).length > 0) {
                   // 同楼层卡：宫格 336 封顶防平板 2 列列宽拉伸（容器已 alignItems Start）
-                  this.ImageGrid(comment.images ?? [], true)
+                  // singlePreview=true：楼中楼图点开单张预览，不进主图流（2026-09-20 预览解耦）
+                  this.ImageGrid(comment.images ?? [], true, true)
                 }
               }
               .alignItems(HorizontalAlign.Start)
@@ -2966,7 +3893,9 @@ struct ThreadDetail {
           }
           .width('100%')
           // 左右 padding 清零，实现内部Row元素与主楼层Row元素左右绝对对齐
-          .padding({ left: 0, right: 0, top: 8, bottom: 8 })
+          // 无链接卡（total<=3）的最后一条评论 padding-bottom 收 0：卡底留空 = 楼层卡 padding(16)，与顶部一致；
+          // 非最后一条或链接卡（total>3，间距由容器 space 8 提供）保持 8 不变
+          .padding({ left: 0, right: 0, top: 8, bottom: (total > 3 || (commentIndex ?? 0) < comments.length - 1) ? 8 : 0 })
           // 评论分隔线：非最后一条时显示，左边距=头像36+space8=44vp，与正文左边缘对齐
           if ((commentIndex ?? 0) < comments.length - 1) {
             Divider()
@@ -2987,16 +3916,21 @@ struct ThreadDetail {
             .fontColor(Theme.brand())
             .backgroundColor(Color.Transparent)
             .enabled(!this.openingSubPost)
-            .padding({ left: 0, right: 0, top: 2, bottom: 2 })
+            // 链接下沿到卡底由楼层卡 padding(Spacing.lg) 单层承担，与顶部用户名行上方留空(16)一致
+            .padding({ left: 0, right: 0, top: 2, bottom: 0 })
             .onClick(() => { this.openSubPostDetail(parentPid, parentFloor, total); })
           Blank()
         }
         .width('100%')
+        // 链接下移 6vp：卡底视觉留空 16→10（translate 不改布局占位，下方无后续内容，安全）
+        .translate({ y: 6 })
       }
     }
     .width('100%')
     // 外层左右padding清零，避免挤压内部Row的水平可用宽度导致元素错位
-    .padding({ left: 0, right: 0, top: 10, bottom: 10 })
+    // 底部 padding 收 0：链接态由楼层卡 padding(16)+链接下移6 承担（视觉 10）；
+    // 无链接态由最后一条评论自身 padding-bottom(8)+楼层卡 padding(16) 承担（视觉 24），不再额外叠 10
+    .padding({ left: 0, right: 0, top: 10, bottom: 0 })
     // 楼中楼预览容器底色与楼层卡同源（Theme.bgCard）：浅深档都与楼层卡同色，避免深色下出现"框中框"视觉冗余
     .backgroundColor(Theme.bgCard(this.isDark))
     .borderRadius(Radius.md)
@@ -3034,6 +3968,9 @@ struct ThreadDetail {
     this.fontSizeTick++;
     this.openingSubPost = false;
     this.isDark = isDarkMode();
+    // 沉浸阅读：返回本页（含从楼中楼返回）复位为「顶栏 / 底栏可见」，且丢弃旧滚动基线
+    // （子页返回后滚动位置可能被楼层定位改过，拿旧基线算增量会误藏）
+    this.resetImmersive();
   }
 
   @Builder
@@ -3073,6 +4010,11 @@ struct ThreadDetail {
     });
   }
 
+  /**
+   * 主图预览列表（2026-09-20 预览解耦）：只含主楼 + 楼层图片，**不再收集楼中楼（comments）图片**。
+   * 楼中楼图片预览独立：宫格点击走单张预览（见 ImageGrid 的 singlePreview 分支），
+   * 左右滑动不会再切进楼中楼图片。ImagePreview 流式补页的 extractStreamImages 同步只收楼层图。
+   */
   private collectAllImages(): string[] {
     const all: string[] = [];
     if (this.detail && this.detail.images && this.detail.images.length > 0) {
@@ -3081,13 +4023,6 @@ struct ThreadDetail {
     for (const floor of this.floors) {
       if (floor.images && floor.images.length > 0) {
         all.push(...floor.images);
-      }
-      if (floor.comments) {
-        for (const comment of floor.comments) {
-          if (comment.images && comment.images.length > 0) {
-            all.push(...comment.images);
-          }
-        }
       }
     }
     return all;
@@ -3110,6 +4045,9 @@ struct ThreadDetail {
    * 「图片尺寸测量期确定」的成品口径对齐。
    * `capMaxWidth`：仅**通栏卡**（主楼）传 true（336 封顶防通栏拉伸）；列内卡（楼层 / 楼中楼）传 false
    * —— 窄列下列宽本就 < 336，写死 336 上限没有意义，跟随列宽（'100%'）杜绝交叉轴测量歧义。
+   * `singlePreview`（2026-09-20 预览解耦）：true = 楼中楼宫格，点开**单张预览**
+   * （urls 只传当前这张、不带流式补页上下文，左右滑不切图）；false = 主图/楼层宫格，
+   * 走全局列表 + 流式补页（原行为）。
    */
   /**
    * 宫格单格高（vp）：大折叠（2026-09-16 用户反馈竖横屏宫格图片拉伸）分栏后格宽骤降——
@@ -3123,7 +4061,7 @@ struct ThreadDetail {
   }
 
   @Builder
-  ImageGrid(images: string[], capMaxWidth: boolean = true) {
+  ImageGrid(images: string[], capMaxWidth: boolean = true, singlePreview: boolean = false) {
     Grid() {
       ForEach(images, (img: string, idx: number) => {
         GridItem() {
@@ -3135,6 +4073,21 @@ struct ThreadDetail {
           .width('100%')
           .height(this.gridCellHeight())
           .onClick(() => {
+            // 预览提速 P3（2026-09-23）：点击即拉——pushUrl 之前先把点击图的基础档
+            // 灌进 ImageCache（闸门 priority=1 插队），路由转场动画期间下载已在并行进行；
+            // 预览页首图同步直出/高清升级都吃这条在途链。已在缓存则 warmImages 自动跳过。
+            ImageCache.warmImages([img], 1, 1);
+            // 楼中楼宫格（singlePreview=true）：单张预览——urls 只含当前这张（单元素 Swiper 不可滑），
+            // 不带流式补页上下文；主图/楼层宫格保持原「全局列表 + 流式补页」行为（2026-09-20 预览解耦）。
+            if (singlePreview) {
+              this.getUIContext().getRouter().pushUrl({
+                url: 'pages/ImagePreview',
+                params: { urls: [img] }
+              }).catch(() => {
+                this.getUIContext().getPromptAction().showToast({ message: '图片预览打开失败，请稍后重试' });
+              });
+              return;
+            }
             const allImages = this.collectAllImages();
             const offset = this.getImageGlobalOffset(images);
             // 图片流式补页（2026-09-17）：浏览页滑到已加载图片末尾时，会按同一组分页参数
@@ -3188,7 +4141,7 @@ struct ThreadDetail {
   }
 
   @Builder
-  RichTextContent(fragments: ContentFragment[], fallbackText: string, fontSize: number, fontColor: ResourceColor, lineHeightVal: number) {
+  RichTextContent(fragments: ContentFragment[], fallbackText: string, fontSize: number, fontColor: ResourceColor, lineHeightVal: number, regionKey: string) {
     Column() {
       if (fragments && fragments.length > 0) {
         // 启动 EmojiLoader HTTP 预取（带 Referer/UA 防盗链头，下载字节→PixelMap），完成后 readyEmojiUrls 触发重绘
@@ -3202,70 +4155,86 @@ struct ThreadDetail {
         // - EmojiLoader 已拿到 PixelMap → ImageSpan(PixelMap) 直接渲染（彻底绕开防盗链）
         // - 尚未下载完成 → 显示 "[中文]" 占位，下载完成后自动切到图
         // - 已被判定下载失败 → 显示 "[中文]" 兜底文本
-        Text() {
-          ForEach(fragments, (fragment: ContentFragment, idx: number) => {
-            if (fragment.type === ContentFragmentType.EMOJI) {
-              if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasReadyEmoji(fragment.imageUrl) && EmojiLoader.has(fragment.imageUrl)) {
-                ImageSpan(EmojiLoader.get(fragment.imageUrl) as image.PixelMap)
-                  .width(fontSize * 1.2)
-                  .height(fontSize * 1.2)
-                  .verticalAlign(ImageSpanAlignment.CENTER)
-                  .objectFit(ImageFit.Contain)
-                  .borderRadius(fontSize * 0.18)
-              } else if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasFailedEmoji(fragment.imageUrl) && fragment.text && fragment.text.length > 0) {
-                // EmojiLoader 下载失败（URL 无效）且有描述文本 → 文本兜底，避免空白
+        // 单元素 ForEach 包裹（key 含复制重建纪元）：复制完成后自增纪元 → key 变化 → Text 节点整体重建
+        // → 选中态随节点销毁清除。纪元未变时 key 相同、节点复用，零额外开销。
+        ForEach([this.copyEpochOf(regionKey)], (copyEpoch: number) => {
+          Text() {
+            ForEach(fragments, (fragment: ContentFragment, idx: number) => {
+              if (fragment.type === ContentFragmentType.EMOJI) {
+                if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasReadyEmoji(fragment.imageUrl) && EmojiLoader.has(fragment.imageUrl)) {
+                  ImageSpan(EmojiLoader.get(fragment.imageUrl) as image.PixelMap)
+                    .width(fontSize * 1.2)
+                    .height(fontSize * 1.2)
+                    .verticalAlign(ImageSpanAlignment.CENTER)
+                    .objectFit(ImageFit.Contain)
+                    .borderRadius(fontSize * 0.18)
+                } else if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasFailedEmoji(fragment.imageUrl) && fragment.text && fragment.text.length > 0) {
+                  // EmojiLoader 下载失败（URL 无效）且有描述文本 → 文本兜底，避免空白
+                  Span(fragment.text)
+                    .fontSize(fontSize)
+                    .fontColor(fontColor)
+                } else if (fragment.imageUrl && fragment.imageUrl.length > 0) {
+                  // 下载中 / 无文本的失败 → 直接 ImageSpan(url) 尝试（CDN 无防盗链，可直连渲染）
+                  ImageSpan(fragment.imageUrl)
+                    .width(fontSize * 1.2)
+                    .height(fontSize * 1.2)
+                    .verticalAlign(ImageSpanAlignment.CENTER)
+                    .objectFit(ImageFit.Contain)
+                    .borderRadius(fontSize * 0.18)
+                } else if (fragment.text && fragment.text.length > 0) {
+                  Span(fragment.text)
+                    .fontSize(fontSize)
+                    .fontColor(fontColor)
+                }
+              } else if (fragment.type === ContentFragmentType.IMAGE) {
+                // Skip IMAGE fragments here — they are rendered separately by ImageGrid
+              } else if (fragment.type === ContentFragmentType.LINK) {
+                // 可点击超链接：主题色高亮 + 下划线，点击弹"是否跳转链接"确认卡片
                 Span(fragment.text)
                   .fontSize(fontSize)
-                  .fontColor(fontColor)
-              } else if (fragment.imageUrl && fragment.imageUrl.length > 0) {
-                // 下载中 / 无文本的失败 → 直接 ImageSpan(url) 尝试（CDN 无防盗链，可直连渲染）
-                ImageSpan(fragment.imageUrl)
-                  .width(fontSize * 1.2)
-                  .height(fontSize * 1.2)
-                  .verticalAlign(ImageSpanAlignment.CENTER)
-                  .objectFit(ImageFit.Contain)
-                  .borderRadius(fontSize * 0.18)
-              } else if (fragment.text && fragment.text.length > 0) {
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.isDark ? '#7FB8FF' : '#2F6BE8')
+                  .decoration({
+                    type: TextDecorationType.Underline,
+                    color: this.isDark ? '#7FB8FF' : '#2F6BE8'
+                  })
+                  .onClick(() => {
+                    this.openPendingLink((fragment.link !== undefined && fragment.link.length > 0) ? fragment.link : fragment.text);
+                  })
+              } else {
                 Span(fragment.text)
                   .fontSize(fontSize)
                   .fontColor(fontColor)
               }
-            } else if (fragment.type === ContentFragmentType.IMAGE) {
-              // Skip IMAGE fragments here — they are rendered separately by ImageGrid
-            } else if (fragment.type === ContentFragmentType.LINK) {
-              // 可点击超链接：主题色高亮 + 下划线，点击弹"是否跳转链接"确认卡片
-              Span(fragment.text)
-                .fontSize(fontSize)
-                .fontWeight(FontWeight.Medium)
-                .fontColor(this.isDark ? '#7FB8FF' : '#2F6BE8')
-                .decoration({
-                  type: TextDecorationType.Underline,
-                  color: this.isDark ? '#7FB8FF' : '#2F6BE8'
-                })
-                .onClick(() => {
-                  this.openPendingLink((fragment.link !== undefined && fragment.link.length > 0) ? fragment.link : fragment.text);
-                })
-            } else {
-              Span(fragment.text)
-                .fontSize(fontSize)
-                .fontColor(fontColor)
-            }
-          }, (fragment: ContentFragment, idx: number) => this.hasReadyEmoji(fragment.imageUrl ?? '')
-            ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_r`
-            : this.hasFailedEmoji(fragment.imageUrl ?? '')
-              ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_f`
-              : `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_w`)
-        }
-        .fontSize(fontSize)
-        .fontColor(fontColor)
-        .lineHeight(lineHeightVal)
-        .width('100%')
-      } else {
-        Text(fallbackText)
+            }, (fragment: ContentFragment, idx: number) => this.hasReadyEmoji(fragment.imageUrl ?? '')
+              ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_r`
+              : this.hasFailedEmoji(fragment.imageUrl ?? '')
+                ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_f`
+                : `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_w`)
+          }
           .fontSize(fontSize)
           .fontColor(fontColor)
           .lineHeight(lineHeightVal)
           .width('100%')
+          // 长按选中复制（docs/帖子详细页长按复制文字功能补全.md 方案 A）：
+          // LocalDevice 允许跨应用粘贴；draggable(false) 关闭选中拖拽防与滚动抢手势；
+          // 选中色按系统默认；onCopy 弹「复制成功」并自增纪元清除选中态
+          .copyOption(CopyOptions.LocalDevice)
+          .draggable(false)
+          .onCopy(() => { this.onTextCopied(regionKey); })
+        }, (copyEpoch: number) => `${regionKey}_${copyEpoch}`)
+      } else {
+        // 与 Span 分支同款纪元重建：复制完成后清选中态
+        ForEach([this.copyEpochOf(regionKey)], (copyEpoch: number) => {
+          Text(fallbackText)
+            .fontSize(fontSize)
+            .fontColor(fontColor)
+            .lineHeight(lineHeightVal)
+            .width('100%')
+            .copyOption(CopyOptions.LocalDevice)
+            .draggable(false)
+            .onCopy(() => { this.onTextCopied(regionKey); })
+        }, (copyEpoch: number) => `${regionKey}_${copyEpoch}`)
       }
     }
     .width('100%')

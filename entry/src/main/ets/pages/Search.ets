@@ -32,6 +32,7 @@ import { curves } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
 import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
+import { PrefetchGate } from '../common/PrefetchGate';
 import { TiebaService } from '../service/TiebaService';
 import {
   GlobalForumResult, GlobalForumSearchData, GlobalPostResult, GlobalPostSearchData,
@@ -44,6 +45,11 @@ const MODULE_LABELS: string[] = ['搜吧', '搜贴', '搜人'];
 const HEADER_TOP_SPACE: number = 114;
 // 底部悬浮模块栏让位：栏顶距物理底 = 30(margin) + 74(栏高) = 104，再加内容滚出余量
 const BOTTOM_BAR_SPACE: number = 130;
+// 剩余距离预取阈值（vp）：三模块共用（搜吧 / 搜贴 / 搜人 节奏同构）。
+// 与首页 / 吧主页同为 1200（docs/帖子预加载.md §2.2），≈2 屏，足够盖住一次翻页请求的往返耗时。
+const SEARCH_PREFETCH_DISTANCE: number = 1200;
+// 空轮保护上限（连续空页数）：连续 N 页「零新增」即判到底（服务端 hasMore 不可全信）
+const SEARCH_STALLED_LIMIT: number = 3;
 // 顶部官方槽位开关（§6.10 同机制）：true → 顶栏整行搬进 Navigation 的 title 槽位吃官方沉浸材质；
 // false → 回退改造前的页面主体悬浮栏（FloatingHeader，自绘真模糊玻璃，几何同源）
 const SEARCH_OFFICIAL_TITLE_BAR: boolean = true;
@@ -79,6 +85,37 @@ struct GlobalQueryPage {
   private scroller: Scroller = new Scroller();
   private searchController: TextInputController = new TextInputController();
   private requestSerial: number = 0; // 最新一次"整页搜索"序号，用于丢弃过期请求的回写
+
+  // ===== 触底无缝续流（docs/帖子预加载.md §8；2026-09-19 接入）=====
+  /**
+   * 三模块各一个预取闸门（阈值 + 节流 + 绝对偏移真值）。本页三模块共用同一个 `Scroll(scroller)`，
+   * 但列表内容与分页节奏互不相干，故闸门按模块分离（节流基线不会互相顶掉）。
+   * 偏移一律走 `PrefetchGate.absoluteY(this.scroller)`（禁读 `onScroll` 入参，§8 禁令①）。
+   */
+  private forumGate: PrefetchGate = new PrefetchGate(SEARCH_PREFETCH_DISTANCE, 'SearchForum');
+  private postGate: PrefetchGate = new PrefetchGate(SEARCH_PREFETCH_DISTANCE, 'SearchPost');
+  private userGate: PrefetchGate = new PrefetchGate(SEARCH_PREFETCH_DISTANCE, 'SearchUser');
+  /**
+   * 内容总高 / 滚动视口高（vp）：**普通字段**，不用 `@State`（`onAreaChange` / `onScroll` 是高频回调，
+   * 写状态会白触发整树重建，§8 第 3 条）。内容高由内容 Column 的 `onAreaChange` 实测
+   * （三模块共用同一个 Column，含顶底让位，即真实可滚动高）；视口高由根 Stack 回填。
+   */
+  private contentH: number = 0;
+  private viewportH: number = 0;
+  /**
+   * 分页代际（每模块一个）：整页搜索（换词 / 重搜 / 切档）时自增，在途旧批次回来时代际不符即丢弃。
+   * 修的是既有隐患：换词后旧关键词的下一页回写会**追加到新关键词列表上**（串数据）。
+   */
+  private forumToken: number = 0;
+  private postToken: number = 0;
+  private userToken: number = 0;
+  /**
+   * 空轮计数（每模块一个）：连续 `SEARCH_STALLED_LIMIT` 页零新增即判到底（置 `hasMore = false`），
+   * 防服务端 `hasMore` 恒真 + 返回空页时后台无限空转（与 ThreadList `stalledPages` 同源）。
+   */
+  private forumStalled: number = 0;
+  private postStalled: number = 0;
+  private userStalled: number = 0;
 
   // 输入与模块
   @State keyword: string = '';
@@ -144,6 +181,11 @@ struct GlobalQueryPage {
     if (w <= 0 || h <= 0) {
       return;
     }
+    // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期 onAreaChange 逐帧回调，同值重写 @State 会白触发
+    // 页面整树重渲染；本函数只有下面三个赋值、无别的副作用，值未变直接返回。
+    if (w === this.pageWidth && h === this.pageHeight) {
+      return;
+    }
     this.pageWidth = w;
     this.pageHeight = h;
     this.isLandscape = w > h;
@@ -164,6 +206,9 @@ struct GlobalQueryPage {
       this.scroller.scrollTo({ xOffset: 0, yOffset: 0 });
     } catch (e) {
     }
+    // 列数换了 → 内容整体重排：预取节流基线复位（内容高不置 0，交给 onAreaChange 实测覆盖；
+    // 置 0 后若新旧高恰好同值则不再回调，反而会永久卡住预取）
+    this.activeGate().reset();
   }
 
   private searchColumns(): number {
@@ -366,17 +411,40 @@ struct GlobalQueryPage {
     }
   }
 
-  private runForumSearch(kw: string, loadMore: boolean): void {
+  /**
+   * 搜吧：整页搜索 / 翻页。
+   * @param silent 后台预取传 true（失败静默，§8 第 4 条）；触底兜底路径传 false 保留原 Toast。
+   */
+  private runForumSearch(kw: string, loadMore: boolean, silent: boolean = false): void {
     const mySerial: number = ++this.requestSerial;
+    // 代际：整页搜索自增（作废在途旧批次），翻页沿用当前代际
+    const myToken: number = loadMore ? this.forumToken : ++this.forumToken;
     if (!loadMore) {
+      // 整页换新：列表 / 分页锁 / 空轮计数 / 预取节流基线一并复位
+      // （内容高不置 0，交给 onAreaChange 实测覆盖，理由同 onColumnModeTick）
       this.forumData = { exact: null, list: [], hasMore: false, page: 0 };
+      this.forumLoadingMore = false;
+      this.forumStalled = 0;
+      this.forumGate.reset();
     } else {
       this.forumLoadingMore = true;
     }
     const nextPage: number = loadMore ? this.forumData.page + 1 : 1;
     TiebaService.getInstance().searchForumGlobal(kw, nextPage, 20).then((result: GlobalForumSearchData) => {
+      // 代际不符 = 换词前的在途批次：整体丢弃，绝不回写（否则旧关键词结果会拼进新列表）
+      if (myToken !== this.forumToken) {
+        return;
+      }
       if (loadMore) {
-        this.forumData = { exact: result.exact, list: this.forumData.list.concat(result.list), hasMore: result.hasMore, page: nextPage };
+        const merged: GlobalForumResult[] = this.forumData.list.concat(result.list);
+        // 空轮保护：零新增累计到上限即判到底，防 hasMore 恒真时无限续拉
+        this.forumStalled = merged.length > this.forumData.list.length ? 0 : this.forumStalled + 1;
+        this.forumData = {
+          exact: this.forumData.exact,
+          list: merged,
+          hasMore: result.hasMore && this.forumStalled < SEARCH_STALLED_LIMIT,
+          page: nextPage
+        };
       } else {
         this.forumData = result;
       }
@@ -386,21 +454,33 @@ struct GlobalQueryPage {
         this.searching = false;
       }
     }).catch((err: Error) => {
+      // 过期批次的失败与当前列表无关：静默丢弃（不再误弹 Toast）
+      if (myToken !== this.forumToken) {
+        return;
+      }
       const msg: string = err instanceof Error ? err.message : String(err);
       this.forumLoadingMore = false;
       if (mySerial === this.requestSerial) {
         this.searching = false;
         this.errorMsg = msg;
-      } else if (loadMore) {
+      } else if (loadMore && !silent) {
         this.notify(msg);
       }
     });
   }
 
-  private runPostSearch(kw: string, loadMore: boolean): void {
+  /**
+   * 搜贴：整页搜索 / 翻页。
+   * @param silent 后台预取传 true（失败静默）；触底兜底路径传 false 保留原 Toast。
+   */
+  private runPostSearch(kw: string, loadMore: boolean, silent: boolean = false): void {
     const mySerial: number = ++this.requestSerial;
+    const myToken: number = loadMore ? this.postToken : ++this.postToken;
     if (!loadMore) {
       this.postData = { list: [], hasMore: false, page: 0 };
+      this.postLoadingMore = false;
+      this.postStalled = 0;
+      this.postGate.reset();
     } else {
       this.postLoadingMore = true;
     }
@@ -408,8 +488,17 @@ struct GlobalQueryPage {
     // 2026-09-15 切客户端端点 /c/s/searchpost（不带 kw = 全吧搜贴）：旧 web 端点 /mo/q/search/thread
     // 已被百度停摆（success + 空结果 + blank_type:1，带签名直连/带 BDUSS 均空，见 service 注释）
     TiebaService.getInstance().searchPostGlobalClient(kw, nextPage, 20).then((result: GlobalPostSearchData) => {
+      if (myToken !== this.postToken) {
+        return;
+      }
       if (loadMore) {
-        this.postData = { list: this.postData.list.concat(result.list), hasMore: result.hasMore, page: nextPage };
+        const merged: GlobalPostResult[] = this.postData.list.concat(result.list);
+        this.postStalled = merged.length > this.postData.list.length ? 0 : this.postStalled + 1;
+        this.postData = {
+          list: merged,
+          hasMore: result.hasMore && this.postStalled < SEARCH_STALLED_LIMIT,
+          page: nextPage
+        };
       } else {
         this.postData = result;
       }
@@ -419,28 +508,49 @@ struct GlobalQueryPage {
         this.searching = false;
       }
     }).catch((err: Error) => {
+      if (myToken !== this.postToken) {
+        return;
+      }
       const msg: string = err instanceof Error ? err.message : String(err);
       this.postLoadingMore = false;
       if (mySerial === this.requestSerial) {
         this.searching = false;
         this.errorMsg = msg;
-      } else if (loadMore) {
+      } else if (loadMore && !silent) {
         this.notify(msg);
       }
     });
   }
 
-  private runUserSearch(kw: string, loadMore: boolean): void {
+  /**
+   * 搜人：整页搜索 / 翻页。
+   * @param silent 后台预取传 true（失败静默）；触底兜底路径传 false 保留原 Toast。
+   */
+  private runUserSearch(kw: string, loadMore: boolean, silent: boolean = false): void {
     const mySerial: number = ++this.requestSerial;
+    const myToken: number = loadMore ? this.userToken : ++this.userToken;
     if (!loadMore) {
       this.userData = { exact: null, list: [], hasMore: false, page: 0 };
+      this.userLoadingMore = false;
+      this.userStalled = 0;
+      this.userGate.reset();
     } else {
       this.userLoadingMore = true;
     }
     const nextPage: number = loadMore ? this.userData.page + 1 : 1;
     TiebaService.getInstance().searchUserGlobal(kw, nextPage, 20).then((result: GlobalUserSearchData) => {
+      if (myToken !== this.userToken) {
+        return;
+      }
       if (loadMore) {
-        this.userData = { exact: result.exact, list: this.userData.list.concat(result.list), hasMore: result.hasMore, page: nextPage };
+        const merged: GlobalUserResult[] = this.userData.list.concat(result.list);
+        this.userStalled = merged.length > this.userData.list.length ? 0 : this.userStalled + 1;
+        this.userData = {
+          exact: this.userData.exact,
+          list: merged,
+          hasMore: result.hasMore && this.userStalled < SEARCH_STALLED_LIMIT,
+          page: nextPage
+        };
       } else {
         this.userData = result;
       }
@@ -450,29 +560,82 @@ struct GlobalQueryPage {
         this.searching = false;
       }
     }).catch((err: Error) => {
+      if (myToken !== this.userToken) {
+        return;
+      }
       const msg: string = err instanceof Error ? err.message : String(err);
       this.userLoadingMore = false;
       if (mySerial === this.requestSerial) {
         this.searching = false;
         this.errorMsg = msg;
-      } else if (loadMore) {
+      } else if (loadMore && !silent) {
         this.notify(msg);
       }
     });
   }
 
-  /** 滚动到底加载下一页（当前模块） */
-  private onReachBottom(): void {
+  /** 当前模块的预取闸门（三模块各一个，按 activeModule 取） */
+  private activeGate(): PrefetchGate {
+    return this.activeModule === 0 ? this.forumGate
+      : (this.activeModule === 1 ? this.postGate : this.userGate);
+  }
+
+  /**
+   * 分页统一入口（当前模块）：后台预取与触底兜底**共用同一组前置判定**，
+   * 避免两条路径条件写歪（§8「新增列表页至少包含五件事」的同源要求）。
+   * @param silent 后台预取传 true（失败静默不弹 Toast）；触底兜底传 false 保留原提示。
+   */
+  private loadMoreCurrent(silent: boolean): void {
     if (this.searching || this.errorMsg.length > 0) {
       return;
     }
     const kw: string = this.keyword.trim();
-    if (this.activeModule === 0 && this.forumData.hasMore && !this.forumLoadingMore && this.forumKeywordLoaded === kw) {
-      this.runForumSearch(kw, true);
-    } else if (this.activeModule === 1 && this.postData.hasMore && !this.postLoadingMore && this.postKeywordLoaded === kw) {
-      this.runPostSearch(kw, true);
-    } else if (this.activeModule === 2 && this.userData.hasMore && !this.userLoadingMore && this.userKeywordLoaded === kw) {
-      this.runUserSearch(kw, true);
+    if (kw.length === 0) {
+      return;
+    }
+    if (this.activeModule === 0) {
+      if (this.forumData.hasMore && !this.forumLoadingMore && this.forumKeywordLoaded === kw) {
+        this.runForumSearch(kw, true, silent);
+      }
+    } else if (this.activeModule === 1) {
+      if (this.postData.hasMore && !this.postLoadingMore && this.postKeywordLoaded === kw) {
+        this.runPostSearch(kw, true, silent);
+      }
+    } else {
+      if (this.userData.hasMore && !this.userLoadingMore && this.userKeywordLoaded === kw) {
+        this.runUserSearch(kw, true, silent);
+      }
+    }
+  }
+
+  /**
+   * 接近底部即静默预取下一页：剩余距离 ≤ `SEARCH_PREFETCH_DISTANCE` 时提前取。
+   * 入参刻意不用 —— `onScroll` 回调入参的偏移语义在工具链间有差异（§8 禁令①），
+   * 偏移只信 `PrefetchGate.absoluteY(this.scroller)`（即 `Scroller.currentOffset()`）。
+   */
+  private onContentScroll(_xOffset: number, _yOffset: number): void {
+    const y: number = PrefetchGate.absoluteY(this.scroller);
+    if (this.activeGate().should(y, this.contentH, this.viewportH)) {
+      this.loadMoreCurrent(true);
+    }
+  }
+
+  /**
+   * 内容尺寸实测（§3.1 / §8 兜底⑤）：记录滚动内容总高，并在「内容不足一屏」时主动预取 ——
+   * 此时 Scroll 根本滚不动，`onScroll` / `onReachEnd` 都不会触发，不主动取就是「滑到底也没有下一页」。
+   * 终止性：每次主动预取要么追加 ≥1 条（内容长高，终会超过一屏），要么使空轮计数 +1；
+   * 连续 `SEARCH_STALLED_LIMIT` 页空即 `hasMore = false` → 循环必停。
+   */
+  private onContentAreaChange(_oldValue: Area, newValue: Area): void {
+    const h: number = newValue.height as number;
+    if (h <= 0 || h === this.contentH) {
+      return;
+    }
+    this.contentH = h;
+    // 低频几何自证探针（每次内容高变化一条）：有 geometry 无 FIRE = 几何在、还没滑到阈值
+    this.activeGate().noteGeometry('measured', h, this.viewportH);
+    if (this.viewportH > 0 && h <= this.viewportH) {
+      this.loadMoreCurrent(true);
     }
   }
 
@@ -492,6 +655,8 @@ struct GlobalQueryPage {
   }
 
   private openThread(item: GlobalPostResult): void {
+    // 点击即预取：利用跳转动画窗口后台取详情，详情页打开即命中缓存秒开（与 HomeTab/ThreadList 同款）
+    TiebaService.getInstance().prefetchThreadDetail(`${item.tid}`, `${item.forumId ?? ''}`);
     this.getUIContext().getRouter().pushUrl({
       url: 'pages/ThreadDetail',
       params: { tid: item.tid, forum: item.forumName, fid: item.forumId }
@@ -1555,6 +1720,8 @@ struct GlobalQueryPage {
       }
       .width('100%')
       .padding({ bottom: BOTTOM_BAR_SPACE })
+      // 内容尺寸实测（§3.1）：内容高变化时回填 contentH（普通字段，不触发重建），不足一屏则主动续取
+      .onAreaChange((oldValue: Area, newValue: Area) => this.onContentAreaChange(oldValue, newValue))
     }
     .width('100%')
     .height('100%')
@@ -1562,7 +1729,8 @@ struct GlobalQueryPage {
     // Scroll 在内容不足一屏时默认垂直居中（搜人等结果少时表现为内容悬在屏幕中部），
     // 显式对齐到顶部：少结果靠顶显示，多结果滚动能力不受影响
     .align(Alignment.TopStart)
-    .onReachEnd(() => this.onReachBottom())
+    .onReachEnd(() => this.loadMoreCurrent(false))
+    .onScroll((xOffset: number, yOffset: number) => this.onContentScroll(xOffset, yOffset))
     .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
     .overlay(this.TopFadeOverlay())
   }
@@ -1654,8 +1822,14 @@ struct GlobalQueryPage {
       if (width > 0) {
         this.currentWidth = width;
       }
+      // 视口高回填（预取闸门输入，普通字段）：根 Stack 与 Scroll 同为 height('100%')，即滚动视口高。
+      // 必须放在 refreshFormMetrics 之前 —— 后者宽高同值时会提前 return，放后面会被跳过。
+      const h = newValue.height as number;
+      if (h > 0) {
+        this.viewportH = h;
+      }
       // 形态变化兜底（横竖屏 / 分屏拖宽：§4.7，与 §4.8 T-B 同款同点追加）；窗口实值优先（小窗 display ≠ 窗口）
-      this.refreshFormMetrics(width, newValue.height as number);
+      this.refreshFormMetrics(width, h);
     })
   }
 }

@@ -17,13 +17,18 @@
  */
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { taskpool } from '@kit.ArkTS';
 import { HttpClient } from '../network/HttpClient';
 import { ProtoSchema } from '../network/ProtoSchema';
 import { TiebaProtoDecoder } from '../network/TiebaProtoDecoder';
+import { decodePbPageTask } from '../network/DetailDecodeTask';
+import { connection } from '@kit.NetworkKit';
 import { AuthManager } from './AuthManager';
+import { UsageHabitsManager } from './UsageHabitsManager';
 import { CacheManager } from '../cache/CacheManager';
+import { ImageCache } from '../cache/ImageCache';
 import { API, stripHtml, extractImages, extractGroup, decodeHtmlEntities, formatTime, CACHE_KEY, CACHE_TTL } from '../common/Constants';
-import { AbstractMessage, PbContentMessage, PostMessage, PostInfoListMessage, SubPostListMessage, FrsPageResponseMessage, ThreadInfoMessage, UserMessage, AgreeMessage } from '../model/TiebaProtoSchema';
+import { AbstractMessage, PbContentMessage, PostMessage, PostInfoListMessage, SubPostListMessage, FrsPageResponseMessage, ThreadInfoMessage, UserMessage, AgreeMessage, PbPageResponseMessage, GoodClassifyMessage } from '../model/TiebaProtoSchema';
 import {
   ThreadItem, ThreadDetail, FloorItem, CommentItem, SubPostDetail, UserStats, PersonalContentItem,
   FollowItem, Conversation, MessageItem, PagedResult, PublishResult, ForumHeaderInfo,
@@ -310,6 +315,35 @@ const SEARCH_PC_SECRET: string = '36770b1f34c9bbf2e7d1a99d2b82fa9e';
  */
 const SEARCH_SORT_THREAD: string = '5';
 
+/** v1.26（P1）点击即预热：首屏批张数上限（主楼正文图 + 前 3 层回帖图） */
+const DETAIL_WARM_HEAD_IMAGES: number = 18;
+/** v1.27（P1）点击即预热：滚动批张数上限（第 4~12 层回帖图，滚到即本地出） */
+const DETAIL_WARM_TAIL_IMAGES: number = 24;
+
+// ---- 「帖子极速开启」滑动让路（2026-09-20）：feed 预取在信息流滚动活跃期降载/挂起，重活收敛到停歇窗口 ----
+/** 判定「仍在滚动」的静默阈值：距最后一次滚动事件不足该值视为滚动余波，feed 预取不启动 */
+const FEED_SCROLL_QUIET_MS: number = 500;
+/** feed 预取逐卡错峰间隔（原 150ms 拉大，进一步摊平网络与解码占用） */
+const FEED_PREFETCH_STAGGER_MS: number = 400;
+/** mainOnly 模式（feed 预取）图片预热封顶：只 warm 主楼正文图，楼层图一律不预热（显示侧直连 CDN 兜底） */
+const FEED_WARM_MAIN_CAP: number = 6;
+/** 滚动活跃时图片预热挂起重试：最大次数与间隔（超时后无条件执行，封顶 ~4s，防永久挂起） */
+const FEED_WARM_DEFER_MAX_ATTEMPTS: number = 10;
+const FEED_WARM_DEFER_INTERVAL_MS: number = 400;
+/** feed 预取「已尝试」会话级去重封顶（FIFO）：弱网失败帖不再被每次停歇重发请求+磁盘检查 */
+const PREFETCH_ATTEMPTED_CAP: number = 500;
+
+/**
+ * 帖子详情族端点（pb/page?cmd=302001 / pb/floor?cmd=302002）专用客户端版本号（2026-09-20）：
+ * 服务端按 _client_version 门控**楼中楼回复图片**下发——12.x 系列一律把 sub_post content 里的
+ * 图片降级成 type=0 文本「[图片]」，实测 12.64/12.74/12.85/13.2 全部如此（tools/subpost_img_probe.js
+ * 四版本对比取证）；升到官方现行 22.x（22.11.1.0 实测通过）后，楼中楼 content 正常下发 type=3 PIC
+ * 且 URL 字段（cdnSrc/bigCdnSrc/originSrc/cdnSrcActive）与主楼层完全同构，现有取图链路直接可用。
+ * 仅限这两个详情端点使用；frs/page 等其它端点保持 12.64.1.1 不动（防未知回归）。
+ */
+const PB_CLIENT_VERSION: string = '22.11.1.0';
+const PB_USER_AGENT: string = 'tieba/22.11.1.0';
+
 export interface ThreadDetailResult {
   detail: ThreadDetail;
   floors: FloorItem[];
@@ -317,7 +351,23 @@ export interface ThreadDetailResult {
 
 interface ThreadDetailCacheEntry {
   result: ThreadDetailResult;
+  /** 写入（或网络刷新回写）时间，只作为 TTL 新鲜度基准 */
   time: number;
+  /** 最近一次被真正读取的时间，作为 LRU 淘汰基准（与 time 分离，改访问不延长 TTL） */
+  lastAccess: number;
+  /**
+   * 是否由预取写入且尚未被真正打开：逐出时优先淘汰这类条目。
+   * 预取只是对"用户可能会点"的押注，不该把用户真看过的帖挤出缓存。
+   * 条目一旦被 touch 读取（页面真实打开）即升格为 false，恢复正常待遇。
+   */
+  prefetched: boolean;
+}
+
+interface ForumPrefetchEntry {
+  /** 携带结果的 Promise：成功 resolve 结果、失败 resolve undefined（页面回落自行请求） */
+  task: Promise<PagedResult<ThreadItem> | undefined>;
+  /** 起跑时间：超过 FORUM_PREFETCH_TTL 视为过期，不再供合流消费（并惰性清扫） */
+  ts: number;
 }
 
 interface CollectionData {
@@ -344,12 +394,22 @@ interface UserInfoResult {
  */
 export class TiebaService {
   private static readonly TAG: string = 'TiebaService';
+  /** §Z3-lite：单次详情解析后最多预热多少个头像（楼层作者优先，其余给楼中楼预览） */
+  private static readonly AVATAR_PREHEAT_MAX: number = 40;
+  /** §Z2：详情磁盘缓存每写几次才做一次全表 prune（节流掉淡入期的全表扫描） */
+  private static readonly DETAIL_PRUNE_EVERY_WRITES: number = 4;
+  /** §Z2：自上次 prune 以来的详情落盘次数 */
+  private detailWritesSincePrune: number = 0;
   private static instance: TiebaService | null = null;
   /** 服务器时间 - 本地时间 的偏移（毫秒），由 /c/s/login 响应的 time 字段校准 */
   private static serverTimeOffsetMs: number = 0;
   private cachedForumHeader: ForumHeaderInfo | null = null;
   /** cachedForumHeader 所属吧名（kw 原样记录）：ThreadList 取头时校验，防止上一个吧的头串显 */
   private cachedForumHeaderKw: string = '';
+  /** 精选二级分类缓存（最近一次 is_good proto 请求的 forum.good_classify）：精选分类页首屏复用 */
+  private cachedGoodClassify: GoodClassifyMessage[] = [];
+  /** cachedGoodClassify 所属吧名：跨吧校验，防串显 */
+  private cachedGoodClassifyKw: string = '';
   /**
    * proto（protobuf）列表接口连续失败次数：接口返回异常/风控/挂起超时时递增。
    * 达到 2 次后本会话内跳过 proto 直接走 modern JSON 接口——被风控时每次都会挂满超时
@@ -389,6 +449,78 @@ export class TiebaService {
       return null;
     }
     return this.cachedForumHeader;
+  }
+
+  /**
+   * 读取精选二级分类（最近一次该吧 is_good proto 请求自然落地）。
+   * kw 不匹配或尚无精选请求时返回空数组 —— 页面按「仅全部」降级，不报错。
+   */
+  getCachedGoodClassify(forumName: string): GoodClassifyMessage[] {
+    if (forumName.length === 0 || this.cachedGoodClassifyKw !== forumName.trim()) {
+      return [];
+    }
+    return this.cachedGoodClassify;
+  }
+
+  /**
+   * 精选分类页首屏预取（长按手势按下即起跑）：与 fetchGoodFirstPageCoalesced 同参
+   * （page=1 / sort=2 / enrichAuthors=false / 无 cid=全部），结果暂存 pendingForumPrefetch
+   * （key 加 `_good` 后缀与吧列表预取区分），不写任何缓存 —— 语义同 prefetchForumThreads。
+   */
+  prefetchGoodFirstPage(forumName: string): void {
+    const kw: string = forumName.trim();
+    if (kw.length === 0) {
+      return;
+    }
+    const key: string = `${kw}_good`;
+    if (this.pendingForumPrefetch.has(key)) {
+      return; // 已在途，防重复请求
+    }
+    const t0: number = Date.now();
+    const task: Promise<PagedResult<ThreadItem> | undefined> =
+      this.fetchForumThreads(kw, 1, 2, false)
+        .then((result: PagedResult<ThreadItem>): PagedResult<ThreadItem> => {
+          console.info(`[PREFETCH] good ${kw} ok n=${result.list.length} cost=${Date.now() - t0}ms`);
+          return result;
+        })
+        .catch((e: Error): PagedResult<ThreadItem> | undefined => {
+          console.info(`[PREFETCH] good ${kw} fail: ${e.message}`);
+          return undefined;
+        });
+    this.pendingForumPrefetch.set(key, { task: task, ts: t0 });
+  }
+
+  /**
+   * 精选分类页首屏请求（预取合流版）：若同吧精选预取仍在途/刚落地（10s TTL 内）则直接消费，
+   * 不另发请求；无预取/失败/空 → 回落 fetchForumThreads 原样请求。
+   */
+  async fetchGoodFirstPageCoalesced(forumName: string): Promise<PagedResult<ThreadItem>> {
+    const kw: string = forumName.trim();
+    const key: string = `${kw}_good`;
+    const entry: ForumPrefetchEntry | undefined = this.pendingForumPrefetch.get(key);
+    if (entry !== undefined) {
+      this.pendingForumPrefetch.delete(key); // 一次性消费
+      if (Date.now() - entry.ts <= TiebaService.FORUM_PREFETCH_TTL) {
+        const shared: PagedResult<ThreadItem> | undefined = await entry.task;
+        if (shared !== undefined && shared.list.length > 0) {
+          console.info(`[FRS] good coalesce kw=${kw} n=${shared.list.length}`);
+          return shared;
+        }
+      }
+    }
+    return this.fetchForumThreads(kw, 1, 2, false);
+  }
+
+  /**
+   * 精选分类专用（2026-09-20 三轮）：**仅走 proto**（cid=field 5 过滤），不做 modern JSON 兜底 ——
+   * modern 不支持 cid，回落会错拿「全部」内容伪装成该分类（真机反馈「切换没反应」的真因）。
+   * 失败直接抛错，由页面按错误态处理；空列表原样返回（页面落空态）。
+   */
+  async fetchGoodCategoryThreads(forumName: string, page: number, cid: number): Promise<PagedResult<ThreadItem>> {
+    if (cid <= 0) {
+      return this.fetchForumThreads(forumName, page, 2, false);
+    }
+    return this.requestForumThreadsProto(forumName, page, 2, true, false, cid);
   }
 
   /** modern JSON 吧对象 → 吧头缓存（值多为字符串数字，统一 Number 归一化；缺字段安全回落 0/空串） */
@@ -1004,16 +1136,17 @@ export class TiebaService {
   /**
    * 获取某个吧的帖子列表
    */
-  async fetchForumThreads(forumName: string, page: number = 1, sortType: number = 0, enrichAuthors: boolean = true): Promise<PagedResult<ThreadItem>> {
+  async fetchForumThreads(forumName: string, page: number = 1, sortType: number = 0, enrichAuthors: boolean = true,
+    goodClassId: number = 0): Promise<PagedResult<ThreadItem>> {
     const isGoodMode: boolean = sortType === 2;
     const t0: number = Date.now();
-    console.info(`[FRS] enter kw=${forumName} page=${page} sort=${sortType} isGood=${isGoodMode}`);
+    console.info(`[FRS] enter kw=${forumName} page=${page} sort=${sortType} isGood=${isGoodMode} cid=${goodClassId}`);
     if (this.protoFailStreak >= 2) {
       // 本会话 proto 已连续失败 2 次（多为风控/挂起超时），不再反复白等，直接走 modern
       console.info(`[FRS] proto SKIP kw=${forumName} sort=${sortType} failStreak=${this.protoFailStreak}`);
     } else {
       try {
-        const protoResult = await this.requestForumThreadsProto(forumName, page, sortType, isGoodMode, enrichAuthors);
+        const protoResult = await this.requestForumThreadsProto(forumName, page, sortType, isGoodMode, enrichAuthors, goodClassId);
         if (protoResult.list.length > 0) {
           console.info(`[FRS] proto OK kw=${forumName} sort=${sortType} n=${protoResult.list.length} cost=${Date.now() - t0}ms`);
           this.protoFailStreak = 0;
@@ -1096,6 +1229,74 @@ export class TiebaService {
     throw new Error(`贴吧“${forumName}”暂时没有可显示的帖子`);
   }
 
+  // ---- 吧列表点击即预取（利用路由转场窗口后台取首屏，吧页打开时合流消费，不新增请求） ----
+  // 与详情页预取的关键区别：这里**不写任何缓存** —— 结果只暂存到被页面消费或超时。
+  // 这样既不会用空列表覆盖本地好缓存，也无需在服务侧复刻页面私有的 forumCacheKey 格式。
+  private pendingForumPrefetch: Map<string, ForumPrefetchEntry> = new Map();
+  /** 预取暂存保鲜期：超过即不再供合流消费（配合惰性清扫，点开就退的预取项不长期驻留） */
+  private static readonly FORUM_PREFETCH_TTL: number = 10000;
+
+  /**
+   * 吧列表首屏预取：与 ThreadList.loadThreads 主请求同参（page=1 / sort=0 / enrichAuthors=false），
+   * 保证合流消费到的结果集与该请求逐字一致。固定只预取默认排序，避免串排序。
+   * 失败静默（resolve undefined），页面自行回落 —— 语义与改造前一致。
+   */
+  prefetchForumThreads(forumName: string): void {
+    const kw: string = forumName.trim();
+    if (kw.length === 0) {
+      return;
+    }
+    const key: string = `${kw}_0`;
+    const now: number = Date.now();
+    // 惰性清扫：无人消费的预取项（用户点开就退）不长期占内存。先收集再删，避免遍历中改集合
+    const staleKeys: string[] = [];
+    this.pendingForumPrefetch.forEach((entry: ForumPrefetchEntry, k: string): void => {
+      if (now - entry.ts > TiebaService.FORUM_PREFETCH_TTL) {
+        staleKeys.push(k);
+      }
+    });
+    staleKeys.forEach((k: string): void => {
+      this.pendingForumPrefetch.delete(k);
+    });
+    if (this.pendingForumPrefetch.has(key)) {
+      return; // 已在途，防重复请求
+    }
+    const t0: number = now;
+    const task: Promise<PagedResult<ThreadItem> | undefined> =
+      this.fetchForumThreads(kw, 1, 0, false)
+        .then((result: PagedResult<ThreadItem>): PagedResult<ThreadItem> => {
+          console.info(`[PREFETCH] forum ${kw} ok n=${result.list.length} cost=${Date.now() - t0}ms`);
+          return result;
+        })
+        .catch((e: Error): PagedResult<ThreadItem> | undefined => {
+          console.info(`[PREFETCH] forum ${kw} fail: ${e.message}`);
+          return undefined;
+        });
+    this.pendingForumPrefetch.set(key, { task: task, ts: now });
+  }
+
+  /**
+   * 吧列表首屏请求（预取合流版）：page=1 且 sort=0 时，若同参预取仍在途/刚落地则直接消费，
+   * 不另发一次请求（预取早于路由转场起跑，等待成本天然低于新请求）。
+   * 无预取 / 预取失败 / 结果为空 → 原样回落 fetchForumThreads，行为与改造前逐字一致。
+   */
+  async fetchForumThreadsCoalesced(forumName: string, page: number = 1, sortType: number = 0,
+    enrichAuthors: boolean = true): Promise<PagedResult<ThreadItem>> {
+    if (page === 1 && sortType === 0) {
+      const key: string = `${forumName.trim()}_0`;
+      const entry: ForumPrefetchEntry | undefined = this.pendingForumPrefetch.get(key);
+      if (entry !== undefined && Date.now() - entry.ts <= TiebaService.FORUM_PREFETCH_TTL) {
+        const shared: PagedResult<ThreadItem> | undefined = await entry.task;
+        this.pendingForumPrefetch.delete(key); // 一次性消费
+        if (shared !== undefined && shared.list.length > 0) {
+          console.info(`[FRS] coalesce kw=${forumName} sort=0 n=${shared.list.length}`);
+          return shared;
+        }
+      }
+    }
+    return this.fetchForumThreads(forumName, page, sortType, enrichAuthors);
+  }
+
   /**
    * 带超时保护的 Promise 包装：超时后 reject（底层请求结果被忽略），
    * 防止接口挂起时拖长 fetchForumThreads 的三级降级链路（proto → modern → HTML），改善冷启动最坏等待。
@@ -1123,7 +1324,8 @@ export class TiebaService {
     });
   }
 
-  private async requestForumThreadsProto(forumName: string, page: number, sortType: number, isGood: boolean, enrichAuthors: boolean = true): Promise<PagedResult<ThreadItem>> {
+  private async requestForumThreadsProto(forumName: string, page: number, sortType: number, isGood: boolean, enrichAuthors: boolean = true,
+    goodClassId: number = 0): Promise<PagedResult<ThreadItem>> {
     const common = ProtoSchema.commonRequest(new Map<string, string | number>([
       ['_client_type', 2],
       ['_client_version', '12.64.1.1'],
@@ -1137,14 +1339,19 @@ export class TiebaService {
       ['pversion', '1.0.3'],
       ['BDUSS', AuthManager.getInstance().getBduss()]
     ]));
-    const data = ProtoSchema.frsPageRequest(new Map<string, string | number>([
+    const frsFields: Map<string, string | number> = new Map<string, string | number>([
       ['kw', forumName],
       ['rn', 20],
       ['rn_need', 25],
       ['is_good', isGood ? 1 : 0],
       ['pn', page === 1 ? 0 : page],
       ['sort_type', isGood ? 0 : sortType],
-    ]), common);
+    ]);
+    // 精选二级分类过滤（2026-09-20 探针实测：field 5 cid=class_id；不传 = 全部）
+    if (goodClassId > 0) {
+      frsFields.set('cid', goodClassId);
+    }
+    const data = ProtoSchema.frsPageRequest(frsFields, common);
     const binary = await this.withTimeout(
       HttpClient.postProtoMultipart('https://c.tieba.baidu.com/c/f/frs/page?cmd=301001', data, {
         'User-Agent': 'tieba/12.64.1.1',
@@ -1164,6 +1371,13 @@ export class TiebaService {
     }
     this.cachedForumHeader = this.extractForumHeaderInfo(decoded, forumName);
     this.cachedForumHeaderKw = forumName;
+    // 精选分类缓存：is_good 请求的响应 forum.good_classify（field 21）随请求自然落地，
+    // 精选分类页首屏一次请求两用（列表 + 分类清单）。非精选请求不动缓存。
+    if (isGood) {
+      this.cachedGoodClassify = decoded.data?.forum?.goodClassify ?? [];
+      this.cachedGoodClassifyKw = forumName;
+      console.info(`[FRS] good_classify kw=${forumName} n=${this.cachedGoodClassify.length}`);
+    }
     const threadList = decoded.data?.threadList ?? [];
     const userList = decoded.data?.userList ?? [];
     const globalForumAvatar: string = decoded.data?.forum?.avatar ?? '';
@@ -1178,12 +1392,21 @@ export class TiebaService {
       const authorInfo = this.resolveAuthorInfo(authorFromMsg, authorFromList, item.authorId);
       
       const authorAvatar: string = this.normalizeAvatar(authorInfo);
-      const images: string[] = (item.media ?? [])
-        .map((m: object): string => {
-          const mediaObj = m as Record<string, string>;
-          return mediaObj.bigPic ?? mediaObj.srcPic ?? mediaObj.originPic ?? '';
-        })
-        .filter((url: string) => url.length > 0);
+      // 2026-09-20 宫格秒加载：单遍循环同时产出两组 URL——
+      // images 仍取 bigPic（960 变体，缓存 HASH/进详情/分享语义与改造前完全一致）；
+      // imageThumbs 同序携带官方 srcPic 缩略图（原版贴吧 App 列表宫格同源），供 ThreadCard
+      // 多图宫格首画直连（几十 KB 级 vs bigPic 数百 KB），本地 960 落地后自动升级高清。
+      const images: string[] = [];
+      const imageThumbs: string[] = [];
+      for (const m of item.media ?? []) {
+        const mediaObj = m as Record<string, string>;
+        const big: string = mediaObj.bigPic ?? mediaObj.srcPic ?? mediaObj.originPic ?? '';
+        if (big.length === 0) {
+          continue;   // 与改造前 filter 语义一致：无可用图的 media 直接丢弃
+        }
+        images.push(big);
+        imageThumbs.push(mediaObj.srcPic ?? '');
+      }
       return {
         tid: `${item.threadId ?? item.id ?? ''}`,
         postId: `${item.firstPostId ?? item.postId ?? item.id ?? ''}`,
@@ -1200,6 +1423,7 @@ export class TiebaService {
         abstract: item.abstract?.map((part) => part.text ?? '').join('') ?? '',
         firstImage: item.media?.[0]?.bigPic ?? item.media?.[0]?.srcPic ?? item.media?.[0]?.originPic ?? '',
         images: images,
+        imageThumbs: imageThumbs,
         createTime: item.lastTime ?? `${item.lastTimeInt ?? item.createTime ?? ''}`,
         isTop: item.isTop === 1 || item.isMemberTop === 1,
         isGood: item.isGood === 1,
@@ -1249,7 +1473,16 @@ export class TiebaService {
   private static readonly THREAD_DETAIL_CACHE_TTL: number = 5 * 60 * 1000;
   private threadDetailCache: Map<string, ThreadDetailCacheEntry> = new Map();
 
-  getThreadDetailCache(key: string): ThreadDetailResult | undefined {
+  /**
+   * 读取内存缓存。
+   * touch=true（默认，页面真实打开的路径）：刷新 lastAccess，并把"预取写入"标记升格为
+   *   普通项 —— 被用户真正打开过的预取项已兑现价值，不再享受"优先淘汰"待遇。
+   * touch=false：纯存在性检查（prefetchThreadDetail 判断"缓存仍有效则无需预取"），
+   *   不碰 LRU 顺序也不清预取标记，否则预取自身的检查会凭空抬高条目热度。
+   * 注意 touch 只刷新 lastAccess，不刷新 time —— 5 分钟 TTL 是数据新鲜度，
+   * 不能因为反复回看就把过期数据永久留在缓存里。
+   */
+  getThreadDetailCache(key: string, touch: boolean = true): ThreadDetailResult | undefined {
     const entry = this.threadDetailCache.get(key);
     if (entry === undefined || entry === null) {
       return undefined;
@@ -1264,10 +1497,14 @@ export class TiebaService {
       this.threadDetailCache.delete(key);
       return undefined;
     }
+    if (touch) {
+      entry.lastAccess = Date.now();
+      entry.prefetched = false;
+    }
     return entry.result;
   }
 
-  putThreadDetailCache(key: string, result: ThreadDetailResult): void {
+  putThreadDetailCache(key: string, result: ThreadDetailResult, prefetched: boolean = false): void {
     if (!result || !result.detail || (result.detail.tid ?? '').length === 0) {
       return;
     }
@@ -1275,19 +1512,47 @@ export class TiebaService {
     if (this.isThreadDetailShell(result)) {
       return;
     }
-    this.threadDetailCache.set(key, { result: result, time: Date.now() });
+    const now: number = Date.now();
+    const entry: ThreadDetailCacheEntry = {
+      result: result,
+      time: now,
+      lastAccess: now,
+      prefetched: prefetched,
+    };
+    this.threadDetailCache.set(key, entry);
     if (this.threadDetailCache.size > TiebaService.THREAD_DETAIL_CACHE_MAX) {
-      let oldestKey: string = '';
-      let oldestTime: number = Number.MAX_SAFE_INTEGER;
-      this.threadDetailCache.forEach((entry: ThreadDetailCacheEntry, k: string) => {
-        if (entry.time < oldestTime) {
-          oldestTime = entry.time;
-          oldestKey = k;
-        }
-      });
-      if (oldestKey.length > 0) {
-        this.threadDetailCache.delete(oldestKey);
+      this.evictOneThreadDetailCache();
+    }
+  }
+
+  /**
+   * 逐出内存缓存的一条。
+   * 改造前按 entry.time（写入时间）淘汰、命中不刷新 —— 实质是 FIFO：用户刚看过的帖
+   * 会被后续任何新写入（含预取）挤掉，返回再进又要重新请求，与秒开目标相反。
+   * 现按两级规则：优先淘汰"预取写入且未被真正打开"的条目，同类中再按 lastAccess 淘汰
+   * 最久未访问的一条（真 LRU）。
+   */
+  private evictOneThreadDetailCache(): void {
+    let victimKey: string = '';
+    let victimPrefetched: boolean = false;
+    let victimAccess: number = 0;
+    this.threadDetailCache.forEach((entry: ThreadDetailCacheEntry, k: string): void => {
+      if (victimKey.length === 0) {
+        victimKey = k;
+        victimPrefetched = entry.prefetched;
+        victimAccess = entry.lastAccess;
+        return;
       }
+      const entryWins: boolean = (entry.prefetched && !victimPrefetched)
+        || (entry.prefetched === victimPrefetched && entry.lastAccess < victimAccess);
+      if (entryWins) {
+        victimKey = k;
+        victimPrefetched = entry.prefetched;
+        victimAccess = entry.lastAccess;
+      }
+    });
+    if (victimKey.length > 0) {
+      this.threadDetailCache.delete(victimKey);
     }
   }
 
@@ -1335,41 +1600,250 @@ export class TiebaService {
         result,
         CACHE_TTL.THREAD_DETAIL
       );
-      CacheManager.getInstance().pruneByPrefix(CACHE_KEY.THREAD_DETAIL, 20);
+      // §Z2（2026-09-19）：prune 是「全表 getAll + 逐条前缀 JSON.parse」，而详情落盘正好发生在
+      // 首屏淡入的同一帧里，每次都清会掉帧；改为每 4 次写入清一次（上限 20，突发期内最多多留 3 条，
+      // 仍是有界收敛，TTL 10 分钟同样兜底）。
+      this.detailWritesSincePrune += 1;
+      if (this.detailWritesSincePrune >= TiebaService.DETAIL_PRUNE_EVERY_WRITES) {
+        this.detailWritesSincePrune = 0;
+        CacheManager.getInstance().pruneByPrefix(CACHE_KEY.THREAD_DETAIL, 20);
+      }
     } catch (_) {
       // 磁盘缓存写入失败不影响功能
     }
   }
 
   // ---- 帖子详情点击即预取（利用跳转动画窗口后台取数，写入内存+磁盘缓存，详情页打开即命中） ----
-  private pendingThreadDetailPrefetch: Map<string, Promise<void>> = new Map();
+  // 值为「携带结果的 Promise」：详情页首屏可 await 在途预取做合流（见 fetchThreadDetailCoalesced），
+  // 成功 resolve 结果、失败 resolve undefined（页面回落自行请求），预取语义与改造前一致。
+  private pendingThreadDetailPrefetch: Map<string, Promise<ThreadDetailResult | undefined>> = new Map();
 
-  prefetchThreadDetail(tid: string, forumId: string = ''): void {
+  // ---- 「帖子极速开启」滑动让路状态（HomeTab onScrollStart/Stop 上报；feed 预取据此降载/挂起） ----
+  private feedScrollActive: boolean = false;
+  private lastFeedScrollAt: number = 0;
+  /** 会话级「预取已尝试」：发过的 tid 本会话不再重试（磁盘检查一并跳过）；点开成功后移除允许重新预取 */
+  private prefetchAttemptedTids: Set<string> = new Set<string>();
+
+  /** 信息流滚动状态上报：HomeTab 在 onScrollStart/Stop 调用（服务层带静默窗口判定） */
+  notifyFeedScrolling(active: boolean): void {
+    this.feedScrollActive = active;
+    this.lastFeedScrollAt = Date.now();
+  }
+
+  /** 是否处于滚动活跃/余波窗口（active 标记 或 距上次滚动事件不足静默阈值） */
+  private isFeedScrollBusy(): boolean {
+    if (this.feedScrollActive) {
+      return true;
+    }
+    return Date.now() - this.lastFeedScrollAt < FEED_SCROLL_QUIET_MS;
+  }
+
+  /** 登记「已尝试预取」（FIFO 封顶）：feed 预取发过的 tid 会话内不再重复发 */
+  private rememberPrefetchAttempted(tid: string): void {
+    this.prefetchAttemptedTids.delete(tid);
+    this.prefetchAttemptedTids.add(tid);
+    if (this.prefetchAttemptedTids.size > PREFETCH_ATTEMPTED_CAP) {
+      const oldest: string | undefined = this.prefetchAttemptedTids.values().next().value;
+      if (oldest !== undefined) {
+        this.prefetchAttemptedTids.delete(oldest);
+      }
+    }
+  }
+
+  prefetchThreadDetail(tid: string, forumId: string = '', mainOnlyImages: boolean = false): void {
     const normalizedTid: string = tid.trim();
     if (normalizedTid.length === 0) {
       return;
     }
     // 详情页默认 sortType=0 / seeLz=false，与跳转时的缓存 key 一致
     const key: string = `${normalizedTid}_0_0`;
-    if (this.getThreadDetailCache(key)) {
+    // touch=false：这里只是"缓存是否仍有效"的存在性检查，不能算一次真实访问，
+    // 否则预取自检会把自己的条目刷成热点，反而挤掉用户真看过的帖
+    if (this.getThreadDetailCache(key, false)) {
       return; // 内存缓存仍有效（5 分钟 TTL），无需重复预取
     }
     if (this.pendingThreadDetailPrefetch.has(key)) {
       return; // 已在途，防重复请求
     }
-    const task: Promise<void> = this.fetchThreadDetail(normalizedTid, 1, 0, false, forumId, 3, 0, '')
-      .then((result: ThreadDetailResult) => {
-        this.putThreadDetailCache(key, result);
-        return this.saveThreadDetailToDisk(result, normalizedTid, 0, false);
+    const task: Promise<ThreadDetailResult | undefined> = this.fetchThreadDetail(normalizedTid, 1, 0, false, forumId, 3, 0, '')
+      .then((result: ThreadDetailResult): Promise<ThreadDetailResult | undefined> => {
+        // prefetched=true：预取项在逐出时优先级最低，先把"押注"让给真访问
+        this.putThreadDetailCache(key, result, true);
+        // v1.26（P1）：数据一到立刻预热首屏宫格图 —— 图片下载与路由转场动画并行，
+        // 页面渲染时 getVerifiedCachedPath 已命中 → 图片从本地 file:// 秒出（不再等网络）。
+        // 2026-09-20：feed 预取（mainOnlyImages=true）在滚动活跃期挂起预热，等停歇窗口再执行；
+        // 按压预取（默认 false）保持立即全量预热 —— 用户即将进帖，转场动画期就该吃图。
+        this.warmDetailPreviewImagesDeferred(result, mainOnlyImages);
+        return this.saveThreadDetailToDisk(result, normalizedTid, 0, false)
+          .then((): ThreadDetailResult | undefined => result);
       })
-      .catch((e: Error) => {
+      .catch((e: Error): ThreadDetailResult | undefined => {
         // 预取失败静默：页面打开时自行请求即可
         console.info(`[PREFETCH] detail ${normalizedTid} fail: ${(e as Error).message}`);
+        return undefined;
       })
-      .finally(() => {
+      .finally((): void => {
         this.pendingThreadDetailPrefetch.delete(key);
       });
     this.pendingThreadDetailPrefetch.set(key, task);
+  }
+
+  /**
+   * v1.26（P1）：详情数据就绪即预热首屏宫格图。
+   * 取主楼正文图 + 前 maxFloors 层回帖图的 URL，先过 ImageCache.toThumbUrl 归一 ——
+   * 必须与 ThreadGridImage 显示侧的缓存 key 同形态，否则预热下载的文件永远命不中；
+   * 张数封顶 IMAGE_WARM_MAX_IMAGES，防一次点按拉起上百张图。
+   * 下载走全局图片并发闸门（ImageCache.warmImages）+ 图片专用 Session，不与接口请求争抢。
+   */
+  /**
+   * 2026-09-20「帖子极速开启」（设置-更多开关，默认关闭）：feed 首屏前 3 卡详情+图片预取。
+   * 用户点开首屏卡时命中内存缓存 → 同步直出真秒开（预取成功自动跑首屏图预热，既有链路复用）。护栏：
+   * - 开关关闭（UsageHabitsManager.isThreadFastOpen()=false）整体短路；
+   * - 逐卡去重：内存缓存命中（touch=false 存在性检查）或磁盘缓存命中（stale 也算有）→ 跳过；
+   * - 会话级「已尝试」去重：发过的 tid 本会话不重试（弱网失败帖不每次停歇重发）；
+   * - 滑动让路：滚动活跃/静默窗口内整轮放弃（isFeedScrollBusy），图片预热挂起到停歇窗口；
+   * - mainOnly：只 warm 主楼正文图（封顶 6 张），楼层图走显示侧直连 CDN 兜底；
+   * - 卡间 400ms 错峰；预取失败静默（prefetchThreadDetail 内部自会处理），不影响任何显示路径。
+   */
+  /** 当前默认网络是否 WiFi（NetworkKit bearerTypes 判定；异常按非 WiFi 处理——保守不预取，不偷跑流量） */
+  private async isOnWifi(): Promise<boolean> {
+    try {
+      const net: connection.NetHandle = await connection.getDefaultNet();
+      if (!net || net.netId === 0) {
+        return false;
+      }
+      const caps: connection.NetCapabilities = await connection.getNetCapabilities(net);
+      return caps.bearerTypes.indexOf(connection.NetBearType.BEARER_WIFI) >= 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async prefetchFeedTopThreads(items: ThreadItem[]): Promise<void> {
+    if (!UsageHabitsManager.getInstance().isThreadFastOpen()) {
+      return;
+    }
+    // 「仅 WiFi 启用」子开关（默认开）：开启时非 WiFi 环境（移动数据/无网络/判定失败）整体短路
+    if (UsageHabitsManager.getInstance().isThreadFastWifi() && !(await this.isOnWifi())) {
+      return;
+    }
+    const top: ThreadItem[] = items.slice(0, 3);
+    for (const it of top) {
+      // 滚动活跃/余波窗口：放弃本轮剩余候选（下次停歇自然重新触发），重活全部让路给滚动
+      if (this.isFeedScrollBusy()) {
+        return;
+      }
+      const tid: string = it.tid.trim();
+      if (tid.length === 0) {
+        continue;
+      }
+      // 会话级去重：发过的 tid 不再重复走磁盘检查与请求（弱网失败帖不无限重发）
+      if (this.prefetchAttemptedTids.has(tid)) {
+        continue;
+      }
+      const key: string = `${tid}_0_0`;
+      if (this.getThreadDetailCache(key, false) !== undefined) {
+        this.rememberPrefetchAttempted(tid);
+        continue;
+      }
+      try {
+        const disk = await this.getThreadDetailFromDisk(tid, 0, false);
+        if (disk) {
+          this.rememberPrefetchAttempted(tid);
+          continue;
+        }
+      } catch (e) {
+        // 缓存检查失败按未命中处理，照常预取
+      }
+      this.rememberPrefetchAttempted(tid);
+      // mainOnlyImages=true：feed 预取只 warm 主楼正文图（封顶 6 张），楼层图走显示侧直连 CDN
+      this.prefetchThreadDetail(tid, it.forumId ?? '', true);
+      await new Promise<void>((resolve: () => void) => setTimeout(resolve, FEED_PREFETCH_STAGGER_MS));
+    }
+  }
+
+  private warmDetailPreviewImages(result: ThreadDetailResult, mainOnly: boolean = false): void {
+    const head: string[] = [];   // 首屏批：主楼正文图 + 前 3 层（优先入队）
+    const tail: string[] = [];   // 滚动批：第 4~12 层（闸门 FIFO 天然排在首屏之后，滚到即本地出）
+    const pushUrl = (u: string, bucket: string[], cap: number): void => {
+      if (bucket.length >= cap || !u || u.length === 0) {
+        return;
+      }
+      const thumb: string = ImageCache.toThumbUrl(u);
+      if (thumb.startsWith('http://') || thumb.startsWith('https://')) {
+        bucket.push(thumb);
+      }
+    };
+    // 主楼正文图（首屏第一眼看到的就是它）；mainOnly 时封顶 6 张
+    const mainImages: string[] = result.detail?.images ?? [];
+    for (const u of mainImages) {
+      pushUrl(u, head, mainOnly ? FEED_WARM_MAIN_CAP : DETAIL_WARM_HEAD_IMAGES);
+    }
+    // mainOnly（feed 预取）：楼层图一律不预热 —— 显示侧 ThreadGridImage 直连 CDN 挂载即发，
+    // 退回"原版秒加载"路线；回复区数据本身随回包已进缓存，分区上屏时直接用。
+    if (!mainOnly) {
+      // 前 3 层进首屏批，第 4~12 层进滚动批
+      const floors: FloorItem[] = result.floors ?? [];
+      for (let i = 0; i < floors.length && i < 12; i++) {
+        const bucket: string[] = i < 3 ? head : tail;
+        const cap: number = i < 3 ? DETAIL_WARM_HEAD_IMAGES : DETAIL_WARM_TAIL_IMAGES;
+        const imgs: string[] = floors[i].images ?? [];
+        for (const u of imgs) {
+          pushUrl(u, bucket, cap);
+        }
+      }
+    }
+    // 先 head 后 tail：闸门是 FIFO，首屏天然排在滚动预热之前
+    if (head.length > 0) {
+      ImageCache.warmImages(head);
+    }
+    if (tail.length > 0) {
+      ImageCache.warmImages(tail, DETAIL_WARM_TAIL_IMAGES);
+    }
+  }
+
+  /**
+   * 2026-09-20 滑动让路：feed 预取（mainOnly=true）在滚动活跃期挂起图片预热，
+   * 每 400ms 复查一次滚动状态，停歇（或封顶 ~4s 超时）后才真正 warm；
+   * 按压预取（mainOnly=false）不挂起 —— 用户即将进帖，转场动画期就该吃图。
+   */
+  private warmDetailPreviewImagesDeferred(result: ThreadDetailResult, mainOnly: boolean, attempt: number = 0): void {
+    if (!mainOnly || !this.isFeedScrollBusy() || attempt >= FEED_WARM_DEFER_MAX_ATTEMPTS) {
+      this.warmDetailPreviewImages(result, mainOnly);
+      return;
+    }
+    setTimeout((): void => {
+      this.warmDetailPreviewImagesDeferred(result, mainOnly, attempt + 1);
+    }, FEED_WARM_DEFER_INTERVAL_MS);
+  }
+
+  /**
+   * 首屏详情请求（预取合流版）：第 1 页 / 正序 / 只看全部 / 无父楼层 与预取同参，
+   * 若同参预取仍在途则直接等它，不另发一次请求 —— 预取早于路由转场起跑，
+   * 等待成本天然低于新请求，且避免同一帖短时间内两个 pb/page 请求。
+   * 无在途预取 / 预取失败 → 原样回落 fetchThreadDetail，行为与改造前逐字一致。
+   * 预取不带 onIdentityHydrated，命中合流时在本侧补做身份补齐，保证与独立请求同观感。
+   */
+  async fetchThreadDetailCoalesced(tid: string, page: number = 1, sortType: number = 0, seeLz: boolean = false,
+    forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = '',
+    onIdentityHydrated?: (result: ThreadDetailResult) => void): Promise<ThreadDetailResult> {
+    const normalizedTid: string = tid.trim();
+    if (page === 1 && sortType === 0 && !seeLz && parentPid.trim().length === 0) {
+      // 真实打开：移出会话级「预取已尝试」集（此刻内存缓存已兜底；此后 feed 预取可对其重新生效）
+      this.prefetchAttemptedTids.delete(normalizedTid);
+      const pending: Promise<ThreadDetailResult | undefined> | undefined =
+        this.pendingThreadDetailPrefetch.get(`${normalizedTid}_0_0`);
+      if (pending !== undefined) {
+        const shared: ThreadDetailResult | undefined = await pending;
+        if (shared !== undefined) {
+          if (this.needsWebIdentityHydration(shared)) {
+            this.hydrateThreadIdentity(shared, normalizedTid, page, onIdentityHydrated);
+          }
+          return shared;
+        }
+      }
+    }
+    return this.fetchThreadDetail(normalizedTid, page, sortType, seeLz, forumId, commentRn, commentSortType, parentPid, onIdentityHydrated);
   }
 
   // ---- 楼层下一页预取缓存（滚动翻页秒接，减少等待；只暂存内存，取出即删） ----
@@ -1435,6 +1909,42 @@ export class TiebaService {
   }
 
   /**
+   * web 兜底结果的可信度判定（2026-09-19）。
+   * 背景：原验收条件 `floors.length > 0 || (标题非空 && 标题 ≠ tid)` 的后半段对几乎任何页面都成立
+   * （任何页面的 <title> 都非空），于是风控页/错误页被 parseThreadDetail 兜成
+   * 「标题=百度贴吧 / 作者=贴吧用户 / 无正文 / 0 楼层」的空壳后，仍被当作成功结果返回，
+   * 页面渲染出一个"不是这个帖"的占位帖（首页快速滑动积压大量在途请求后点帖时偶发）。
+   * 两道闸：
+   * ① 必须有可展示内容（复用空壳判定）—— 直接堵住本次现象，且零误杀；
+   * ② HTML 里必须出现本帖 tid，确认这份页面确实属于该帖（拦截"有内容但帖子不对"的变体）。
+   */
+  private isTrustworthyWebResult(result: ThreadDetailResult, html: string, tid: string): boolean {
+    if (this.isThreadDetailShell(result)) {
+      return false;
+    }
+    return html.indexOf(tid) >= 0;
+  }
+
+  /**
+   * pb/page 解码下沉 taskpool（2026-09-20 性能优化）：
+   * 首页回包可达数百 KB，逐字段解析在主线程占 30~100ms 且恰与详情页路由转场动画同期。
+   * 下沉到 worker 后解码与转场并行，主线程只收结构化克隆的纯数据结果。
+   * 注意：binary 走 taskpool 默认拷贝（不用 setTransferList）——拷贝几百 KB 不足 1ms，
+   * 而一旦 transfer 后主线程的 ArrayBuffer 被剥离，兜底同步解码将无料可用。
+   * taskpool 异常（worker 创建失败 / 序列化失败等）时回退主线程同步解码，行为与改造前完全一致。
+   */
+  private async decodePbPageOffMain(binary: ArrayBuffer): Promise<PbPageResponseMessage> {
+    try {
+      const task: taskpool.Task = new taskpool.Task(decodePbPageTask, binary);
+      const decoded = await taskpool.execute(task) as PbPageResponseMessage;
+      return decoded;
+    } catch (e) {
+      hilog.warn(0x0000, 'TDPERF', 'pb page taskpool decode FALLBACK err=%{public}s', `${(e as Error).message ?? '?'}`);
+      return TiebaProtoDecoder.decodePbPageResponse(binary);
+    }
+  }
+
+  /**
    * 获取帖子详情与楼层
    */
   async fetchThreadDetail(tid: string, page: number = 1, sortType: number = 0, seeLz: boolean = false, forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = '', onIdentityHydrated?: (result: ThreadDetailResult) => void): Promise<ThreadDetailResult> {
@@ -1442,18 +1952,27 @@ export class TiebaService {
     if (normalizedTid.length === 0) {
       throw new Error('缺少帖子 ID，无法加载详情');
     }
+    // §TD 耗时打点（诊断用，零行为影响的纯日志）：用于定位"点进去转很久"究竟是
+    // pb/page 慢、还是落进 web 兜底后慢，两段各有 6s 上限（最坏 ~12s）。
+    const __t0: number = Date.now();
     let protoError: string = '';
     let shellResult: ThreadDetailResult | null = null;
     try {
+      const __tp0: number = Date.now();
       const payload = await this.requestThreadPage(normalizedTid, page, sortType, seeLz, forumId, commentRn, commentSortType, parentPid);
+      const __tp1: number = Date.now();
       const modernResult = this.parseModernThreadDetail(payload, normalizedTid, page, parentPid);
+      // §Z3-lite：解析完立即后台预热楼层头像，首屏渲染时大多已命中本地文件
+      this.preheatFloorAvatars(modernResult);
       const hasRequestedParent: boolean = parentPid.trim().length > 0;
       const titleResolved: boolean = modernResult.detail.title.trim().length > 0 && modernResult.detail.title !== normalizedTid;
       const shell: boolean = this.isThreadDetailShell(modernResult);
+      console.info(`[TD] proto tid=${normalizedTid} p=${page} parent=${hasRequestedParent ? '1' : '0'} cost=${__tp1 - __tp0}ms floors=${modernResult.floors.length} title=${titleResolved ? '1' : '0'} shell=${shell ? '1' : '0'}`);
       // 正常判定：有楼层 → 直接成功；无楼层时需"解析出真实标题且首楼有可展示内容"，
       // 否则视为疑似残缺响应（标题元数据在、post_list 丢失），交给下方 web 通道兜底。
       if ((!hasRequestedParent && (modernResult.floors.length > 0 || (titleResolved && !shell))) ||
         (hasRequestedParent && modernResult.floors.length > 0)) {
+        console.info(`[TD] done tid=${normalizedTid} via=proto total=${Date.now() - __t0}ms floors=${modernResult.floors.length}`);
         if (this.needsWebIdentityHydration(modernResult)) {
           // 身份补齐改为后台异步执行：先返回正文楼层让页面立即渲染，补齐后通过回调刷新作者身份
           this.hydrateThreadIdentity(modernResult, normalizedTid, page, onIdentityHydrated);
@@ -1466,32 +1985,51 @@ export class TiebaService {
         shellResult = modernResult;
       }
       protoError = shell ? '贴吧返回了空的帖子数据' : '贴吧返回了空的楼层数据';
+      console.info(`[TD] proto EMPTY tid=${normalizedTid} -> web fallback (shellResult=${shellResult ? '1' : '0'}, elapsed=${Date.now() - __t0}ms)`);
     } catch (e) {
       protoError = this.errorMessage(e, '移动详情接口请求失败');
     }
     try {
       const url = `${API.THREAD}${encodeURIComponent(normalizedTid)}?pn=${page}`;
-      const html = await HttpClient.get(url, {
-        'Accept': 'text/html,application/xhtml+xml',
-        'Referer': `${TIEBA_BASE}/p/${encodeURIComponent(normalizedTid)}`
-      });
+      // web 兜底是详情链路的最后一道：原口径吃 rcp 会话的 30s 传输超时，
+      // 网络拥塞时表现为"点进去转很久"（2026-09-19）。改为 app 级 6s 上限，超时即走下方兜底/报错。
+      const __tw0: number = Date.now();
+      const html = await this.withTimeout(
+        HttpClient.get(url, {
+          'Accept': 'text/html,application/xhtml+xml',
+          'Referer': `${TIEBA_BASE}/p/${encodeURIComponent(normalizedTid)}`
+        }),
+        6000,
+        'detail web'
+      );
+      const __tw1: number = Date.now();
       const webResult = this.parseThreadDetail(html, normalizedTid, page);
+      // §Z3-lite：web 兜底通道同样预热
+      this.preheatFloorAvatars(webResult);
+      console.info(`[TD] web tid=${normalizedTid} cost=${__tw1 - __tw0}ms floors=${webResult.floors.length} html=${html.length}B total=${Date.now() - __t0}ms`);
+      // 验收闸门（2026-09-19）：原条件后半段"标题非空且 ≠ tid"对任何页面都成立，
+      // 风控页/错误页会被当成功结果渲染成占位帖；现统一走 isTrustworthyWebResult
+      // （有可展示内容 + 页面确属该帖），不通过则退回 proto 标题页或报错让用户重试。
+      const webTrusted: boolean = this.isTrustworthyWebResult(webResult, html, normalizedTid);
       if (parentPid.trim().length > 0) {
         const requestedFloors: FloorItem[] = webResult.floors.filter((floor: FloorItem): boolean =>
           floor.floorId === parentPid.trim() || floor.floorId === `${Number(parentPid)}`);
         if (requestedFloors.length > 0) {
           return { detail: webResult.detail, floors: [requestedFloors[0]] };
         }
-      } else if (webResult.floors.length > 0 || webResult.detail.title.length > 0 && webResult.detail.title !== normalizedTid) {
+      } else if (webTrusted) {
+        console.info(`[TD] done tid=${normalizedTid} via=web total=${Date.now() - __t0}ms floors=${webResult.floors.length}`);
         return webResult;
       }
       if (shellResult) {
         // web 通道同样拿不到楼层（真空帖场景）：退回 proto 标题页，避免误报删除/空错误
+        console.info(`[TD] done tid=${normalizedTid} via=shellResult total=${Date.now() - __t0}ms`);
         return shellResult;
       }
       throw new Error('帖子页面为空，可能已被删除或触发访问限制');
     } catch (e) {
       const webError = this.errorMessage(e, '网页详情请求失败');
+      console.warn(`[TD] web FAIL tid=${normalizedTid} total=${Date.now() - __t0}ms err=${webError}`);
       if (protoError.includes('访问被拒绝') || webError.includes('访问被拒绝')) {
         throw new Error('贴吧拒绝了详情请求，通常与登录态失效、接口风控或帖子权限有关，请先重新登录后重试');
       }
@@ -1509,9 +2047,10 @@ export class TiebaService {
     if (normalizedTid.length === 0 || normalizedPid.length === 0) {
       throw new Error('缺少主楼信息，无法加载楼中楼');
     }
+    // _client_version 用 PB_CLIENT_VERSION（22.x）：12.x 会被服务端把楼中楼图片降级成「[图片]」文本
     const common = ProtoSchema.commonRequest(new Map<string, string | number>([
       ['_client_type', 2],
-      ['_client_version', '12.64.1.1'],
+      ['_client_version', PB_CLIENT_VERSION],
       ['_os_version', '26'],
       ['model', 'HarmonyOS'],
       ['brand', 'Huawei'],
@@ -1524,7 +2063,7 @@ export class TiebaService {
     ]));
     const request = ProtoSchema.pbFloorRequest(normalizedTid, normalizedPid, page, common);
     const binary = await HttpClient.postProtoMultipart('https://tiebac.baidu.com/c/f/pb/floor?cmd=302002', request, {
-      'User-Agent': 'tieba/12.64.1.1',
+      'User-Agent': PB_USER_AGENT,
       'Accept': 'application/octet-stream',
       'X-BD-DATA-TYPE': 'protobuf',
       'Client-Type': '2',
@@ -1556,6 +2095,51 @@ export class TiebaService {
       total: comments.length,
       hasMore: data?.page?.hasMore === 1,
     };
+  }
+
+  /**
+   * 楼层头像预热（§Z3-lite，2026-09-19）。
+   * 详情解析完成即把首屏会显示的头像 URL 丢给 ImageCache 提前下载：AvatarImage 首帧读
+   * getCachedPath 时大多已落地，省掉「先直连兜底图 → 下载完成后替换」这一轮闪动。
+   * 纯后台行为：不 await、失败静默、与正常下载共用 inflight 合并与本地缓存，不改任何渲染逻辑。
+   * 上限 AVATAR_PREHEAT_MAX 条，避免一次抛出上百个请求去抢首屏的连接池。
+   */
+  private preheatFloorAvatars(result: ThreadDetailResult): void {
+    const floors: FloorItem[] = result?.floors ?? [];
+    if (floors.length === 0) {
+      return;
+    }
+    const urls: string[] = [];
+    // 先排楼层作者（首屏可见的主体），再排楼中楼预览作者，超出上限即停止收集
+    for (const floor of floors) {
+      if (urls.length >= TiebaService.AVATAR_PREHEAT_MAX) {
+        break;
+      }
+      const floorAvatar: string = `${floor.authorAvatar ?? ''}`.trim();
+      if (floorAvatar.startsWith('http://') || floorAvatar.startsWith('https://')) {
+        urls.push(floorAvatar);
+      }
+    }
+    for (const floor of floors) {
+      if (urls.length >= TiebaService.AVATAR_PREHEAT_MAX) {
+        break;
+      }
+      for (const comment of (floor.comments ?? [])) {
+        if (urls.length >= TiebaService.AVATAR_PREHEAT_MAX) {
+          break;
+        }
+        const commentAvatar: string = `${comment.authorAvatar ?? ''}`.trim();
+        if (commentAvatar.startsWith('http://') || commentAvatar.startsWith('https://')) {
+          urls.push(commentAvatar);
+        }
+      }
+    }
+    const unique: string[] = Array.from(new Set<string>(urls));
+    for (const url of unique) {
+      // 命中本地缓存时 resolve 立即返回，不会重复下载
+      ImageCache.resolve(url).catch((): void => {
+      });
+    }
   }
 
   private normalizeUrl(url: string): string {
@@ -1887,14 +2471,84 @@ export class TiebaService {
     }
   }
 
+  // 九宫格/卡片图片目标宽度：单格约 110vp，3x 屏约 330px，取 400 兼顾清晰与省流
+  private static readonly CARD_IMG_WIDTH: number = 400;
+
+  // 解析贴吧 CDN 图片 URL 自带的宽度参数（形如 /forum/w%3D580/ 或 /forum/w=580/），无则返回 0
+  private static parseUrlWidth(url: string): number {
+    if (url.length === 0) return 0;
+    const m1: RegExpMatchArray | null = url.match(/\/w%3D(\d+)/);
+    if (m1 !== null && m1.length > 1) return Number.parseInt(m1[1], 10);
+    const m2: RegExpMatchArray | null = url.match(/\/w=(\d+)/);
+    if (m2 !== null && m2.length > 1) return Number.parseInt(m2[1], 10);
+    return 0;
+  }
+
+  // 把过宽的档位改写到目标宽度；只缩不放（避免把小图放大导致更糊又更大）
+  private static rewriteUrlWidth(url: string, targetW: number): string {
+    const cur: number = TiebaService.parseUrlWidth(url);
+    if (cur <= 0 || cur <= targetW) return url;
+    const encoded: string = `/w%3D${cur}/`;
+    if (url.includes(encoded)) return url.replace(encoded, `/w%3D${targetW}/`);
+    const plain: string = `/w=${cur}/`;
+    if (url.includes(plain)) return url.replace(plain, `/w=${targetW}/`);
+    return url;
+  }
+
+  // 按 URL 形态择优（不依赖字段名硬排序）：
+  // ①带宽度参数且宽度最小但不小于 300 的档位；②任意带宽度参数的档位；③原图兜底
+  private static pickImageUrl(cands: string[]): string {
+    const MIN_USABLE: number = 300;
+    let best: string = '';
+    let bestW: number = -1;
+    for (const c of cands) {
+      if (c.length === 0) continue;
+      const w: number = TiebaService.parseUrlWidth(c);
+      if (w >= MIN_USABLE && (bestW < 0 || w < bestW)) {
+        best = c;
+        bestW = w;
+      }
+    }
+    if (best.length > 0) return best;
+    for (const c of cands) {
+      if (c.length > 0 && TiebaService.parseUrlWidth(c) > 0) return c;
+    }
+    for (const c of cands) {
+      if (c.length > 0) return c;
+    }
+    return '';
+  }
+
+  private static briefUrl(s: string): string {
+    return s.length > 95 ? s.substring(0, 95) : s;
+  }
+
+  // 临时取证日志：打印各字段原始 URL 与最终选用 URL，用于确认真实档位（[IMGPICK]）
+  private static logImagePick(picked: string, finalUrl: string, cands: string[]): void {
+    if (picked.length === 0) return;
+    hilog.info(0x0000, 'IMGPICK', 'final=%{public}s | bigCdn=%{public}s cdn=%{public}s cdnAct=%{public}s org=%{public}s src=%{public}s bigSrc=%{public}s',
+      TiebaService.briefUrl(finalUrl), TiebaService.briefUrl(cands[0]), TiebaService.briefUrl(cands[1]),
+      TiebaService.briefUrl(cands[5]), TiebaService.briefUrl(cands[2]), TiebaService.briefUrl(cands[3]),
+      TiebaService.briefUrl(cands[4]));
+  }
+
   private buildFragmentsFromPbContent(contentList: PbContentMessage[] | undefined): FragmentsResult {
     const fragments: ContentFragment[] = [];
     const textParts: string[] = [];
     const images: string[] = [];
     for (const item of contentList ?? []) {
       const type: number = item.type ?? 0;
-      const rawUrl: string = item.originSrc ?? item.bigCdnSrc ?? item.cdnSrc ?? item.src ?? item.bigSrc ?? '';
+      // 取图档位：不按字段名硬排序（实测 bigCdnSrc=w960 平均 207KB、originSrc=原图平均 865KB/最大 8.14MB），
+      // 改为「按 URL 形态择优」——优先带宽度参数且宽度最小的档位，再改写为省流档 CARD_IMG_WIDTH；
+      // originSrc 走 /forum/pic/item/ 无宽度参数、压不了（注入 w 会被 CDN 返防盗链 logo）→ 仅作兜底。
+      const imgCands: string[] = [
+        item.bigCdnSrc ?? '', item.cdnSrc ?? '', item.originSrc ?? '',
+        item.src ?? '', item.bigSrc ?? '', item.cdnSrcActive ?? ''
+      ];
+      const pickedUrl: string = TiebaService.pickImageUrl(imgCands);
+      const rawUrl: string = TiebaService.rewriteUrlWidth(pickedUrl, TiebaService.CARD_IMG_WIDTH);
       const imageUrl: string = this.normalizeUrl(rawUrl);
+      TiebaService.logImagePick(pickedUrl, rawUrl, imgCands);
       const memePicUrl: string = this.normalizeUrl(item.memeInfo?.picUrl ?? item.memeInfo?.thumbnail ?? '');
       const memePackageUrl: string = this.resolveMemePackageUrl(item.memeInfo?.pckId, item.memeInfo?.picId);
       const cFieldUrl: string = this.resolveCFieldEmojiUrl(item.c ?? '');
@@ -1980,6 +2634,63 @@ export class TiebaService {
       }
     }
     return { fragments, text: textParts.join(''), images };
+  }
+
+  /**
+   * 楼中楼回复内容去冒号（2026-09-20 用户要求：内容前面不要有冒号）。两种服务端形态：
+   * A（嵌套回复，pb/floor 与 pb/page 均见）：text"回复 " + type4 用户名 + text" :正文"——
+   *   摘除用户名后首个 TEXT 片段开头的「: / ：」（连同前导空格，替换为一个空格维持间隔）；
+   * B（直回复，仅 22.x pb/page 预览出现，22.x 实测每条都带）：首片段即独立冒号头 text" : "，
+   *   随后才是正文/图片——首片段若以「: / ：」开头，摘除冒号；摘完只剩空白则整片段移除
+   *   （纯图回复表现为只剩一个" : "片段，必须移除否则屏幕上孤零零一个冒号）。
+   * 同步修正拼接 text（楼中楼消息通知按内容兜底匹配用到）。
+   * 两条楼中楼解析路径共用：pb 直连（mapSubPostComment→buildFragmentsFromPbContent）
+   * 与 modern 转换（parseModernThreadDetail→buildFragmentsFromContent）。
+   */
+  private stripQuoteColon(result: FragmentsResult): FragmentsResult {
+    const frags: ContentFragment[] = result.fragments;
+    if (frags.length === 0) {
+      return result;
+    }
+    const headText: string = frags[0].text ?? '';
+    if (frags[0].type === ContentFragmentType.TEXT && (headText === '回复' || headText === '回复 ')) {
+      // ---- 形态 A：引用头「回复 某某 :正文」 ----
+      for (let i = 1; i < frags.length; i++) {
+        const f: ContentFragment = frags[i];
+        if (f.type !== ContentFragmentType.TEXT) {
+          continue;
+        }
+        const original: string = f.text ?? '';
+        const stripped: string = original.replace(/^\s*[:：]\s*/, ' ');
+        if (stripped !== original) {
+          f.text = stripped;
+          // 同步拼接 text：定位该片段原文（textParts 对 type=0 文本原样入列，必然逐字出现），
+          // 只替换这一处，避免全局正则误伤用户名或正文里其它冒号
+          const idx: number = result.text.indexOf(original);
+          if (idx >= 0) {
+            result.text = result.text.slice(0, idx) + stripped + result.text.slice(idx + original.length);
+          }
+        }
+        break;
+      }
+      return result;
+    }
+    // ---- 形态 B：无引用头，首 TEXT 片段以冒号开头（22.x pb/page 直回复：" : " 或 "：正文"） ----
+    if (frags[0].type === ContentFragmentType.TEXT) {
+      const original: string = headText;
+      const match: RegExpMatchArray | null = original.match(/^\s*[:：]/);
+      if (match !== null) {
+        const stripped: string = original.slice(match[0].length);
+        if (stripped.trim().length === 0) {
+          // 独立冒号头（" : "）：整片段移除
+          frags.shift();
+        } else {
+          frags[0].text = stripped;
+        }
+        result.text = result.text.replace(/^\s*[:：]\s*/, '');
+      }
+    }
+    return result;
   }
 
   private mapFloorPost(post: PostMessage | undefined, parentFloor: number, pid: string, commentCount: number): FloorItem {
@@ -2139,7 +2850,8 @@ export class TiebaService {
   }
 
   private mapSubPostComment(subPost: SubPostListMessage, parentPid: string, index: number): CommentItem {
-    const contentResult = this.buildFragmentsFromPbContent(subPost.content);
+    // 引用头「回复 某某 :正文」去冒号（楼中楼详细页 / ThreadDetail 楼中楼预览共用此入口之一）
+    const contentResult = this.stripQuoteColon(this.buildFragmentsFromPbContent(subPost.content));
     const author = subPost.author;
     const authorNameBase: string = author?.nameShow ?? author?.name ?? '贴吧用户';
     const authorIdStr: string = `${subPost.authorId ?? author?.id ?? ''}`;
@@ -2168,9 +2880,10 @@ export class TiebaService {
   }
 
   private async requestThreadPage(tid: string, page: number, sortType: number = 0, seeLz: boolean = false, forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = ''): Promise<ModernApiPayload> {
+    // _client_version 用 PB_CLIENT_VERSION（22.x）：12.x 会被服务端把楼中楼图片降级成「[图片]」文本
     const common = ProtoSchema.commonRequest(new Map<string, string | number>([
       ['_client_type', 2],
-      ['_client_version', '12.64.1.1'],
+      ['_client_version', PB_CLIENT_VERSION],
       ['_os_version', '26'],
       ['model', 'HarmonyOS'],
       ['brand', 'Huawei'],
@@ -2203,17 +2916,21 @@ export class TiebaService {
     ]), common);
     const binary = await this.withTimeout(
       HttpClient.postProtoMultipart('https://tiebac.baidu.com/c/f/pb/page?cmd=302001', data, {
-        'User-Agent': 'tieba/12.41.7.1',
+        'User-Agent': PB_USER_AGENT,
         'Accept': 'application/octet-stream',
         'X-BD-DATA-TYPE': 'protobuf',
         'Client-Type': '2',
         'Charset': 'UTF-8',
         'Referer': 'https://tieba.baidu.com/'
       }),
-      2000,
+      // 2000 → 6000（2026-09-19）：2s 是从 fetchForumThreads 三级降级链抄来的口径，
+      // 但详情页的降级目标是 web 通道（更慢、更不可靠）。首页快速滑动积压大量在途请求时，
+      // 详情请求常被 2s 误砍 → 绕 web 兜底 → 又慢又可能拿到空壳，改为 6s。
+      6000,
       'detail proto'
     );
-    const decoded = TiebaProtoDecoder.decodePbPageResponse(binary);
+    // 2026-09-20 性能优化：解码下沉 taskpool worker（理由见 decodePbPageOffMain），主线程不再被逐字段解析阻塞
+    const decoded = await this.decodePbPageOffMain(binary);
     const errorCode = decoded.error?.errorCode ?? 0;
     if (errorCode !== 0) {
       throw new Error(decoded.error?.userMsg ?? decoded.error?.errorMsg ?? `贴吧详情接口错误 ${errorCode}`);
@@ -2500,8 +3217,14 @@ export class TiebaService {
     };
   }
 
-  // 后台异步补齐作者身份（昵称/头像/等级等）：不阻塞详情首屏渲染，补齐后通过回调合并结果
+  // 后台异步补齐作者身份（昵称/头像/等级等）：不阻塞详情首屏渲染，补齐后通过回调合并结果。
+  // 无回调（如详情预取路径）表示本轮补齐结果无人消费：直接返回，省掉一次整页 HTML 请求与全页解析，
+  // 页面侧命中合流时会按 needsWebIdentityHydration 自行补做，观感不变。
   private async hydrateThreadIdentity(mobile: ThreadDetailResult, tid: string, page: number, onDone?: (result: ThreadDetailResult) => void): Promise<void> {
+    const callback: ((result: ThreadDetailResult) => void) | undefined = onDone;
+    if (callback === undefined || callback === null) {
+      return;
+    }
     try {
       const identityHtml = await HttpClient.get(`${API.THREAD}${encodeURIComponent(tid)}?pn=${page}`, {
         'Accept': 'text/html,application/xhtml+xml',
@@ -2509,9 +3232,7 @@ export class TiebaService {
       });
       const webIdentity = this.parseThreadDetail(identityHtml, tid, page);
       const merged = this.mergeThreadIdentity(mobile, webIdentity);
-      if (onDone !== undefined && onDone !== null) {
-        onDone(merged);
-      }
+      callback(merged);
     } catch (e) {
       // 身份补齐失败：保留移动接口正文数据，静默忽略
     }
@@ -2564,7 +3285,8 @@ export class TiebaService {
         : this.displayAuthor(record.author);
       const rawComments: ModernSubPostRecord[] = record.sub_post_list ?? record.subPostList ?? [];
       const comments: CommentItem[] = rawComments.map((comment: ModernSubPostRecord, commentIndex: number): CommentItem => {
-        const commentContent = this.buildFragmentsFromContent(comment.content);
+        // 引用头「回复 某某 :正文」去冒号（ThreadDetail 内联楼中楼预览走此入口）
+        const commentContent = this.stripQuoteColon(this.buildFragmentsFromContent(comment.content));
         const commentAuthorId: string = `${comment.author_id ?? comment.author?.id ?? ''}`;
         const cachedCommentName: string | undefined = (commentAuthorId.length > 0 && this.authorNickProfileConfirmed.has(commentAuthorId))
           ? this.authorNickCache.get(commentAuthorId)
@@ -2725,8 +3447,14 @@ export class TiebaService {
     const images: string[] = [];
     for (const item of contentList ?? []) {
       const type: number = item.type ?? 0;
-      const rawUrl2: string = item.origin_src ?? item.big_cdn_src ?? item.cdn_src ?? item.src ?? item.big_src ?? '';
+      const imgCands2: string[] = [
+        item.big_cdn_src ?? '', item.cdn_src ?? '', item.origin_src ?? '',
+        item.src ?? '', item.big_src ?? '', ''
+      ];
+      const pickedUrl2: string = TiebaService.pickImageUrl(imgCands2);
+      const rawUrl2: string = TiebaService.rewriteUrlWidth(pickedUrl2, TiebaService.CARD_IMG_WIDTH);
       const imageUrl: string = this.normalizeUrl(rawUrl2);
+      TiebaService.logImagePick(pickedUrl2, rawUrl2, imgCands2);
       const memePicUrl: string = this.normalizeUrl(item.meme_pic_url ?? '');
       const memePackageUrl: string = this.resolveMemePackageUrl(item.meme_pck_id, item.meme_pic_id);
       const cFieldUrl: string = this.resolveCFieldEmojiUrl(item.c ?? '');
@@ -3030,7 +3758,32 @@ export class TiebaService {
       // Protobuf failed, try next
     }
 
-    // Priority 2: Try search results HTML (works for any forum, followed or not)
+    // Priority 2: 全吧搜索（PC 网页端点 /mo/q/search/forum，带吧头像；exactMatch + fuzzyMatch
+    // 精确名匹配）。2026-09-22 实测：优先级 3/4 的两个 PC HTML 页面已改版为 CSR 空壳
+    // （<div id="app">），对任何吧都抓不到头像，本端点是协议接口之外唯一存活的头像来源
+    // （PC 直连验证：刃牙/遐蝶均返回 exactMatch 头像 URL 且可下载为真图）。
+    try {
+      const searchData = await this.searchForumGlobal(forumName, 1, 5);
+      let searchAvatar: string = '';
+      if (searchData.exact !== null && searchData.exact.forumName === forumName
+        && searchData.exact.avatar.length > 0) {
+        searchAvatar = searchData.exact.avatar;
+      }
+      if (searchAvatar.length === 0) {
+        const hit: GlobalForumResult | undefined = searchData.list.find(
+          (f: GlobalForumResult): boolean => f.forumName === forumName && f.avatar.length > 0);
+        if (hit !== undefined) {
+          searchAvatar = hit.avatar;
+        }
+      }
+      if (searchAvatar.length > 0) {
+        return this.normalizeForumAvatar(searchAvatar);
+      }
+    } catch (e) {
+      // Search endpoint failed, try next
+    }
+
+    // Priority 3: Try search results HTML (works for any forum, followed or not)
     try {
       const searchUrl = `${API.SEARCH_FORUM}${encodeURIComponent(forumName)}`;
       const html = await HttpClient.get(searchUrl, {
@@ -3045,7 +3798,7 @@ export class TiebaService {
       // Search failed
     }
 
-    // Priority 3: Try forum page HTML scraping
+    // Priority 4: Try forum page HTML scraping
     try {
       const forumUrl = `${API.FORUM_THREADS}${encodeURIComponent(forumName)}`;
       const html = await HttpClient.get(forumUrl, {
@@ -4586,6 +5339,10 @@ export class TiebaService {
         }
       }
     }
+    if (exact === null && list.length === 0) {
+      // 空结果时留一条原始响应（截断），便于区分「服务端无结果」与「风控空结果（blank_type）」
+      hilog.info(0x0000, TiebaService.TAG, '[GSEARCH-F] empty resp=%{public}s', resp.substring(0, 600));
+    }
     return {
       exact,
       list,
@@ -4964,6 +5721,10 @@ export class TiebaService {
         }
       }
     }
+    if (exact === null && list.length === 0) {
+      // 空结果时留一条原始响应（截断），便于区分「服务端无结果」与「风控空结果（blank_type）」
+      hilog.info(0x0000, TiebaService.TAG, '[GSEARCH-U] empty resp=%{public}s', resp.substring(0, 600));
+    }
     return {
       exact,
       list,
@@ -4991,11 +5752,25 @@ export class TiebaService {
     const query: string = keys.map((key: string): string =>
       `${encodeURIComponent(key)}=${encodeURIComponent(form[key])}`).join('&');
     const url: string = `${TIEBA_BASE}/mo/q/search/${path}?${query}&sign=${sign}`;
-    const resp: string = await HttpClient.get(url, {
+    const headers: Record<string, string> = {
       'Accept': 'application/json, text/plain, */*',
       'Referer': `${TIEBA_BASE}/f/search/res?ie=utf-8&qw=${encodeURIComponent(form['word'])}`,
       'User-Agent': 'Mozilla/5.0 (Linux; Android 12; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    });
+    };
+    // 游客态请求（withCookie=false）：不注入登录态 Cookie。
+    // 2026-09-22 复核：搜吧/搜人端点 PC 直连（含任意/无 Cookie）均返回完整数据，
+    // App 内恒空——HttpClient 默认注入「真实 BDUSS 但无 STOKEN」的登录态 Cookie，
+    // 该组合在浏览器登录态中不存在（BDUSS 与 STOKEN 恒成对下发），命中 web 端点风控
+    // → success + 空结果（与搜贴端点 2026-09-14 的 blank_type:1 同款死法，仅选择性拦截）。
+    let resp: string = await HttpClient.get(url, headers, false);
+    // 反爬兜底：游客态仍被判空（blank_type:1）时，换 NetworkKit http 网络栈（独立于 rcp 指纹）重试一次
+    if (/"blank_type"\s*:\s*1/.test(resp)) {
+      hilog.info(0x0000, TiebaService.TAG, '[GSEARCH] rcp blank_type path=%{public}s → http-stack retry', path);
+      const retried: string | null = await HttpClient.httpStackGet(url, headers);
+      if (retried !== null && retried.trim().length > 0) {
+        resp = retried;
+      }
+    }
     const trimmed: string = resp.trim();
     if (trimmed.length === 0) {
       throw new Error('搜索服务无响应，请稍后重试');

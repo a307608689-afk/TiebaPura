@@ -17,11 +17,13 @@
  */
 
 import { common } from '@kit.AbilityKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { display, LengthMetrics } from '@kit.ArkUI';
 import { picker, fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { CacheManager } from '../cache/CacheManager';
+import { ImageCache } from '../cache/ImageCache';
 import { CACHE_KEY } from '../common/Constants';
 import { CategoryMapping, FavCategory, FolderItem, PostCardItem, PersonalContentItem, PinRecord } from '../model/DataModel';
 import { TiebaService } from '../service/TiebaService';
@@ -35,6 +37,7 @@ import { ToastUtil, ToastType } from '../common/ToastUtil';
 import { Haptic } from '../common/Haptic';
 import { ShareUtil } from '../common/ShareUtil';
 import { compareByName } from '../common/Pinyin';
+import { PrefetchGate } from '../common/PrefetchGate';
 
 enum FavCategoryTab {
   Forums = 0,
@@ -1165,9 +1168,35 @@ export struct FavoriteTab {
   private panelCategoryScroller: Scroller = new Scroller();
   /** §4.3 改动六 B 二次更正：分类内帖子排序面板独立 Scroller（WaterFlow 不支持 List 拖拽 → 帖子排序同收面板） */
   private panelThreadScroller: Scroller = new Scroller();
+  /** 分类内帖子列表滚动容器（多列档 Scroll / 单列档 List 共用；同一时刻只挂载其一）：
+   *  剩余距离预取必须读 `currentOffset()` 真值，故两个分支都要把 Scroller 传进去 */
+  private threadScroller: Scroller = new Scroller();
   private lastAutoScrollTime: number = 0;
   // v1.13 加载冷却：内容不足一屏时 onReachEnd 会连续触发，加冷却避免"不断加载中"刷屏
   private lastLoadMoreAt: number = 0;
+  // ===== 帖子列表预加载（2026-09-19，docs/帖子预加载.md §2 / §4.2）=====
+  /** 预加载阈值（vp）：滚动到「距内容底部剩余距离 < 该值」时提前静默加载下一页 */
+  private static readonly THREAD_PREFETCH_DISTANCE: number = 1000;
+  /** 预加载触发的最小滚动增量（vp）：同一屏内只触发一次（节流） */
+  private static readonly THREAD_PREFETCH_THROTTLE: number = 120;
+  /**
+   * 视口高 / 内容高（vp）：Scroll + Column 全量渲染分支由 onAreaChange 实测（内容高天然可得）；
+   * List 单列分支无内容总高接口 → 折算（见 estimatedThreadContentH）。
+   * 均为普通字段（非 @State）：onScroll / onAreaChange 属高频回调，写入 @State 会触发整树重建。
+   */
+  private threadViewportH: number = 0;
+  private threadContentH: number = 0;
+  /**
+   * 剩余距离预取闸门（2026-09-19 口径修正）：偏移只取 `Scroller.currentOffset()` 真值，
+   * 不再用 `onScroll` 回调入参（其语义在工具链间有差异，会把剩余距离算成恒小于阈值的错值，
+   * 表现为「每滚一下都翻页」或「滑到底空一段才加载」）。判定 + 节流统一收口在 common/PrefetchGate.ets。
+   */
+  private threadPrefetchGate: PrefetchGate =
+    new PrefetchGate(FavoriteTab.THREAD_PREFETCH_DISTANCE, 'Favorite', FavoriteTab.THREAD_PREFETCH_THROTTLE);
+  /** 几何来源探针是否已打印（每会话仅一条）：真机自证内容高是「实测」还是「折算」、折算参数是多少 */
+  private threadContentSrcNoted: boolean = false;
+  /** 请求代际：首页拉取（fetchPage(isFirst=true)）自增，作废在途的「加载更多」结果，防旧页拼到新列表 */
+  private threadLoadToken: number = 0;
   /** 进入页静默刷新的最小间隔（ms）：防切换动画期间/快速来回切 Tab 引发的请求风暴（2026-09-17） */
   private static readonly ENTER_REFRESH_MIN_GAP_MS: number = 3000;
   private lastEnterRefreshAt: number = 0;
@@ -1182,7 +1211,8 @@ export struct FavoriteTab {
   private avatarFailed: Set<string> = new Set<string>();
   private avatarQueue: string[] = [];
   private avatarInFlight: number = 0;
-  private avatarDirty: boolean = false;
+  // 会话级重试白名单：渲染失败（坏文件）时允许每个吧重试一次，杜绝整页永久停在首字占位（2026-09-23）
+  private avatarRetried: string[] = [];
   // v1.17 性能：吧内最大收藏时间键预计算缓存（重建一次 O(T)，folderTimeOf 查表 O(1)，
   // 避免 rebuildFolders 对每个吧实时遍历全部帖子 O(吧×帖) 造成主线程卡顿）
   private threadTimeCache: Map<string, number> = new Map<string, number>();
@@ -1198,6 +1228,9 @@ export struct FavoriteTab {
   private static readonly SYNC_PAGE_DELAY_MS: number = 300;
   private static readonly SYNC_MAX_PAGES: number = 100;
   private static readonly SYNC_FLUSH_STEP: number = 20;
+  // 旧版吧头像映射键（Preferences 里的「吧名 → file://」表）。2026-09-23 起头像改为持久头像文件
+  // （cacheDir/avatar_cache 显示 + filesDir/avatar_cache 备份，文件名由吧名哈希推导，文件系统即真相），
+  // 本键仅供一次性迁移读取后删除。
   private static readonly AVATAR_CACHE_KEY: string = 'fav_avatar_map';
   // v1.8 拖拽排序：自定义分类 List 前置固定项数（占位 + 新建卡 + 未分类卡），拖拽索引转换用
   private static readonly CAT_LIST_PREPEND: number = 3;
@@ -1280,7 +1313,7 @@ export struct FavoriteTab {
         return;
       }
       this.notLoggedIn = false;
-      await this.loadAvatarCache();
+      await this.migrateLegacyAvatarCache();
       await this.loadSyncMeta();
       this.pinnedFolders = await FavoriteStore.getInstance().loadPinnedFolders(this.accountId);
       this.pinnedThreads = await FavoriteStore.getInstance().loadPinnedThreads(this.accountId);
@@ -1338,7 +1371,19 @@ export struct FavoriteTab {
 
   /** 拉取云端收藏分页并合并本地缓存（增量聚合，严禁全量拉取） */
   private async fetchPage(offset: number, isFirst: boolean): Promise<void> {
+    // 预加载防竞态（2026-09-19）：首页拉取即递增代际，作废在途的「加载更多」结果
+    // （下拉刷新 / 重载期间旧页 concat 到新列表会造成重复与错序）；加载更多自身在 await 后校验代际。
+    if (isFirst) {
+      this.threadLoadToken++;
+      // 首屏/刷新：列表整体换新（偏移归零、条数重置），旧节流基线无意义
+      this.threadPrefetchGate.reset();
+      this.threadContentSrcNoted = false;
+    }
+    const myToken: number = this.threadLoadToken;
     const cloud = await TiebaService.getInstance().fetchCollectedThreads(this.accountId, offset, this.pageSize);
+    if (myToken !== this.threadLoadToken) {
+      return;
+    }
     let base: PersonalContentItem[] = [];
     if (isFirst) {
       const cachedRaw = await CacheManager.getInstance().get(`${CACHE_KEY.PERSONAL_COLLECTED}_${this.accountId}`);
@@ -1393,7 +1438,7 @@ export struct FavoriteTab {
     group.forEach((count: number, name: string) => {
       list.push({
         forumName: name,
-        avatarUrl: this.avatarCache.get(name) ?? '',
+        avatarUrl: this.avatarUrlOf(name),
         threadCount: count,
         pinned: pinMap.has(name),
         pinnedAt: pinMap.get(name) ?? 0,
@@ -1483,29 +1528,50 @@ export struct FavoriteTab {
     }
   }
 
-  /** 从本地缓存恢复吧头像映射（避免进程重启后对全部吧重新请求触发风控） */
-  private async loadAvatarCache(): Promise<void> {
+  /**
+   * 旧版头像映射（Preferences 内的 file:// 路径表）一次性迁移：把 img_cache 里仍存在的头像
+   * 文件固化到持久头像目录（cacheDir/avatar_cache + filesDir 备份），随后删除旧键。
+   * 2026-09-23 起头像持久性不再依赖 img_cache（会被 prune / 系统清缓存删掉），也不再需要
+   * Preferences 映射表 —— 头像文件名由吧名哈希直接推导，文件系统自身就是真相。
+   */
+  private async migrateLegacyAvatarCache(): Promise<void> {
     try {
       const raw = await CacheManager.getInstance().get(FavoriteTab.AVATAR_CACHE_KEY);
-      if (raw) {
-        const map = JSON.parse(raw) as Record<string, string>;
-        for (const key of Object.keys(map)) {
-          if (map[key].length > 0) {
-            this.avatarCache.set(key, map[key]);
+      if (!raw) {
+        return;
+      }
+      const map = JSON.parse(raw) as Record<string, string>;
+      let migrated: number = 0;
+      for (const key of Object.keys(map)) {
+        const v: string = map[key];
+        if (v.length > 0 && v.startsWith('file://') && ImageCache.getPersistedAvatarPath(key) === null) {
+          if (ImageCache.persistAvatar(key, v).length > 0) {
+            migrated++;
           }
         }
       }
+      await CacheManager.getInstance().delete(FavoriteTab.AVATAR_CACHE_KEY);
+      hilog.info(0x0000, 'Favorite', '[AVATAR] legacy map migrated=%{public}d', migrated);
     } catch (e) {
-      // 解析失败忽略，走内存缓存
+      // 迁移失败忽略：头像走常规「搜索 + 下载」路径，功能不受影响
     }
   }
 
-  private saveAvatarCache(): void {
-    const obj: Record<string, string> = {};
-    this.avatarCache.forEach((v: string, k: string) => {
-      obj[k] = v;
-    });
-    CacheManager.getInstance().put(FavoriteTab.AVATAR_CACHE_KEY, JSON.stringify(obj)).catch(() => {});
+  /**
+   * 渲染期头像地址解析（同步、零网络）：内存映射优先 → 持久头像文件（存在即命中，
+   * 进页首帧就是真头像）→ 空串（显示吧名首字，由 rebuildFolders 的宏任务入队补齐）。
+   */
+  private avatarUrlOf(forumName: string): string {
+    const hit: string | undefined = this.avatarCache.get(forumName);
+    if (hit !== undefined) {
+      return hit;
+    }
+    const persisted: string | null = ImageCache.getPersistedAvatarPath(forumName);
+    if (persisted !== null) {
+      this.avatarCache.set(forumName, persisted);
+      return persisted;
+    }
+    return '';
   }
 
   /** 头像加载入队（在途去重 + 失败标记，重复触发与并发风暴均被拦截） */
@@ -1535,40 +1601,90 @@ export struct FavoriteTab {
         this.drainAvatarQueue();
       });
     }
-    if (this.avatarInFlight === 0 && this.avatarQueue.length === 0 && this.avatarDirty) {
-      this.avatarDirty = false;
-      this.saveAvatarCache();
-    }
+    // 头像固化落盘由 ImageCache.persistAvatar 在每个吧成功时即时完成（不再依赖整条队列清空后统一写）
   }
 
   /** 异步填充吧头像（失败走首字占位，本次会话不重试避免风暴）
    *  v1.17 成功回填改为局部更新对应卡片（不再整表 rebuildFolders），
-   *  避免 N 张头像逐一触发 O(吧×帖) 时间重算与 List 全量重渲染 */
+   *  避免 N 张头像逐一触发 O(吧×帖) 时间重算与 List 全量重渲染
+   *  v1.28 吧头像不再交给 Image 直连 URL —— 贴吧图床对无 UA 请求会返回 HTTP 200 的
+   *  238×238「贴字图」占位（onError 不触发，LOGO 直接上屏）。统一走 ImageCache
+   *  （移动端 UA 下载 + 占位字节/尺寸/灰阶校验 + 镜像域重试）。
+   *  2026-09-23：下载校验后的真图由 ImageCache.ensureAvatar 固化到持久头像目录
+   *  （cacheDir/avatar_cache，另备份 filesDir），此后任意冷启动/重挂载都可同步命中
+   *  （见 avatarUrlOf），不再出现「先首字、等一会才变」，也不会因 img_cache 被清理而整页退化。 */
   private async loadForumAvatar(forumName: string): Promise<void> {
     try {
       const url = await TiebaService.getInstance().fetchForumAvatarByName(forumName);
       if (url.length > 0) {
-        this.avatarCache.set(forumName, url);
-        this.avatarDirty = true;
-        const idx: number = this.folders.findIndex((f: FolderItem): boolean => f.forumName === forumName);
-        if (idx >= 0) {
-          const cur: FolderItem = this.folders[idx];
-          const next: FolderItem[] = this.folders.slice();
-          next[idx] = {
-            forumName: cur.forumName,
-            avatarUrl: url,
-            threadCount: cur.threadCount,
-            pinned: cur.pinned,
-            pinnedAt: cur.pinnedAt,
-          };
-          this.folders = next;
+        const resolved = await ImageCache.ensureAvatar(forumName, url);
+        if (resolved.length > 0) {
+          this.avatarCache.set(forumName, resolved);
+          const idx: number = this.folders.findIndex((f: FolderItem): boolean => f.forumName === forumName);
+          if (idx >= 0) {
+            const cur: FolderItem = this.folders[idx];
+            const next: FolderItem[] = this.folders.slice();
+            next[idx] = {
+              forumName: cur.forumName,
+              avatarUrl: resolved,
+              threadCount: cur.threadCount,
+              pinned: cur.pinned,
+              pinnedAt: cur.pinnedAt,
+            };
+            this.folders = next;
+          }
+        } else {
+          // 占位图确认 / 下载网络失败 → 首字占位（本次会话不重试）
+          hilog.warn(0x0000, 'Favorite', '[AVATAR] unresolved name=%{public}s url=%{public}s', forumName, url);
+          this.avatarFailed.add(forumName);
         }
       } else {
+        hilog.warn(0x0000, 'Favorite', '[AVATAR] fetch empty name=%{public}s', forumName);
         this.avatarFailed.add(forumName);
       }
     } catch (e) {
+      hilog.warn(0x0000, 'Favorite', '[AVATAR] fetch exception name=%{public}s err=%{public}s',
+        forumName, JSON.stringify(e));
       this.avatarFailed.add(forumName);
     }
+  }
+
+  /**
+   * 头像渲染期失败兜底（持久文件被删 / 损坏等）：清出坏条目 + 删除坏文件 + 回退首字，
+   * 并允许每个吧在当前会话内重试一次（重新搜索 + 下载固化）——否则一处坏文件会让该吧
+   * 在本会话内永久停在首字占位（2026-09-23）。仅处理吧分类收纳夹卡片（folders 为 @State 可驱动重渲染）。
+   */
+  private handleAvatarRenderError(forumName: string): void {
+    const had: boolean = this.avatarCache.has(forumName);
+    this.avatarCache.delete(forumName);
+    ImageCache.discardPersistedAvatar(forumName);
+    const idx: number = this.folders.findIndex((f: FolderItem): boolean => f.forumName === forumName);
+    if (idx >= 0) {
+      const cur: FolderItem = this.folders[idx];
+      const next: FolderItem[] = this.folders.slice();
+      next[idx] = {
+        forumName: cur.forumName,
+        avatarUrl: '',
+        threadCount: cur.threadCount,
+        pinned: cur.pinned,
+        pinnedAt: cur.pinnedAt,
+      };
+      this.folders = next;
+    }
+    if (had && this.avatarRetried.indexOf(forumName) < 0) {
+      this.avatarRetried.push(forumName);
+      this.avatarFailed.delete(forumName);
+      this.enqueueAvatarLoad(forumName);
+    } else {
+      this.avatarFailed.add(forumName);
+    }
+  }
+
+  /** 丢弃某吧头像缓存（含持久文件）并标记本次会话不再重试（20vp 徽标等非主显示路径用） */
+  private dropAvatarEntry(forumName: string): void {
+    this.avatarCache.delete(forumName);
+    ImageCache.discardPersistedAvatar(forumName);
+    this.avatarFailed.add(forumName);
   }
 
   /** 吧内帖子列表（本地过滤 + 排序降级 + 置顶恒顶） */
@@ -1775,7 +1891,7 @@ export struct FavoriteTab {
     }
   }
 
-  private async loadMore(): Promise<void> {
+  private async loadMore(silent: boolean = false): Promise<void> {
     if (this.loading || this.loadingMore || !this.hasMore) {
       return;
     }
@@ -1789,10 +1905,68 @@ export struct FavoriteTab {
     try {
       await this.fetchPage(this.allThreads.length, false);
     } catch (e) {
-      this.toast('更多收藏加载失败，请稍后重试', ToastType.Error);
+      // 预加载（silent）失败静默丢弃，不打断浏览；手动触底仍提示
+      if (!silent) {
+        this.toast('更多收藏加载失败，请稍后重试', ToastType.Error);
+      }
     } finally {
       this.loadingMore = false;
     }
+  }
+
+  /**
+   * 帖子列表预加载（2026-09-19，docs/帖子预加载.md §2/§4.2）：滚动到「距内容底部剩余距离 < THREAD_PREFETCH_DISTANCE」
+   * 时提前静默加载下一页，让追加落在视口下方、在用户滑到底部边界之前完成（避免边界回弹瞬间插入新内容造成抽搐）。
+   * onReachEnd 保留作兜底（列表不满一屏等）。
+   *
+   * 2026-09-19 口径修正：偏移**只取 `Scroller.currentOffset()` 真值**，不再用 `onScroll` 回调入参 ——
+   * 其语义在工具链 / 组件类型间存在差异（Scroll 上曾观测到帧增量语义），一旦不是绝对偏移，
+   * 「剩余距离」就会算成恒小于阈值的错值。判定 + 节流现统一收口在 common/PrefetchGate.ets（单点维护）。
+   * 内容高来源：Scroll + Column 全量渲染分支由 onAreaChange 实测；List 单列分支无内容总高接口 → 折算。
+   */
+  private onFavoriteThreadScroll(_x: number, _y: number): void {
+    if (this.loading || this.loadingMore || !this.hasMore) {
+      return;
+    }
+    const contentH: number = this.favColumns() > 1 ? this.threadContentH : this.estimatedThreadContentH();
+    if (this.threadPrefetchGate.should(PrefetchGate.absoluteY(this.threadScroller), contentH, this.threadViewportH)) {
+      this.loadMore(true);
+    }
+  }
+
+  /** 视口尺寸变化：挂在滚动容器（Scroll / List 单列）上，记录视口高（普通字段，避免触发整树重建） */
+  private onFavoriteViewportAreaChange(_old: Area, n: Area): void {
+    this.threadViewportH = n.height as number;
+  }
+
+  /** 内容尺寸变化：Scroll + Column 分支挂在内容 Column 上，实测内容总高（含顶部占位与底部留白） */
+  private onFavoriteContentAreaChange(_old: Area, n: Area): void {
+    const h: number = n.height as number;
+    if (h > 0) {
+      this.threadContentH = h;
+    }
+    // 真机自证：多列档几何来源（每会话一条；onAreaChange 属高频回调，不能条条打印）
+    if (!this.threadContentSrcNoted && this.threadContentH > 0 && this.threadViewportH > 0 && this.favColumns() > 1) {
+      this.threadContentSrcNoted = true;
+      this.threadPrefetchGate.noteGeometry('measured(columns)', this.threadContentH, this.threadViewportH);
+    }
+  }
+
+  /**
+   * List 单列分支内容高折算（vp）：List 是虚拟容器，**自身高恒等于视口高**、无内容总高读取接口，
+   * 故按「每列条数 ×(卡高 + 行距)」折算。口径统一收口在 `PrefetchGate.estimateWaterfallContentH`
+   * （刻意不计顶/底让位 → 折算偏小 → 触发更早，宁可早取不漏取，见 docs/帖子预加载.md §8）。
+   */
+  private estimatedThreadContentH(): number {
+    const cards: PostCardItem[] = this.categoryThreads();
+    const colWidth: number = Math.max(160, this.pageWidth - Spacing.lg * 2);
+    const total: number = PrefetchGate.estimateWaterfallContentH(cards.length, 1, colWidth, Spacing.md);
+    // 真机自证：单列档折算几何（每会话一条，供真机按阈值校准）
+    if (!this.threadContentSrcNoted && this.threadViewportH > 0 && cards.length > 0) {
+      this.threadContentSrcNoted = true;
+      this.threadPrefetchGate.noteGeometry(`estimated(1col/${cards.length}row)`, total, this.threadViewportH);
+    }
+    return total;
   }
 
   // ===== v1.18 自动同步（进页秒开 + 后台补齐 + 变更回流 + 删除/幽灵校正）=====
@@ -3130,8 +3304,14 @@ export struct FavoriteTab {
     .backgroundColor(Theme.bg(this.isDark))
     // §4.3 改动四：根容器实宽 / 实高 → 形态判定与列数（首帧由 aboutToAppear 的 fadeCoverVp 同源取值兜底）
     .onAreaChange((_old: Area, n: Area) => {
-      this.pageWidth = n.width as number;
-      this.pageHeight = n.height as number;
+      const w: number = n.width as number;
+      const h: number = n.height as number;
+      // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期逐帧回调，同值重写 @State 会白触发整树重渲染
+      if (w === this.pageWidth && h === this.pageHeight) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
     })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
@@ -3380,6 +3560,9 @@ export struct FavoriteTab {
             .height(48)
             .borderRadius(24)
             .objectFit(ImageFit.Cover)
+            .onError(() => {
+              this.handleAvatarRenderError(folder.forumName);
+            })
         } else {
           Text(folder.forumName.charAt(0))
             .fontSize(fs(20, this.fontScale))
@@ -3620,12 +3803,16 @@ export struct FavoriteTab {
       if (showForumBadge) {
         Row({ space: 6 }) {
           Stack() {
-            if (this.avatarCache.has(card.forumName)) {
-              Image(this.avatarCache.get(card.forumName) as string)
+            if (this.avatarUrlOf(card.forumName).length > 0) {
+              Image(this.avatarUrlOf(card.forumName))
                 .width(20)
                 .height(20)
                 .borderRadius(10)
                 .objectFit(ImageFit.Cover)
+                .onError(() => {
+                  // v1.28：本地缓存文件失效时清出坏条目（徽标为 20vp 小图，不单独驱动重渲染）
+                  this.dropAvatarEntry(card.forumName);
+                })
             } else {
               Text(card.forumName.charAt(0))
                 .fontSize(fs(9, this.fontScale))
@@ -4398,7 +4585,7 @@ export struct FavoriteTab {
           // 真机修复（2026-09-14，floor-vanish 同源）：WaterFlow → Scroll + Column 全量渲染（同 ForumThreadsView）；
           // 分页改 Scroll.onReachEnd 驱动（文档 §5：全量渲染下懒回收哨兵失效，必须用滚动容器自身触底回调）；
           // padding / 渐显遮罩 / 沉浸挂 Scroll 本身（与原 List 同口径，包裹 Column 方案真机驳回：遮罩漏边 + 盖内容）
-          Scroll() {
+          Scroll(this.threadScroller) {
             Column({ space: Spacing.md }) {
               Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
               this.PostColumnsBlock(this.categoryThreads(), true)
@@ -4410,6 +4597,8 @@ export struct FavoriteTab {
               Column().width('100%').height(90)
             }
             .width('100%')
+            // 全量渲染 → 内容总高可实测，供剩余距离预加载定位阈值
+            .onAreaChange((_old: Area, n: Area) => { this.onFavoriteContentAreaChange(_old, n); })
           }
           .width('100%')
           .layoutWeight(1)
@@ -4419,6 +4608,10 @@ export struct FavoriteTab {
           .align(Alignment.TopStart)
           .edgeEffect(EdgeEffect.Spring)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          // 剩余距离预加载（docs/帖子预加载.md §2/§4.2）：距底 < THREAD_PREFETCH_DISTANCE 提前静默取下一页；
+          // onReachEnd 保留作兜底（列表不满一屏等）。偏移真值取 threadScroller.currentOffset()（见 PrefetchGate）
+          .onScroll((_x: number, _y: number) => { this.onFavoriteThreadScroll(_x, _y); })
+          .onAreaChange((_old: Area, n: Area) => { this.onFavoriteViewportAreaChange(_old, n); })
           .onReachEnd(() => {
             if (this.categoryThreads().length === 0) {
               return;
@@ -4427,7 +4620,7 @@ export struct FavoriteTab {
           })
         }
       } else {
-      List({ space: Spacing.md }) {
+      List({ space: Spacing.md, scroller: this.threadScroller }) {
         ListItem() {
           Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
         }
@@ -4479,6 +4672,10 @@ export struct FavoriteTab {
       .scrollBar(BarState.Off)
       .clip(false)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      // 剩余距离预加载（docs/帖子预加载.md §2/§4.2）：单列 List 无内容总高接口 → 折算（estimatedThreadContentH）；
+      // onReachEnd 保留作兜底（列表不满一屏等）。偏移真值取 threadScroller.currentOffset()（见 PrefetchGate）
+      .onScroll((_x: number, _y: number) => { this.onFavoriteThreadScroll(_x, _y); })
+      .onAreaChange((_old: Area, n: Area) => { this.onFavoriteViewportAreaChange(_old, n); })
       .onReachEnd(() => {
         if (this.categoryThreads().length === 0) {
           return;

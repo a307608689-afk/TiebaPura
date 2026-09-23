@@ -47,6 +47,21 @@ const SUBPOST_OFFICIAL_TITLE_BAR: boolean = true;
 const SUBPOST_TITLE_BAR_HEIGHT: number = 98;
 
 /**
+ * 「帖子沉浸式阅读」（设置 → 个性化，AppStorage `immersiveReading`，2026-09-18）——
+ * 楼中楼详细页只隐藏**顶栏（吧名胶囊 + 返回钮）**，本页无底部悬浮层，故无底栏侧逻辑。
+ * 阈值与帖子详细页（ThreadDetail.ets 同名常量）**逐项同源**，改一处须两处同步：
+ * 向下累计 24vp 藏起 / 向上累计 12vp 恢复（不对称，上滑更容易唤出）。
+ */
+const SUBPOST_IMMERSIVE_HIDE_DIST: number = 24;
+const SUBPOST_IMMERSIVE_REVEAL_DIST: number = 12;
+/** 置顶保护（vp）：滚动位置 ≤ 该值（含顶部回弹负值）恒显示，用户 2026-09-18 明确要求 */
+const SUBPOST_IMMERSIVE_TOP_KEEP: number = 8;
+/** 跳变保护（vp）：超过该值视为命令式定位（消息楼层 scrollTo）/ 形态切换，丢弃本次方向判定 */
+const SUBPOST_IMMERSIVE_JUMP_LIMIT: number = 240;
+/** 显隐动画时长（ms）：与 ThreadDetail 同值 */
+const SUBPOST_IMMERSIVE_ANIM_MS: number = 220;
+
+/**
  * 平板适配 §4.10 SP-I：横屏分栏时的**左栏固定宽度**（vp）=「帖子本身宽度」，
  * 与 §4.9 DT-I 同口径（420 为推荐值，备选 368 = 宫格自然宽 336 + 卡片内边距 32）。
  */
@@ -123,9 +138,26 @@ struct SubPostDetail {
    * 避免旋转过程中宽高每帧变化引发多次全量重建（「切换卡一下」的主要成本）。
    */
   @State isSplit: boolean = false;
+  // ===== 「帖子沉浸式阅读」（设置 → 个性化，2026-09-18）=====
+  /** 设置项真源：AppStorage `immersiveReading`（UsageHabitsManager 冷启动恢复 / 设置页写入），默认关 */
+  @StorageLink('immersiveReading') @Watch('onImmersiveReadingChanged') immersiveReading: boolean = false;
+  /**
+   * 沉浸态：true = 顶栏（吧名胶囊 + 返回钮）已藏起。
+   * **只存页面局部 @State，绝不写 AppStorage** —— 写全局会让切页 / 换楼层残留隐藏态（文档 §6.1 D1 类风险）。
+   */
+  @State immersiveHidden: boolean = false;
+  /** 同方向滚动累计量（vp，私有，不参与渲染 —— 逐帧写 @State 会在高刷档掉帧） */
+  private immersiveAccum: number = 0;
+  /** 上一次滚动位置（vp）：增量自算 */
+  private immersiveLastY: number = 0;
+  /** 滚动位置是否已初始化（首帧只记录不判定，避免拿别处残留值算增量） */
+  private immersiveLastReady: boolean = false;
 
   onPageShow(): void {
     this.fontSizeTick++;
+    // 沉浸阅读：返回本页（含从链接页 / 楼层详情返回）复位为「顶栏可见」，并丢弃旧滚动基线
+    // （子页返回后滚动位置可能被消息定位改过，拿旧基线算增量会误藏）
+    this.resetImmersive();
   }
 
   // ===== 平板适配判据（§4.10 SP-A）=====
@@ -170,6 +202,83 @@ struct SubPostDetail {
     return this.isWideFormDevice && this.currentWidth >= Breakpoint.sm && this.isLandscape();
   }
 
+  // ===== 「帖子沉浸式阅读」交互（2026-09-18）=====
+
+  /** 顶栏隐藏位移（vp，向上）：= 官方标题栏高(98) + 余量，保证整行移出屏幕上沿 */
+  private immersiveTopSink(): number {
+    return -(SUBPOST_TITLE_BAR_HEIGHT + 16);
+  }
+
+  /**
+   * 楼中楼页滚动 → 顶栏（吧名胶囊 + 返回钮）沉浸显隐判定。挂点 = 内容主滚动区
+   * （竖屏 Scroll / 横屏分栏右栏，共用 `this.scroller`）；左栏父楼层卡不挂（通常不满一屏，
+   * 且与右栏共用累计器会互相污染基线）。
+   * 规则与 ThreadDetail.onDetailScroll 逐项同源：24 藏 / 12 露不对称阈值 + 置顶 8 恒显示 + 跳变 240 丢弃。
+   */
+  private onSubPostScroll(_x: number, _y: number): void {
+    if (!this.immersiveReading) {
+      return;
+    }
+    let pos: number = this.immersiveLastY;
+    try {
+      pos = this.scroller.currentOffset().yOffset;
+    } catch (e) {
+      return;
+    }
+    if (!this.immersiveLastReady) {
+      this.immersiveLastY = pos;
+      this.immersiveLastReady = true;
+      return;
+    }
+    const delta: number = pos - this.immersiveLastY;
+    this.immersiveLastY = pos;
+    if (delta === 0) {
+      return;
+    }
+    // 置顶保护：在最顶部（含回弹负值）恒显示，本页唯一返回入口不能消失
+    if (pos <= SUBPOST_IMMERSIVE_TOP_KEEP) {
+      this.immersiveAccum = 0;
+      if (this.immersiveHidden) {
+        this.immersiveHidden = false;
+      }
+      return;
+    }
+    // 跳变保护：消息楼层定位 scrollTo / 旋转分栏切换不参与方向判定
+    if (Math.abs(delta) > SUBPOST_IMMERSIVE_JUMP_LIMIT) {
+      this.immersiveAccum = 0;
+      return;
+    }
+    if (delta > 0) {
+      this.immersiveAccum = this.immersiveAccum > 0 ? this.immersiveAccum + delta : delta;
+      if (!this.immersiveHidden && this.immersiveAccum >= SUBPOST_IMMERSIVE_HIDE_DIST) {
+        this.immersiveHidden = true;
+        this.immersiveAccum = 0;
+      }
+    } else {
+      this.immersiveAccum = this.immersiveAccum < 0 ? this.immersiveAccum + delta : delta;
+      if (this.immersiveHidden && this.immersiveAccum <= -SUBPOST_IMMERSIVE_REVEAL_DIST) {
+        this.immersiveHidden = false;
+        this.immersiveAccum = 0;
+      }
+    }
+  }
+
+  /** 复位沉浸态（展开顶栏）。返回本页、关闭开关两处调用；`immersiveLastReady` 一并清掉防误藏 */
+  private resetImmersive(): void {
+    this.immersiveAccum = 0;
+    this.immersiveLastReady = false;
+    if (this.immersiveHidden) {
+      this.immersiveHidden = false;
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即复位，避免页面停留在隐藏态 */
+  onImmersiveReadingChanged(): void {
+    if (!this.immersiveReading) {
+      this.resetImmersive();
+    }
+  }
+
   /**
    * 形态切换平滑化（2026-09-13 二次优化 —— 消除「闪一下」，与 §4.9 同款）。
    * 三段全动画：① 淡出 100ms → ② 内容不可见时才切 `isSplit`（全量重建看不见）→ ③ 淡入 160ms。
@@ -198,6 +307,32 @@ struct SubPostDetail {
 
   @State readyEmojiUrls: string[] = [];
   @State failedEmojiUrls: string[] = [];
+  /**
+   * 长按复制（docs/帖子详细页长按复制文字功能补全.md）：各正文 Text 的「复制重建纪元」。
+   * 复制完成后自增对应 key → RichTextContent 内单元素 ForEach 的 key 变化 → Text 节点整体重建
+   * → 选中态随节点销毁清除。用 per-region key 而非共享 selection(start,end) 绑定：
+   * selection 属性绑共享 @State 会把同一段选中范围套到所有绑定 Text 上（跨楼层串扰）；
+   * 纪元重建只重建被复制的那一个节点。Record 更新须整体赋新对象触发重渲染。
+   */
+  @State copyEpochs: Record<string, number> = {};
+
+  /** 读取某正文区域的复制重建纪元（缺省 0；ForEach key 生成用） */
+  private copyEpochOf(regionKey: string): number {
+    return this.copyEpochs[regionKey] ?? 0;
+  }
+
+  /** 复制成功回调：toast 提示 + 自增纪元清除该 Text 的选中态 */
+  private onTextCopied(regionKey: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: '复制成功' });
+    // ArkTS 禁止对象展开（arkts-no-spread），Record 拷贝走 Object.keys 逐键赋值；
+    // 其余 key 保留原值（纪元不变 → 对应 Text 节点不重建），只有被复制的区域自增
+    const next: Record<string, number> = {};
+    Object.keys(this.copyEpochs).forEach((k: string) => {
+      next[k] = this.copyEpochs[k];
+    });
+    next[regionKey] = (this.copyEpochs[regionKey] ?? 0) + 1;
+    this.copyEpochs = next;
+  }
   @State pendingLinkUrl: string = '';
   @State showLinkDialog: boolean = false;
 
@@ -496,6 +631,8 @@ struct SubPostDetail {
               .scrollBar(BarState.Off)
               .clip(false)
               .edgeEffect(EdgeEffect.Spring)
+              // 沉浸阅读（2026-09-18）：方向阈值驱动顶栏显隐（左栏父楼层卡不挂）
+              .onScroll((xOffset: number, yOffset: number) => this.onSubPostScroll(xOffset, yOffset))
             }
             .width('100%')
             .layoutWeight(1)
@@ -537,6 +674,8 @@ struct SubPostDetail {
         .id('subpost_scroll_content')
         .clip(false)
         .edgeEffect(EdgeEffect.Spring)
+        // 沉浸阅读（2026-09-18）：方向阈值驱动顶栏显隐
+        .onScroll((xOffset: number, yOffset: number) => this.onSubPostScroll(xOffset, yOffset))
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         // 形态切换平滑化：与 opacity 同层（根 Stack 已有底色，淡入不露底）
         .opacity(this.contentOpacity)
@@ -564,6 +703,12 @@ struct SubPostDetail {
     .onAreaChange((_oldValue: Area, newValue: Area) => {
       const width = newValue.width as number;
       const height = newValue.height as number;
+      // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期逐帧回调，同尺寸时写 @State 与重算 splitMode()
+      // 都是白做（下方 applySplitSwitch 另有「split 结果未变不切」守卫）。
+      // 注意判据用 currentWidth（下方 width>0 才回填，故 0 = 未初始化时不会误早退）。
+      if (width === this.currentWidth && height === this.pageHeight) {
+        return;
+      }
       if (width > 0) {
         this.currentWidth = width;
       }
@@ -629,6 +774,13 @@ struct SubPostDetail {
     .height(SUBPOST_TITLE_BAR_HEIGHT)
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
+    // 沉浸阅读（2026-09-18）：整行上移出屏 + 淡出，220ms。
+    // 槽位高度固定 98 不参与内容布局（Scroll 首项自带 98 占位），故位移不影响正文排布。
+    .translate({ y: this.immersiveHidden ? this.immersiveTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    // opacity 0 的组件仍参与命中测试，必须显式禁用，避免"看不见但能点到返回"
+    .enabled(!this.immersiveHidden)
+    .animation({ duration: SUBPOST_IMMERSIVE_ANIM_MS, curve: Curve.FastOutSlowIn })
   }
 
   /**
@@ -668,6 +820,11 @@ struct SubPostDetail {
     .height(98)
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
+    // 沉浸阅读（2026-09-18）：与官方槽位路径 SubPostTitleBar 同款（上移出屏 + 淡出 + 禁用命中）
+    .translate({ y: this.immersiveHidden ? this.immersiveTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation({ duration: SUBPOST_IMMERSIVE_ANIM_MS, curve: Curve.FastOutSlowIn })
   }
 
   /**
@@ -707,10 +864,10 @@ struct SubPostDetail {
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
-      this.RichTextContent(floor.fragments ?? [], floor.contentText || '（该楼层无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
+      this.RichTextContent(floor.fragments ?? [], floor.contentText || '（该楼层无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26, 'sp_main')
       if (floor.images.length > 0) {
         // 父楼层卡：竖屏通栏 / 横屏左栏（420 固定宽）→ capMaxWidth=true（336 封顶防拉伸）
-        this.ImageGrid(floor.images, true)
+        this.ImageGrid(floor.images, true, false)
       }
     }
     .width('100%')
@@ -855,11 +1012,14 @@ struct SubPostDetail {
                 }
                 .width('100%')
                 .justifyContent(FlexAlign.Start)
-                // 正文
-                this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26)
+                // 正文（纯图回复去冒号头后无文本片段，整体跳过避免「（无文字内容）」兜底）
+                if ((comment.fragments ?? []).length > 0 || (comment.content ?? '').length > 0) {
+                  this.RichTextContent(comment.fragments ?? [], comment.content || '（无文字内容）', fs(16), Theme.textPrimary(this.isDark), 26, `sp_cmt_${comment.commentId}`)
+                }
                 if ((comment.images ?? []).length > 0) {
                   // 列内回复卡：跟随列宽（杜绝窄列交叉轴测量歧义）
-                  this.ImageGrid(comment.images ?? [], false)
+                  // singlePreview=true：楼中楼图点开单张预览（2026-09-20 预览解耦）
+                  this.ImageGrid(comment.images ?? [], false, true)
                 }
               }
               .layoutWeight(1)
@@ -947,17 +1107,14 @@ struct SubPostDetail {
     });
   }
 
+  /**
+   * 父楼层图预览列表（2026-09-20 预览解耦）：只含父楼层图片，**不再合并楼中楼回复图片**。
+   * 楼中楼回复图走独立单张预览（见 ImageGrid 的 singlePreview 分支），预览左右滑只在父楼层图内切换。
+   */
   private collectAllImages(): string[] {
     const all: string[] = [];
     if (this.detail && this.detail.parent && this.detail.parent.images && this.detail.parent.images.length > 0) {
       all.push(...this.detail.parent.images);
-    }
-    if (this.detail && this.detail.comments) {
-      for (const comment of this.detail.comments) {
-        if (comment.images && comment.images.length > 0) {
-          all.push(...comment.images);
-        }
-      }
     }
     return all;
   }
@@ -975,9 +1132,11 @@ struct SubPostDetail {
    * 「自测量高度」与「实际渲染高度」可能不一致，布局期用错高度会把后续 FlowItem 摆错位置 → 卡片重叠。
    * 故**显式给出总高** = 行数 × 120 + (行数 − 1) × 6，测量期即终值（与 §4.9 同款修复）。
    * `capMaxWidth`：仅**通栏 / 左栏父楼层卡**传 true（336 封顶）；列内回复卡传 false（跟随列宽）。
+   * `singlePreview`（2026-09-20 预览解耦）：true = 楼中楼回复宫格，点开**单张预览**
+   * （urls 只传当前这张，左右滑不切图）；false = 父楼层宫格，走父楼层图列表（原全局行为去掉楼中楼图）。
    */
   @Builder
-  ImageGrid(images: string[], capMaxWidth: boolean = true) {
+  ImageGrid(images: string[], capMaxWidth: boolean = true, singlePreview: boolean = false) {
     Grid() {
       ForEach(images, (img: string, idx: number) => {
         GridItem() {
@@ -991,6 +1150,16 @@ struct SubPostDetail {
           .width('100%')
           .height(120)
           .onClick(() => {
+            // 楼中楼回复宫格（singlePreview=true）：单张预览——urls 只含当前这张（单元素 Swiper 不可滑）。
+            if (singlePreview) {
+              this.getUIContext().getRouter().pushUrl({
+                url: 'pages/ImagePreview',
+                params: { urls: [img] }
+              }).catch(() => {
+                this.getUIContext().getPromptAction().showToast({ message: '图片预览打开失败，请稍后重试' });
+              });
+              return;
+            }
             const allImages = this.collectAllImages();
             const offset = this.getImageGlobalOffset(images);
             this.getUIContext().getRouter().pushUrl({
@@ -1015,7 +1184,7 @@ struct SubPostDetail {
   }
 
   @Builder
-  RichTextContent(fragments: ContentFragment[], fallbackText: string, fontSize: number, fontColor: ResourceColor, lineHeightVal: number) {
+  RichTextContent(fragments: ContentFragment[], fallbackText: string, fontSize: number, fontColor: ResourceColor, lineHeightVal: number, regionKey: string) {
     Column() {
       if (fragments && fragments.length > 0) {
         // 通过 EmojiLoader HTTP + Referer/UA 防盗链下载→PixelMap，完成后 readyEmojiUrls 触发重绘
@@ -1025,70 +1194,85 @@ struct SubPostDetail {
             .height(0)
             .onAppear(() => this.prefetchEmojisWithLoader([emojiUrl]))
         }, (u: string) => u)
-        Text() {
-          ForEach(fragments, (fragment: ContentFragment, idx: number) => {
-            if (fragment.type === ContentFragmentType.EMOJI) {
-              if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasReadyEmoji(fragment.imageUrl) && EmojiLoader.has(fragment.imageUrl)) {
-                ImageSpan(EmojiLoader.get(fragment.imageUrl) as image.PixelMap)
-                  .width(fontSize * 1.2)
-                  .height(fontSize * 1.2)
-                  .verticalAlign(ImageSpanAlignment.CENTER)
-                  .objectFit(ImageFit.Contain)
-                  .borderRadius(fontSize * 0.18)
-              } else if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasFailedEmoji(fragment.imageUrl) && fragment.text && fragment.text.length > 0) {
-                // EmojiLoader 下载失败（URL 无效）且有描述文本 → 文本兜底，避免空白
+        // 单元素 ForEach 包裹（key 含复制重建纪元）：复制完成后自增纪元 → key 变化 → Text 节点整体重建
+        // → 选中态随节点销毁清除。纪元未变时 key 相同、节点复用，零额外开销。
+        ForEach([this.copyEpochOf(regionKey)], (copyEpoch: number) => {
+          Text() {
+            ForEach(fragments, (fragment: ContentFragment, idx: number) => {
+              if (fragment.type === ContentFragmentType.EMOJI) {
+                if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasReadyEmoji(fragment.imageUrl) && EmojiLoader.has(fragment.imageUrl)) {
+                  ImageSpan(EmojiLoader.get(fragment.imageUrl) as image.PixelMap)
+                    .width(fontSize * 1.2)
+                    .height(fontSize * 1.2)
+                    .verticalAlign(ImageSpanAlignment.CENTER)
+                    .objectFit(ImageFit.Contain)
+                    .borderRadius(fontSize * 0.18)
+                } else if ((fragment.imageUrl && fragment.imageUrl.length > 0) && this.hasFailedEmoji(fragment.imageUrl) && fragment.text && fragment.text.length > 0) {
+                  // EmojiLoader 下载失败（URL 无效）且有描述文本 → 文本兜底，避免空白
+                  Span(fragment.text)
+                    .fontSize(fontSize)
+                    .fontColor(fontColor)
+                } else if (fragment.imageUrl && fragment.imageUrl.length > 0) {
+                  // 下载中 / 无文本的失败 → 直接 ImageSpan(url) 尝试（CDN 无防盗链，可直连渲染）
+                  ImageSpan(fragment.imageUrl)
+                    .width(fontSize * 1.2)
+                    .height(fontSize * 1.2)
+                    .verticalAlign(ImageSpanAlignment.CENTER)
+                    .objectFit(ImageFit.Contain)
+                    .borderRadius(fontSize * 0.18)
+                } else if (fragment.text && fragment.text.length > 0) {
+                  Span(fragment.text)
+                    .fontSize(fontSize)
+                    .fontColor(fontColor)
+                }
+              } else if (fragment.type === ContentFragmentType.IMAGE) {
+                // Skip IMAGE fragments here — they are rendered separately by ImageGrid
+              } else if (fragment.type === ContentFragmentType.LINK) {
+                // 可点击超链接：主题色高亮 + 下划线，点击弹"是否跳转链接"确认卡片
                 Span(fragment.text)
                   .fontSize(fontSize)
-                  .fontColor(fontColor)
-              } else if (fragment.imageUrl && fragment.imageUrl.length > 0) {
-                // 下载中 / 无文本的失败 → 直接 ImageSpan(url) 尝试（CDN 无防盗链，可直连渲染）
-                ImageSpan(fragment.imageUrl)
-                  .width(fontSize * 1.2)
-                  .height(fontSize * 1.2)
-                  .verticalAlign(ImageSpanAlignment.CENTER)
-                  .objectFit(ImageFit.Contain)
-                  .borderRadius(fontSize * 0.18)
-              } else if (fragment.text && fragment.text.length > 0) {
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.isDark ? '#7FB8FF' : '#2F6BE8')
+                  .decoration({
+                    type: TextDecorationType.Underline,
+                    color: this.isDark ? '#7FB8FF' : '#2F6BE8'
+                  })
+                  .onClick(() => {
+                    this.openPendingLink((fragment.link !== undefined && fragment.link.length > 0) ? fragment.link : fragment.text);
+                  })
+              } else {
                 Span(fragment.text)
                   .fontSize(fontSize)
                   .fontColor(fontColor)
               }
-            } else if (fragment.type === ContentFragmentType.IMAGE) {
-              // Skip IMAGE fragments here — they are rendered separately by ImageGrid
-            } else if (fragment.type === ContentFragmentType.LINK) {
-              // 可点击超链接：主题色高亮 + 下划线，点击弹"是否跳转链接"确认卡片
-              Span(fragment.text)
-                .fontSize(fontSize)
-                .fontWeight(FontWeight.Medium)
-                .fontColor(this.isDark ? '#7FB8FF' : '#2F6BE8')
-                .decoration({
-                  type: TextDecorationType.Underline,
-                  color: this.isDark ? '#7FB8FF' : '#2F6BE8'
-                })
-                .onClick(() => {
-                  this.openPendingLink((fragment.link !== undefined && fragment.link.length > 0) ? fragment.link : fragment.text);
-                })
-            } else {
-              Span(fragment.text)
-                .fontSize(fontSize)
-                .fontColor(fontColor)
-            }
-          }, (fragment: ContentFragment, idx: number) => this.hasReadyEmoji(fragment.imageUrl ?? '')
-            ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_r`
-            : this.hasFailedEmoji(fragment.imageUrl ?? '')
-              ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_f`
-              : `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_w`)
-        }
-        .fontSize(fontSize)
-        .fontColor(fontColor)
-        .lineHeight(lineHeightVal)
-        .width('100%')
-      } else {
-        Text(fallbackText)
+            }, (fragment: ContentFragment, idx: number) => this.hasReadyEmoji(fragment.imageUrl ?? '')
+              ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_r`
+              : this.hasFailedEmoji(fragment.imageUrl ?? '')
+                ? `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_f`
+                : `${idx}_${fragment.type}_${fragment.text}_${fragment.imageUrl ?? ''}_w`)
+          }
           .fontSize(fontSize)
           .fontColor(fontColor)
           .lineHeight(lineHeightVal)
           .width('100%')
+          // 长按选中复制（与 ThreadDetail.RichTextContent 同款，docs/帖子详细页长按复制文字功能补全.md 方案 A）；
+          // onCopy 弹「复制成功」并自增纪元清除选中态
+          .copyOption(CopyOptions.LocalDevice)
+          .draggable(false)
+          .onCopy(() => { this.onTextCopied(regionKey); })
+        }, (copyEpoch: number) => `${regionKey}_${copyEpoch}`)
+      } else {
+        // 与 Span 分支同款纪元重建：复制完成后清选中态
+        ForEach([this.copyEpochOf(regionKey)], (copyEpoch: number) => {
+          Text(fallbackText)
+            .fontSize(fontSize)
+            .fontColor(fontColor)
+            .lineHeight(lineHeightVal)
+            .width('100%')
+            .copyOption(CopyOptions.LocalDevice)
+            .draggable(false)
+            .onCopy(() => { this.onTextCopied(regionKey); })
+        }, (copyEpoch: number) => `${regionKey}_${copyEpoch}`)
       }
     }
     .width('100%')

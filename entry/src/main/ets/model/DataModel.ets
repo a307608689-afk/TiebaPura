@@ -61,6 +61,7 @@ export interface ThreadItem {
   abstract: string;     // 摘要/首楼内容
   firstImage?: string;  // 首图
   images?: string[];    // 帖子图片列表
+  imageThumbs?: string[]; // 宫格缩略图通道（与 images 同序，官方 media.srcPic；首页 feed 专用，其它数据源缺省回退原 URL）
   createTime: string;   // 发布时间
   isTop: boolean;       // 是否置顶
   isGood?: boolean;     // 是否精选/精品
@@ -225,6 +226,11 @@ export interface PersonalContentItem {
   replyNum: number;
   createTime: string;
   accountId?: string;
+  /**
+   * 浏览时间（毫秒时间戳，2026-09-23）：仅「浏览历史」记录使用——`createTime` 是帖子**发布时间**
+   * 的展示串（「54 分钟前」「09-21 19:34」），无法用于排序；浏览历史按本字段倒序展示。
+   */
+  visitTime?: number;
   /** 帖子图片（CDN 链接，从 proto 内容段提取，用于关注动态宫格展示） */
   images?: string[];
 }

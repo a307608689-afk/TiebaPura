@@ -18,6 +18,11 @@
 
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
 import { ImageCache } from '../cache/ImageCache';
+import {
+  acquireImagePreloadSlot as acquireImagePreloadSlotInner,
+  releaseImagePreloadSlot as releaseImagePreloadSlotInner
+} from '../cache/ImageCache';
+import { TiebaService } from '../service/TiebaService';
 import { display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
@@ -31,29 +36,26 @@ function shortUrl(url: string): string {
 
 // 图片预下载全局并发闸门：限制同时下载的图片数，避免首屏大量卡片图片同时请求抢占带宽，
 // 让列表正文先渲染、图片逐个到达（下载本身仍在 ImageCache 内以沙箱缓存串起复用）
-const IMAGE_PRELOAD_CONCURRENCY: number = 8;
-let imagePreloadActive: number = 0;
-const imagePreloadWaiters: Array<() => void> = [];
-
-function acquireImagePreloadSlot(): Promise<void> {
-  return new Promise<void>((resolve: () => void) => {
-    if (imagePreloadActive < IMAGE_PRELOAD_CONCURRENCY) {
-      imagePreloadActive++;
-      resolve();
-    } else {
-      imagePreloadWaiters.push(resolve);
-    }
-  });
+// §IMGQ（2026-09-19）：由模块私有改为 export，供 ThreadDetail 楼层宫格/头像共用同一口闸门——
+// 详情页楼层是全量渲染（Scroll+Column+ForEach），进帖瞬间上百张图同时下载，
+// 此前只有列表卡片走闸门、详情页完全裸奔。
+// v1.24（2026-09-19）：8 → 16。配合 ThreadDetail 宫格/头像的「进入视口才发起」门控后，
+// 排队量本身已被压到「一屏左右」，可以放宽并发让首屏一次到位（8 并发下首屏 9~18 张要排 2~3 批）。
+// 接口侧已有独立 Session（§IMGQ）隔离，小体积缩略图并发提高对接口的影响可忽略。
+// v1.26（2026-09-19）：实现移至 cache/ImageCache.ets —— 服务层「点击即预热」也要用同一口闸门，
+// 并发原语归图片缓存管；此处保留同名转发，既有调用点（本文件卡片预载 / ThreadDetail 宫格与头像）零改动。
+export function acquireImagePreloadSlot(priority: number = 0): Promise<void> {
+  return acquireImagePreloadSlotInner(priority);
 }
 
-function releaseImagePreloadSlot(): void {
-  const next: (() => void) | undefined = imagePreloadWaiters.shift();
-  if (next !== undefined) {
-    next();
-  } else {
-    imagePreloadActive--;
-  }
+export function releaseImagePreloadSlot(): void {
+  releaseImagePreloadSlotInner();
 }
+
+// v1.26（P2）按下即预取：Touch Down 起计时，Move 超阈值（滚动起手）即取消，不会造成滚动误预取；
+// 计时到点 / 快速点按抬起（计时未到且位移很小）立即预取 —— 比 onClick 提前约一拍把详情数据请求发出去。
+const CARD_PRESS_PREFETCH_MS: number = 60;
+const CARD_PRESS_MOVE_LIMIT: number = 12;   // vp，位移超过视为滚动/拖动
 
 // 用于 @Prop 的帖子卡片数据结构
 export interface ThreadItemData {
@@ -72,6 +74,10 @@ export interface ThreadItemData {
   abstract: string;
   firstImage: string;
   images?: string[];
+  // 2026-09-20 宫格秒加载：与 images 同序的官方缩略图（首页 feed media.srcPic）。
+  // ThreadCard 多图宫格首画直连小图，本地 960 真图落地后自动升级；单图分支不用（大图区会糊）。
+  // 缺省/空串回退原 URL，其它页面数据源不携带时行为与改造前一致。
+  imageThumbs?: string[];
   createTime: string;
   isTop: boolean;
   isGood?: boolean;
@@ -240,7 +246,10 @@ export struct PinnedThreadItem {
  */
 @Component
 export struct ThreadCard {
-  @Prop item: ThreadItemData = {
+  // 2026-09-20 性能优化：@Prop 深拷贝改普通成员。卡数据只在创建时传入，后续更新全部走
+  // 「key 变更 → 整卡重建」（HomeTab/ThreadList 的 key 均含 isLiked/likeCount/replyNum），
+  // @Prop 的深拷贝纯属创建期浪费（多列瀑布流一次建 6+ 卡时最明显）。
+  item: ThreadItemData = {
     tid: '',
     postId: '',
     forumId: '',
@@ -255,6 +264,7 @@ export struct ThreadCard {
     abstract: '',
     firstImage: '',
     images: [],
+    imageThumbs: [],
     createTime: '',
     isTop: false,
     isGood: false,
@@ -267,6 +277,63 @@ export struct ThreadCard {
   onComment: (tid: string) => void = () => {};
   // 头像点击回调：由父组件(Index/ThreadList)注入实现，跳转用户主页
   onAvatarTap: (authorId: string, author: string) => void = () => {};
+  // v1.26（P2）按下即预取：计时器句柄与按下起点（Move 位移判滚动用）
+  private pressPrefetchTimer: number = -1;
+  private pressX: number = 0;
+  private pressY: number = 0;
+  // 2026-09-20：本次触摸已判定为滚动手势（Move 超限取消）后置位 —— 后续高频 Move 事件直接早退，
+  // 不再逐事件算位移；Down 时复位。
+  private pressPrefetchDead: boolean = false;
+
+  private cancelPressPrefetch(): void {
+    if (this.pressPrefetchTimer >= 0) {
+      clearTimeout(this.pressPrefetchTimer);
+      this.pressPrefetchTimer = -1;
+    }
+  }
+
+  /**
+   * v1.26（P2）按下即预取（挂在卡片内容区根节点的 onTouch）：
+   * - Down：起 100ms 计时器，到点即预取详情数据；
+   * - Move：位移超过 12vp 视为滚动/拖动 → 取消（滚动起手不会误预取）；
+   * - Up：计时器还在（快速点按，抬起早于计时器）→ 立即预取；
+   * - Cancel：取消。
+   * prefetchThreadDetail 自带「内存缓存有效 / 在途」判重，与 onClick 路径的预取天然互斥，不会重复请求。
+   */
+  private handlePressPrefetch(event: TouchEvent): void {
+    const tid: string = this.getItem().tid;
+    if (tid.length === 0) {
+      return;
+    }
+    if (event.type === TouchType.Down) {
+      this.pressX = event.touches[0].x;
+      this.pressY = event.touches[0].y;
+      this.pressPrefetchDead = false;
+      this.cancelPressPrefetch();
+      this.pressPrefetchTimer = setTimeout(() => {
+        this.pressPrefetchTimer = -1;
+        TiebaService.getInstance().prefetchThreadDetail(tid, this.getItem().forumId ?? '');
+      }, CARD_PRESS_PREFETCH_MS);
+      return;
+    }
+    if (event.type === TouchType.Move) {
+      if (this.pressPrefetchDead) {
+        return;
+      }
+      const p: TouchObject = event.touches[0];
+      if (Math.abs(p.x - this.pressX) + Math.abs(p.y - this.pressY) > CARD_PRESS_MOVE_LIMIT) {
+        this.pressPrefetchDead = true;
+        this.cancelPressPrefetch();
+      }
+      return;
+    }
+    if (event.type === TouchType.Up && this.pressPrefetchTimer >= 0) {
+      this.cancelPressPrefetch();
+      TiebaService.getInstance().prefetchThreadDetail(tid, this.getItem().forumId ?? '');
+      return;
+    }
+    this.cancelPressPrefetch();
+  }
 
   /**
    * 操作栏收紧判定（docs/TiebaPura阔直屏适配.md，2026-09-15 用户云调试反馈：阔直屏竖 2 列
@@ -278,19 +345,34 @@ export struct ThreadCard {
    * 卡宽按「屏宽 − 页面左右边距(Spacing.lg×2) − 列间距((列数−1)×Spacing.md)」÷ 列数估算
    * （不求像素准只求相对准，同 PersonalContent 分桶估算口径）。
    */
+  /** actionCompact() 记忆化缓存：key = 上次求值时的列数（-1 表示尚未求值） */
+  private actionCompactCachedKey: number = -1;
+  private actionCompactCachedValue: boolean = false;
+
   private actionCompact(): boolean {
     if (this.cardColumns <= 1) {
       return false;
     }
+    // 记忆化（2026-09-19 性能优化）：本方法在 build 里被调用 10+ 次/卡（每处
+    // height/borderRadius/fontSize/space 三元都要算一次），每次都 display.getDefaultDisplaySync()
+    // 跨进程取屏参 + px2vp，纯属浪费。判定只取决于「列数」：display 取的是**物理屏宽**，
+    // 仅随旋转/折叠变化，而这两种情况各页列数必然同步变化，故按列数记忆等价。
+    if (this.cardColumns === this.actionCompactCachedKey) {
+      return this.actionCompactCachedValue;
+    }
+    let compact: boolean = false;
     try {
       const d: display.Display = display.getDefaultDisplaySync();
       const screenW: number = this.getUIContext().px2vp(d.width);
       const cardW: number =
         (screenW - Spacing.lg * 2 - Spacing.md * (this.cardColumns - 1)) / this.cardColumns;
-      return cardW < 240;
+      compact = cardW < 240;
     } catch (e) {
-      return false;
+      compact = false;
     }
+    this.actionCompactCachedKey = this.cardColumns;
+    this.actionCompactCachedValue = compact;
+    return compact;
   }
   /**
    * 图片加载失败标记：任一图加载失败时降级为作者头像缩略 + 失败提示，
@@ -378,7 +460,16 @@ export struct ThreadCard {
       };
       // 阶梯重试序列:立即 + 2s + 8s + 30s,覆盖 ~40s CDN 同步窗口。
       // 第一次延迟 0 不阻塞,直接进入 tryLoad(命中本地缓存场景);后续每次延迟再试。
-      const delays: number[] = [0, 2000, 8000, 30000];
+      // Z5（2026-09-19 掉帧治理,零视觉影响）:后三档加 ±20% 随机抖动。
+      // 新兴帖子的图在 CDN 未同步时会集中失败;若延迟严格为定值,同一批卡会在 30s 档
+      // 同一时刻集体唤醒 → 单帧内 N 次 resolve + 解码,锁 120Hz(8.3ms)下必然掉帧。
+      // 抖动只打散唤醒时刻,重试次数/判定逻辑/总窗口(~40s,最坏 36s)均不变。
+      const delays: number[] = [
+        0,
+        Math.round(2000 * (0.8 + Math.random() * 0.4)),
+        Math.round(8000 * (0.8 + Math.random() * 0.4)),
+        Math.round(30000 * (0.8 + Math.random() * 0.4))
+      ];
       for (const d of delays) {
         if (d > 0) {
           await new Promise<void>((resolve) => setTimeout(resolve, d));
@@ -416,7 +507,37 @@ export struct ThreadCard {
   }
 
   aboutToAppear(): void {
+    // Z1（2026-09-19）：先把「已在磁盘且已确认安全」的图同步填进 cachedImageMap，
+    // 使首帧 Image 直接拿到 file:// 真图，省掉「先请求 CDN 拿回 238×238 占位图 →
+    // onComplete 判占位 → 阶梯重试 → 才切本地路径」的整条往返。
+    this.seedCachedImages();
     this.preloadImages();
+  }
+
+  /**
+   * Z1：同步预填已确认安全的本地缓存路径（组件创建时执行一次，整表一次性赋值）。
+   * 判定走 ImageCache.getVerifiedCachedPath（命中缓存且文件大小已达灰阶校验豁免档），
+   * 未命中或过小的图不填，仍由 preloadImages 的异步路径处理（含像素灰阶兜底），
+   * 行为与改动前完全一致。
+   */
+  private seedCachedImages(): void {
+    const imgs: string[] | undefined = this.item.images;
+    if (!imgs || imgs.length === 0) {
+      return;
+    }
+    const next: Record<string, string> = {};
+    let hits: number = 0;
+    for (const u of imgs) {
+      if (!u) continue;
+      const local: string | null = ImageCache.getVerifiedCachedPath(u);
+      if (local !== null) {
+        next[u] = local;
+        hits++;
+      }
+    }
+    if (hits > 0) {
+      this.cachedImageMap = next;
+    }
   }
 
   /** 通过 ImageCache（带贴吧 UA + Referer + Cookie）预下载图片到沙箱缓存 */
@@ -463,6 +584,36 @@ export struct ThreadCard {
   private resolveImgUrl(u: string | undefined): string {
     if (!u) return '';
     return this.cachedImageMap[u] ?? u;
+  }
+
+  /**
+   * 2026-09-20 宫格秒加载：srcPic 缩略图直连失败标记（键=原图 URL）。
+   * 置位后 gridDisplayUrl 对该格回退原图 bigPic 直连，行为与改造前一致。
+   */
+  @State gridThumbFallbacks: Record<string, boolean> = {};
+
+  /**
+   * 2026-09-20 宫格秒加载：多图宫格显示 URL 三级解析（单图分支不用，保持 bigPic 直连）。
+   * ① 本地缓存 file://（HASH 归一真图，全尺寸解码——autoResize 真机实测对百分比尺寸本地图解码失败已回退）；
+   * ② 官方 srcPic 缩略图（首页 feed media.srcPic，几十 KB 级直连秒出，原版贴吧 App 同源）；
+   * ③ 原图 bigPic（960 宽变体）——srcPic 缺失 / 已标记加载失败时回退。
+   * 闸门下载落地后 cachedImageMap 命中即自动升级高清本地图；布局/尺寸/占位检测零改动。
+   */
+  private gridDisplayUrl(img: string, idx: number): string {
+    const cached: string | undefined = this.cachedImageMap[img];
+    if (cached !== undefined) {
+      return cached;
+    }
+    if (this.gridThumbFallbacks[img] !== true) {
+      const thumbs: string[] | undefined = this.getItem().imageThumbs;
+      if (thumbs !== undefined && idx >= 0 && idx < thumbs.length) {
+        const t: string = thumbs[idx];
+        if (t.length > 0) {
+          return t;
+        }
+      }
+    }
+    return img;
   }
 
   private getItem(): ThreadItemData {
@@ -595,6 +746,10 @@ export struct ThreadCard {
           this.onTap(tid);
         }
       })
+      // v1.26（P2）按下即预取：手指按下（且非滚动）就把详情数据请求发出去，吃掉"按下到抬起"这一拍
+      .onTouch((event: TouchEvent) => {
+        this.handlePressPrefetch(event);
+      })
 
       // ========== 操作栏（独立区域）：分享/评论/点赞三胶囊，完全不在跳转详情的点击区域内 ==========
       // 窄卡收紧模式（actionCompact）：图标 15/文字 11/内距 4/高 30/圆角 15/外距 8——
@@ -616,8 +771,12 @@ export struct ThreadCard {
         .backgroundColor(Theme.sheetGlass(isDarkMode()))
         .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .shadow(Theme.glassShadowStyle())
-        .systemMaterial(ImmMaterial.cardAction())
+        // 2026-09-19 性能优化：删除 .shadow(Theme.glassShadowStyle()) —— 该函数恒返回全零阴影
+        // { radius: 0, color: '#00000000' }，渲染无痕迹，只是每卡白付一次阴影属性；
+        // 删除 .systemMaterial(ImmMaterial.cardAction()) —— 页面主体内材质判 out of scope 不渲染
+        // （见 docs/immersive-material-guide.md），胶囊玻璃观感由上方 backgroundColor(sheetGlass)
+        // + backgroundBlurStyle(Regular) 独立提供，故两处删除对画面零差异、每卡省 3 次材质挂载。
+        // 若后续真机实拍发现差异，把这两行原样加回即可（其余属性无需变动）。
         .onClick(() => {
           const payload: ThreadSharePayload = {
             tid: this.getItem().tid,
@@ -646,8 +805,7 @@ export struct ThreadCard {
         .backgroundColor(Theme.sheetGlass(isDarkMode()))
         .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .shadow(Theme.glassShadowStyle())
-        .systemMaterial(ImmMaterial.cardAction())
+        // 同分享钮：删除恒空阴影与页面主体内不生效的 cardAction 材质（理由见上）
         .onClick(() => {
           const tid = this.getItem().tid;
           if (tid.length > 0) {
@@ -677,8 +835,7 @@ export struct ThreadCard {
         .backgroundColor(Theme.sheetGlass(isDarkMode()))
         .backgroundBlurStyle(BlurStyle.Regular, { scale: 0.85 })
         .border({ width: 0.5, color: Theme.manualGlassBorder() })
-        .shadow(Theme.glassShadowStyle())
-        .systemMaterial(ImmMaterial.cardAction())
+        // 同分享钮：删除恒空阴影与页面主体内不生效的 cardAction 材质（理由见上）
         .onClick(() => {
           const tid = this.getItem().tid;
           const postId = this.getItem().postId ?? '';
@@ -732,6 +889,17 @@ export struct ThreadCard {
   private handleGridImageError(img: string): void {
     hilog.warn(LOG_DOMAIN, TAG, 'onError grid url=%{public}s', shortUrl(img));
     ImageCache.debugLog(`card onError grid url=${shortUrl(img)}`);
+    // 2026-09-20 宫格秒加载：若当前显示的是 srcPic 缩略图且加载失败，标记回退原图 bigPic 直连
+    //（重试逻辑不变，仍按原 URL 解析本地缓存）。整体赋新对象触发重渲染，与 setCachedImage 同口径。
+    if (this.gridThumbFallbacks[img] !== true) {
+      const next: Record<string, boolean> = {};
+      const keys: string[] = Object.keys(this.gridThumbFallbacks);
+      for (const k of keys) {
+        next[k] = this.gridThumbFallbacks[k];
+      }
+      next[img] = true;
+      this.gridThumbFallbacks = next;
+    }
     this.retryOrFail(img);
   }
 
@@ -814,7 +982,8 @@ export struct ThreadCard {
                 // 改 1:1 比例，避免比例失真（§4.2 决策 6）。两种写法互斥（height 与 aspectRatio 同设会冲突）。
                 // 封顶同单列档：防止列宽变宽后多图格也变得比手机大。
                 if (this.cardColumns > 1) {
-                  Image(this.resolveImgUrl(img))
+                  // 2026-09-20 宫格秒加载：显示 URL 三级解析（本地缓存 → srcPic 缩略图 → bigPic 原图）
+                  Image(this.gridDisplayUrl(img, idx))
                     .width('100%')
                     .aspectRatio(1)
                     .constraintSize({
@@ -830,7 +999,7 @@ export struct ThreadCard {
                       this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
                     })
                 } else {
-                  Image(this.resolveImgUrl(img))
+                  Image(this.gridDisplayUrl(img, idx))
                     .width('100%')
                     .height((this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100)
                     .borderRadius(Radius.md)

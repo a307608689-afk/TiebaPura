@@ -24,6 +24,7 @@ import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY } from '../common/Constants';
+import { PrefetchGate } from '../common/PrefetchGate';
 import { FollowUserItem, FollowListResult } from '../model/DataModel';
 import { compareByName } from '../common/Pinyin';
 import { EmptyView, ErrorView } from '../components/CommonComponents';
@@ -108,7 +109,11 @@ struct FollowList {
   private readonly PULL_THRESHOLD: number = 80; // 触发刷新的下拉阈值
   // 关注列表预加载：视口高测量 + 节流/竞态（普通字段，避免高频回调触发 UI 重建）
   private viewportH: number = 0;
-  private lastPrefetchY: number = -10000;
+  /**
+   * 剩余距离预取闸门（2026-09-19 口径修正）：偏移只取 `Scroller.currentOffset()` 真值，
+   * 不再用 `onScroll` 回调入参（其语义在工具链间有差异，会把剩余距离算成恒小于阈值的错值）。
+   */
+  private prefetchGate: PrefetchGate = new PrefetchGate(FOLLOW_PREFETCH_DISTANCE, 'FollowList');
   private loadToken: number = 0;
 
   aboutToAppear(): void {
@@ -182,6 +187,8 @@ struct FollowList {
     }
     // 请求代际递增：使 in-flight 的加载更多结果作废，避免 concat 到刷新后的新列表
     this.loadToken++;
+    // 预取节流基线同步复位：列表整体换新，沿用旧偏移基线会漏触发
+    this.prefetchGate.reset();
     this.loadState = LoadState.Loading;
     this.page = 0;
     this.hasMore = true;
@@ -206,6 +213,7 @@ struct FollowList {
   private async onRefresh(): Promise<void> {
     // 请求代际递增：刷新后丢弃 in-flight 的加载更多结果
     this.loadToken++;
+    this.prefetchGate.reset();
     try {
       const result = await TiebaService.getInstance().fetchFollowUserList(0, this.PAGE_SIZE);
       this.list = result.list;
@@ -255,22 +263,16 @@ struct FollowList {
    * 关注列表预加载：按行数估算内容高，滚动剩余距离 < 阈值时提前静默加载下一页。
    * 编辑态不预加载；loadingMore 锁 + 偏移节流防重；onReachEnd 保留作兜底。
    */
-  private onFollowListScroll(_x: number, y: number): void {
+  private onFollowListScroll(_x: number, _y: number): void {
     if (this.editMode || this.loadState !== LoadState.Ready || this.loadingMore || !this.hasMore) {
       return;
     }
     // 内容高估算：顶栏占位(90) + 行数×行高 + 底部 padding(Spacing.xl≈24)
     const contentH: number = 90 + this.displayedList().length * FOLLOW_ROW_H + 24;
-    const remaining: number = contentH - this.viewportH - y;
-    if (remaining > FOLLOW_PREFETCH_DISTANCE) {
-      return;
+    // 偏移取 Scroller 真值（onScroll 回调入参语义在工具链间有差异，非绝对偏移会让剩余距离恒小）
+    if (this.prefetchGate.should(PrefetchGate.absoluteY(this.scroller), contentH, this.viewportH)) {
+      this.loadMore(true);
     }
-    // 节流：偏移变化超过 120vp 才允许再次触发，避免同一轮滚动连续请求
-    if (Math.abs(y - this.lastPrefetchY) < 120) {
-      return;
-    }
-    this.lastPrefetchY = y;
-    this.loadMore(true);
   }
 
   /** 视口尺寸变化：记录视口高 */

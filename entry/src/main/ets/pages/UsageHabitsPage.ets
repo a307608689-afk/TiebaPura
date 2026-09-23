@@ -17,9 +17,104 @@
  */
 
 import { common } from '@kit.AbilityKit';
+import { display } from '@kit.ArkUI';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, tabletTopFadeStop, isWideBarFlatDevice } from '../common/Theme';
 import { BRAND_BLUE } from '../common/Constants';
+
+/** 「吧主页默认进入界面」档位选项：0 = 热门（默认）/ 1 = 最新。 */
+const FORUM_SORT_OPTIONS: number[] = [0, 1];
+
+/**
+ * 「吧主页默认进入界面」二选一弹窗（系统 CustomDialog + API 26 沉浸光感）。
+ * 玻璃层交给 options.systemMaterial（ImmMaterial.dialog()），卡内不再自绘
+ * backgroundColor / border / backgroundBlurStyle / shadow（与工程既有弹窗约定一致）。
+ */
+@CustomDialog
+struct ForumDefaultSortDialog {
+  /** 系统弹窗必须声明 CustomDialogController 类型属性（ArkTS 编译期强校验） */
+  controller?: CustomDialogController;
+  @Link isDark: boolean;
+  @Link fontScale: number;
+  /** 当前档位（0 = 热门 / 1 = 最新）：选中项高亮用 */
+  @Link mode: number;
+  /** 选定档位回调（写 AppStorage + 落盘） */
+  onPick: (mode: number) => void = () => {};
+  onDismiss: () => void = () => {};
+
+  /** 档位说明（选项副文案） */
+  private optionNote(m: number): string {
+    if (m === 1) {
+      return '吧主页打开先显示最新排序';
+    }
+    return '吧主页打开先显示热门排序';
+  }
+
+  /** 档位名称 */
+  private optionLabel(m: number): string {
+    return m === 1 ? '最新' : '热门';
+  }
+
+  build() {
+    Column({ space: Spacing.md }) {
+      Text('吧主页默认进入界面')
+        .fontSize(fs(17, this.fontScale))
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Theme.textPrimary(this.isDark))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+
+      Text('选择进入任意吧主页时默认显示的排序')
+        .fontSize(fs(12, this.fontScale))
+        .fontColor(Theme.textTertiary(this.isDark))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+
+      ForEach(FORUM_SORT_OPTIONS, (m: number) => {
+        Row({ space: Spacing.sm }) {
+          Column({ space: 2 }) {
+            Text(this.optionLabel(m))
+              .fontSize(fs(15, this.fontScale))
+              .fontWeight(this.mode === m ? FontWeight.Bold : FontWeight.Medium)
+              .fontColor(Theme.textPrimary(this.isDark))
+            Text(this.optionNote(m))
+              .fontSize(fs(11, this.fontScale))
+              .fontColor(Theme.textTertiary(this.isDark))
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+
+          if (this.mode === m) {
+            SymbolGlyph($r('sys.symbol.checkmark_circle'))
+              .fontColor([Theme.brand()])
+              .fontSize(fs(20, this.fontScale))
+          }
+        }
+        .width('100%')
+        .padding({ left: Spacing.md, right: Spacing.md, top: Spacing.md, bottom: Spacing.md })
+        .backgroundColor(this.mode === m ? (this.isDark ? '#333173FF' : '#1A3173FF') : Color.Transparent)
+        .borderRadius(Radius.md)
+        .onClick(() => { this.onPick(m); })
+      }, (m: number) => `forum_sort_${m}`)
+
+      Button() {
+        Text('取消')
+          .fontSize(fs(15, this.fontScale))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary(this.isDark))
+      }
+      .width('100%')
+      .height(44)
+      .systemMaterial(ImmMaterial.cardAction())
+      .backgroundColor(this.isDark ? '#B31B1E24' : '#B3FFFFFF')
+      .borderRadius(Radius.full)
+      .shadow({ radius: 10, color: this.isDark ? '#4D000000' : '#1F101824', offsetY: 3 })
+      .onClick(() => { this.onDismiss(); })
+    }
+    .width('100%')
+    .padding(Spacing.lg)
+  }
+}
 
 @Entry
 @Component
@@ -27,10 +122,33 @@ struct UsageHabitsPage {
   @StorageLink('homeOnlyFollow') onlyFollow: boolean = false;
   /** 「关闭自动旋转」开关（仅阔直屏直板显示；true = 已关闭自动旋转、固定竖屏） */
   @StorageLink('autoRotateOff') autoRotateOff: boolean = false;
+  /** 「吧主页默认进入界面」档位（0 = 热门 / 1 = 最新；持久化，弹窗点选即写） */
+  @StorageLink('forumDefaultSort') forumDefaultSort: number = 0;
   @State isDark: boolean = isDarkMode();
   @StorageLink('fontScale') fontScale: number = 1.0;
   /** 页面可见时自增，强制组件重建使字号实时生效 */
   @State fontSizeTick: number = 0;
+  /** 「吧主页默认进入界面」二选一弹窗控制器（几何与工程既有 CustomDialog 同源：宽 dialogCardWidth、圆角 32、底部锚点 dy -110） */
+  private forumSortController: CustomDialogController = new CustomDialogController({
+    builder: ForumDefaultSortDialog({
+      isDark: $isDark,
+      fontScale: $fontScale,
+      mode: $forumDefaultSort,
+      onPick: (m: number) => { this.pickForumDefaultSort(m); },
+      onDismiss: () => { this.closeForumSortDialog(); }
+    }),
+    autoCancel: true,
+    alignment: DialogAlignment.Bottom,
+    offset: { dx: 0, dy: -110 },
+    maskColor: '#06000000',
+    cornerRadius: 32,
+    width: this.dialogCardWidth(),
+    customStyle: false,
+    systemMaterial: ImmMaterial.dialog(),
+    openAnimation: { duration: 220, curve: Curve.EaseOut },
+    closeAnimation: { duration: 200, curve: Curve.EaseInOut },
+    onWillDismiss: () => { }
+  });
 
   onPageShow(): void {
     this.fontSizeTick++;
@@ -40,6 +158,37 @@ struct UsageHabitsPage {
     MaterialManager.init();
     this.isDark = isDarkMode();
     UsageHabitsManager.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
+  }
+
+  /** 「吧主页默认进入界面」选定档位：走 manager 写 AppStorage + 落盘，随后关闭弹窗（显示值经 @StorageLink 自动同步） */
+  private pickForumDefaultSort(mode: number): void {
+    UsageHabitsManager.getInstance().setForumDefaultSort(mode).catch(() => {
+    });
+    this.closeForumSortDialog();
+  }
+
+  /** 关闭「吧主页默认进入界面」弹窗 */
+  private closeForumSortDialog(): void {
+    this.forumSortController.close();
+  }
+
+  /**
+   * 「吧主页默认进入界面」弹窗宽度（vp 数值）—— 与个性化页 / 收藏页同款：`max(200, min(400, 屏宽 − 48))`。
+   * 必须给数值：`CustomDialogControllerOptions.width` 类型是 `Dimension`，不接受 `calc(100% - 48vp)` 字符串。
+   */
+  private dialogCardWidth(): number {
+    try {
+      const info: display.Display = display.getDefaultDisplaySync();
+      const widthVp: number = info.width / info.densityPixels;
+      return Math.max(200, Math.min(400, widthVp - 48));
+    } catch (e) {
+      return 312;
+    }
+  }
+
+  /** 当前档位显示文案（设置行右侧） */
+  private forumSortLabel(): string {
+    return this.forumDefaultSort === 1 ? '最新' : '热门';
   }
 
   build() {
@@ -80,6 +229,39 @@ struct UsageHabitsPage {
           .backgroundColor(Theme.bgCard(this.isDark))
           .borderRadius(Radius.lg)
           .margin({ top: Spacing.sm })
+
+          // 吧主页默认进入界面：点开二选一弹窗（热门 / 最新）
+          Row({ space: Spacing.md }) {
+            Text('⇅')
+              .fontSize(fs(20, this.fontScale))
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Theme.brand())
+
+            Column({ space: 2 }) {
+              Text('吧主页默认进入界面')
+                .fontSize(fs(16, this.fontScale))
+                .fontWeight(FontWeight.Medium)
+                .fontColor(Theme.textPrimary(this.isDark))
+              Text('选择进入吧主页时默认显示的排序')
+                .fontSize(fs(13, this.fontScale))
+                .fontColor(Theme.textSecondary(this.isDark))
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            Text(this.forumSortLabel())
+              .fontSize(fs(14, this.fontScale))
+              .fontColor(Theme.textSecondary(this.isDark))
+
+            SymbolGlyph($r('sys.symbol.chevron_right'))
+              .fontColor([Theme.textTertiary(this.isDark)])
+              .fontSize(fs(16, this.fontScale))
+          }
+          .width('100%')
+          .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.md, bottom: Spacing.md })
+          .backgroundColor(Theme.bgCard(this.isDark))
+          .borderRadius(Radius.lg)
+          .onClick(() => { this.forumSortController.open(); })
 
           // 关闭自动旋转（仅阔直屏直板显示：只有该形态由本应用主动解锁了自动旋转）
           if (isWideBarFlatDevice()) {

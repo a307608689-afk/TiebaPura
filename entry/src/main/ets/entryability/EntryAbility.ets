@@ -28,6 +28,16 @@ import { CACHE_KEY } from '../common/Constants';
 const TAG: string = 'EntryAbility';
 
 export default class EntryAbility extends UIAbility {
+  /**
+   * 上一次系统上报的 colorMode（undefined = 尚未收到过任何色模配置）。
+   * 用途：「色模未变则早退」——横竖屏旋转同样是 Configuration 变化、同样会走进
+   * onConfigurationUpdate，但 colorMode 根本没动，此时下游的系统栏重绘 / 窗口底色重绘 /
+   * darkTick 全页广播（10+ 页 @StorageLink watch）纯属白做，是旋转期最贵的一笔开销。
+   * ⚠️ 必须声明为 `number | undefined` 且初值 undefined：COLOR_MODE_DARK 的取值是 **0**，
+   * 若写成 `= 0`，首次真实 DARK 回调会被误判成「与上次一致」而跳过首次色同步。
+   */
+  private lastColorMode: number | undefined = undefined;
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, 'Ability onCreate');
     // 关键时序：在首帧渲染前 fire-and-forget 异步把 Application Configuration 同步到 manual 值。
@@ -227,6 +237,17 @@ export default class EntryAbility extends UIAbility {
       const rawColorMode: number | undefined = newConfig.colorMode;
       const sysDark: boolean =
         rawColorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      // 色模未变早退（2026-09-18 旋转丝滑）：横竖屏旋转同样是 Configuration 变化、同样走进本回调，
+      // 但 colorMode 根本没动——下游的系统栏重绘 / 窗口底色重绘 / darkTick 全页广播纯属白做。
+      // 条件只说「有明确值且与上次一致」：undefined（非色模态的配置变化）仍走老路径，不存在漏切色。
+      // ⚠️ 位置必须在上面 followSys=ON 已通过之后、且不能上移到那条 return 之前——!followSys 分支里
+      // 是「手动档对账自愈」（系统把应用级 colorMode 冲回系统档时重新下发手动档），有独立修复职责，
+      // 挡住它会让「应用内手动深色被系统拉回浅色」的 bug 复发。
+      if (rawColorMode !== undefined && rawColorMode === this.lastColorMode) {
+        hilog.info(0x0000, TAG, 'Configuration update skipped: colorMode unchanged (%{public}s)',
+          String(rawColorMode));
+        return;
+      }
       hilog.info(0x0000, TAG,
         'Configuration update colorMode=%{public}s, followSys=ON, sysDark=%{public}s',
         String(rawColorMode), sysDark ? '1' : '0');
@@ -266,6 +287,11 @@ export default class EntryAbility extends UIAbility {
       }
       // 3. 递增 darkTick 触发所有监听 darkTick 的页面 @StorageLink('darkTick') watch 翻 @State isDark
       AppStorage.setOrCreate<number>('darkTick', (AppStorage.get<number>('darkTick') ?? 0) + 1);
+      // 色模记账放在全部工作完成之后（2026-09-18）：仅当系统给出明确色模时记录，undefined 不覆盖旧记录；
+      // 若上面任一步抛异常（走 catch），此处不执行 → 下次同色模仍会完整重跑，不存在「记了账却没干成」。
+      if (rawColorMode !== undefined) {
+        this.lastColorMode = rawColorMode;
+      }
     } catch (e) {
       hilog.error(0x0000, TAG, 'onConfigurationUpdate failed: %{public}s', JSON.stringify(e));
     }

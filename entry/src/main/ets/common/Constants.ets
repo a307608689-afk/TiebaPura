@@ -126,6 +126,10 @@ export interface CacheKeys {
   PIN_FOLLOW_FORUM: string;
   /** 首页推荐仅显示关注吧的帖子开关 */
   HOME_ONLY_FOLLOW: string;
+  /** 「帖子极速开启」开关（'1' = 开启；缺省/其他 = 关闭）：feed 首屏前 3 卡详情+图片预取 */
+  THREAD_FEED_PREFETCH: string;
+  /** 「仅 WiFi 启用」子开关（'0' = 关闭；缺省/其他 = 开启）：仅 WiFi 环境执行极速预取 */
+  THREAD_FAST_WIFI: string;
   /**
    * 阔直屏「关闭自动旋转」开关（'1' = 已关闭自动旋转、固定竖屏；缺省/其他 = 允许旋转）。
    * 仅阔直屏直板形态显示与生效，见 Theme.isWideBarFlatDevice()
@@ -153,6 +157,17 @@ export interface CacheKeys {
    * 缺省 null → 默认档，老用户升级逐像素零回归。
    */
   COLUMN_MODE: string;
+  /**
+   * 「帖子沉浸式阅读」开关（'1' = 详情页向下滑动时自动隐藏顶栏与底栏，向上滑动 / 回到顶部恢复）。
+   * 覆盖帖子详情页 ThreadDetail（顶栏三钮 + 排序胶囊 + 评论底栏）与楼中楼页 SubPostDetail（顶栏）；
+   * 缺省 null → 关闭，老用户升级零行为变化。
+   */
+  IMMERSIVE_READ: string;
+  /**
+   * 「吧主页默认进入界面」档位（'1' = 最新；缺省/其他 = 热门）。
+   * 吧主页 ThreadList 打开时按本档位初始化 selectedSort；缺省 null → 热门，老用户升级零回归。
+   */
+  FORUM_DEFAULT_SORT: string;
 }
 
 // 缓存键
@@ -187,6 +202,8 @@ export const CACHE_KEY: CacheKeys = {
   FOLLOW_FORUM_SORT: 'follow_forum_sort',
   PIN_FOLLOW_FORUM: 'pin_follow_forum',
   HOME_ONLY_FOLLOW: 'tieba_home_only_follow',
+  THREAD_FEED_PREFETCH: 'tieba_thread_feed_prefetch',
+  THREAD_FAST_WIFI: 'tieba_thread_fast_wifi',
   AUTO_ROTATE: 'tieba_auto_rotate',
   DARK_MODE: 'tieba_dark_mode',
   FOLLOW_SYSTEM_DARK: 'tieba_follow_system_dark',
@@ -197,6 +214,8 @@ export const CACHE_KEY: CacheKeys = {
   FORUM_SIGN_STATE: 'tieba_forum_sign_state',
   PRIVACY_AGREED: 'tieba_privacy_agreed',
   COLUMN_MODE: 'tieba_column_mode',
+  IMMERSIVE_READ: 'tieba_immersive_read',
+  FORUM_DEFAULT_SORT: 'tieba_forum_default_sort',
 };
 
 // 缓存过期时间接口

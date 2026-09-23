@@ -168,6 +168,10 @@ export struct MessagesTab {
   // 「回复/提到」两页在 Tabs 中并存，各自镜像互不干扰。
   @State shownReply: NotifyTabState = new NotifyTabState();
   @State shownAt: NotifyTabState = new NotifyTabState();
+  // 下拉刷新进行中（2026-09-22，docs/下拉刷新.md）：两个子 Tab 各持独立状态；
+  // 必须显式走 false→true→false 变化链，Refresh 靠 true→false 变化沿收起指示器
+  @State replyPullRefreshing: boolean = false;
+  @State atPullRefreshing: boolean = false;
   // §4.4 真机修复：多列分桶结果**主动算好写入 @State**（同步在 syncAll）——原实现 UI 在 @Builder 内
   // 经方法间接读取镜像，Tabs/TabContent 嵌套下 @State 替换未触发重渲染（数据到 175 条而 UI 停在第一页），
   // 直接读 @State 数组绕开依赖收集问题
@@ -343,6 +347,39 @@ export struct MessagesTab {
     }
   }
 
+  /** 收起指定子 Tab 的下拉刷新指示器 */
+  private clearPullRefreshing(tab: NotifyTab): void {
+    if (tab === NotifyTab.Reply) {
+      this.replyPullRefreshing = false;
+    } else {
+      this.atPullRefreshing = false;
+    }
+  }
+
+  /**
+   * 下拉刷新（2026-09-22，docs/下拉刷新.md）：复用 loadMessages 的 silent 语义——
+   * 保列表在场、不切 Loading、第 1 页整体替换。进入即显式置 true（制造 false→true→false
+   * 变化沿，否则指示器永久转圈），15s 看门狗兜底强制收起。
+   */
+  private async pullRefreshNotify(tab: NotifyTab): Promise<void> {
+    if (tab === NotifyTab.Reply) {
+      this.replyPullRefreshing = true;
+    } else {
+      this.atPullRefreshing = true;
+    }
+    const watchdog: number = setTimeout(() => {
+      this.clearPullRefreshing(tab);
+    }, 15000);
+    try {
+      if (this.loggedIn) {
+        await this.loadMessages(tab, true, true);
+      }
+    } finally {
+      clearTimeout(watchdog);
+      this.clearPullRefreshing(tab);
+    }
+  }
+
   /** 进入某 Tab 时按缓存/过期策略装载数据（点击与滑动共用入口） */
   private ensureTabLoaded(tab: NotifyTab): void {
     if (!this.loggedIn) {
@@ -406,6 +443,8 @@ export struct MessagesTab {
     if (item.forumName.length > 0) {
       params.forum = item.forumName;
     }
+    // 点击即预取：消息跳转也要走楼层/楼中楼定位，早 300ms 拿到数据即早 300ms 开始定位（§P0-3）
+    TiebaService.getInstance().prefetchThreadDetail(`${item.threadId}`, '');
     this.getUIContext().getRouter().pushUrl({ url: 'pages/ThreadDetail', params });
   }
 
@@ -694,6 +733,13 @@ export struct MessagesTab {
         if (this.notifyColumns() > 1) {
           // §4.4 平板多列（2026-09-14 用户拍板：回复/提到我的采用首页同款瀑布流观感，竖 3 / 横 4）：
           // 「列内独立堆叠」Scroll 全量渲染——本页 floor-vanish 已实证虚拟滚动剔除风险，禁止回归 WaterFlow/List
+          // 下拉刷新（2026-09-22，docs/下拉刷新.md）：Refresh 铺满全区保顶部沉浸，自定义 builder 指示器
+          // 落在标题栏下方；offset 130 保证触发前转圈完整露出
+          Refresh({
+            refreshing: tab === NotifyTab.Reply ? this.replyPullRefreshing : this.atPullRefreshing,
+            offset: 48,
+            friction: 62
+          }) {
           Scroll(tab === NotifyTab.Reply ? this.replyScroller : this.atScroller) {
             Column({ space: Spacing.md }) {
               // §4.4 真机修复（2026-09-14 四轮）：多列块**内联**在此，不能再经 @Builder 传参——
@@ -729,7 +775,7 @@ export struct MessagesTab {
             .width('100%')
             // 修复"首卡上方大片空白"：内容不足一屏时 Scroll 会垂直居中 → 最小撑满视口贴顶（同单列口径）
             .constraintSize({ minHeight: '100%' })
-            .padding({ left: Spacing.lg, right: Spacing.lg, top: NOTIFY_TOP_PAD })
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
             // 真机修复（2026-09-14）：平板 3/4 列把一页 20 条摊薄后内容可能填不满视口 → Scroll 无可滚
             // 距离、onReachEnd 一次都不触发。内容高 / 视口高记录进字段（供 loadMessages 完成后主动判断续拉；
             // minHeight 撑满下高度恒定、本回调未必再触发，故主动判断在 loadMessages 末尾兜底）
@@ -742,7 +788,7 @@ export struct MessagesTab {
             })
           }
           .width('100%')
-          .layoutWeight(1)
+          .height('100%')
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
           .clip(false)
@@ -768,7 +814,20 @@ export struct MessagesTab {
             }
           })
           .onReachEnd(() => { this.loadMessages(tab, false); })
+          }
+          .width('100%')
+          .height('calc(100% - 98vp)')
+          .margin({ top: NOTIFY_TOP_PAD })
+          // 与首页同款：Refresh 自身不裁切 → 列表内容可溢出到材质顶栏之下渲染（顶部沉浸的关键）
+          .clip(false)
+          .onRefreshing(() => { this.pullRefreshNotify(tab); })
         } else {
+          // 下拉刷新（2026-09-22，docs/下拉刷新.md）：与多列分支同款
+          Refresh({
+            refreshing: tab === NotifyTab.Reply ? this.replyPullRefreshing : this.atPullRefreshing,
+            offset: 48,
+            friction: 62
+          }) {
           Scroll(tab === NotifyTab.Reply ? this.replyScroller : this.atScroller) {
             Column({ space: Spacing.md }) {
               ForEach(this.mirrorOf(tab).list, (item: NotifyMessage) => {
@@ -786,15 +845,22 @@ export struct MessagesTab {
             // 让内容列最小撑满视口即可贴顶显示，内容超出视口时不受影响。
             .constraintSize({ minHeight: '100%' })
             // 顶部让位：padding-top 计入内容、随滚动一起上移（沉浸），且不会被 Column space 再叠加一份
-            .padding({ left: Spacing.lg, right: Spacing.lg, top: NOTIFY_TOP_PAD })
+            .padding({ left: Spacing.lg, right: Spacing.lg, top: 0 })
           }
           .width('100%')
-          .layoutWeight(1)
+          .height('100%')
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
           .clip(false)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
           .onReachEnd(() => { this.loadMessages(tab, false); })
+          }
+          .width('100%')
+          .height('calc(100% - 98vp)')
+          .margin({ top: NOTIFY_TOP_PAD })
+          // 与首页同款：Refresh 自身不裁切 → 列表内容可溢出到材质顶栏之下渲染（顶部沉浸的关键）
+          .clip(false)
+          .onRefreshing(() => { this.pullRefreshNotify(tab); })
         }
       }
     }
@@ -841,8 +907,14 @@ export struct MessagesTab {
     .height('100%')
     // §4.4：根容器实宽 / 实高 → 形态判定与列数（首帧由 aboutToAppear 兜底）
     .onAreaChange((_old: Area, n: Area) => {
-      this.pageWidth = n.width as number;
-      this.pageHeight = n.height as number;
+      const w: number = n.width as number;
+      const h: number = n.height as number;
+      // 尺寸同值短路（2026-09-18 旋转丝滑）：旋转期逐帧回调，同值重写 @State 会白触发整树重渲染
+      if (w === this.pageWidth && h === this.pageHeight) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
     })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .overlay(this.BottomFadeOverlay())
