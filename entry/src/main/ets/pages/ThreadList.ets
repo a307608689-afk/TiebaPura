@@ -528,12 +528,6 @@ struct ThreadList {
   /** WaterFlow 数据源（§4.8 T-G）：置顶卡 + 普通帖合并列表，@Watch('onThreadsChanged') 自动同步 */
   @State listDataSource: ThreadListDataSource = new ThreadListDataSource();
   /**
-   * 单列档虚拟化（2026-09-23）：普通帖独立数据源（不含置顶卡；精选档 sort=2 = 全量）。
-   * 单列档与多列档共用同一个 WaterFlow（外层分支只看 searchMode），分段配置见 syncSections：
-   * 置顶块以独立跨列格子原样复刻旧「置顶标签 + bgCard 整体容器」结构，普通帖走本数据源离屏回收。
-   */
-  @State normalDataSource: ThreadListDataSource = new ThreadListDataSource();
-  /**
    * WaterFlow 分段配置（§4.8 T-G 修正）：让**吧头成为跨列的首个格子**、随内容一起滚动
    * （替代「吧头固定于滚动容器外」的旧结构）。section 0 = 吧头（全宽），section 1 = 主体（多列）。
    */
@@ -1756,13 +1750,10 @@ struct ThreadList {
     }
   }
 
-  /** 把合并后的列表同步进 WaterFlow 数据源（多列档用），并同步单列档普通帖数据源 */
+  /** 把合并后的列表同步进 WaterFlow 数据源（单列/多列共用） */
   private syncListDataSource(): void {
     const next: ThreadItem[] = this.waterFlowThreads();
     this.syncSourceData(this.listDataSource, next);
-    // 单列档虚拟化（2026-09-23）：普通帖独立数据源（不含置顶；精选档 = 全量，与旧单列渲染口径一致）。
-    // 多列档不用它，但同步保持两份数据同源，形态切换（旋转/折叠翻档）时无需补同步。
-    this.syncSourceData(this.normalDataSource, this.normalThreads());
     // 数据量变化 → 主体 section 的 itemsCount 必须同步（数量不匹配会让 WaterFlow 无法滚动）
     this.syncSections();
     this.scheduleListPrefetch();
@@ -1785,38 +1776,17 @@ struct ThreadList {
   private syncSections(): void {
     const cols: number = this.threadColumns();
     const isSuccess: boolean = this.loadState === LoadState.Success;
-    if (cols <= 1) {
-      // ===== 单列档（2026-09-23 虚拟化）四段：吧头 / 置顶块 / 普通帖 / 尾部哨兵 =====
-      // 置顶块与尾部哨兵永远各占 1 格（空时渲染 0 高占位），保证「子节点数 == Σ itemsCount」
-      // 官方硬约束只依赖普通帖数量与加载态，无需感知置顶有无 / hasMore 翻转。
-      // 非成功态：吧头 + 状态视图（骨架 / 空态 / 错误）各 1 格。
-      const bodyCount: number = isSuccess ? Math.max(this.normalDataSource.data.length, 1) : 1;
-      const key: string = `single_${bodyCount}_${isSuccess ? 's' : 'n'}`;
-      if (key === this.lastSectionKey) {
-        return;
-      }
-      this.lastSectionKey = key;
-      const next: SectionOptions[] = isSuccess
-        ? [
-          { itemsCount: 1, crossCount: 1 },
-          { itemsCount: 1, crossCount: 1, margin: { left: 12, right: 12 } },
-          { itemsCount: bodyCount, crossCount: 1, margin: { left: 12, right: 12 } },
-          { itemsCount: 1, crossCount: 1, margin: { left: 12, right: 12 } },
-        ]
-        : [
-          { itemsCount: 1, crossCount: 1 },
-          { itemsCount: 1, crossCount: 1 },
-        ];
-      this.sections.splice(0, this.sections.length(), next);
-      return;
-    }
-    // 主体 section：成功态 = 帖子多列（至少 1 项，规避 itemsCount 为 0）；
-    // 其余态 = 1 项、单列（骨架屏 / 空态 / 错误视图需占满整行，不能只占一列）
+    // 主体 section：成功态 = 帖子（至少 1 项，规避 itemsCount 为 0）；
+    // 其余态 = 1 项、单列（骨架屏 / 空态 / 错误视图需占满整行，不能只占一列）。
+    // 单列档（cols<=1）与多列档同构：吧头 1 格 + 主体 bodyCount 格（crossCount 1），
+    // 置顶卡作为主体的普通格子渲染（§4.8 决策 13）——不再拆「置顶块 / 普通帖」独立 section
+    //（2026-09-24 回退：跨 section 虚拟化在真机上出现整层不渲染，对齐 docs/floor-vanish-viewport-fix.md
+    //  的同类结论，恢复单一数据源口径）。
     const bodyCount: number = isSuccess ? Math.max(this.listDataSource.data.length, 1) : 1;
     const bodyCross: number = isSuccess ? cols : 1;
     // 去重：切排序时本方法会被「数据源同步」「加载态回调」先后调两次，配置未变则直接返回，
     // 避免同一帧内重复 splice 触发 WaterFlow 重排（真机表现为过场中画面一顿/闪）。
-    const key: string = `${bodyCount}_${bodyCross}`;
+    const key: string = `s${cols}_${bodyCount}_${bodyCross}`;
     if (key === this.lastSectionKey) {
       return;
     }
@@ -2520,16 +2490,16 @@ struct ThreadList {
    */
   private estimatedColumnContentH(): number {
     const cols: number = Math.max(1, this.threadColumns());
-    // 单列档虚拟化（2026-09-23）：条数取单列数据源（不含置顶），间距/边距按旧单列口径（6 / 12），
-    // 另加吧头实测高 + 尾部哨兵高；多列档口径完全不动。
+    // 条数取合并数据源（置顶+普通，单列/多列同源）；间距/边距按旧单列口径（6 / 12），
+    // 另加吧头实测高；多列档口径完全不动。
     const single: boolean = cols <= 1;
-    const count: number = single ? this.normalDataSource.data.length : this.listDataSource.data.length;
+    const count: number = this.listDataSource.data.length;
     const gap: number = single ? 6 : Spacing.md;
     const side: number = single ? 12 : Spacing.lg;
     // 可用总宽 = 窗口宽 − 左右外边距 − 列间距（折算口径统一收口在 PrefetchGate，卡高估算也在那里）
     const availW: number = Math.max(1, this.pageWidth) - side * 2 - gap * (cols - 1);
     const total: number = PrefetchGate.estimateWaterfallContentH(count, cols, availW, gap)
-      + (single ? this.headerBlockH + LIST_FOOTER_SENTINEL_H : 0);
+      + (single ? this.headerBlockH : 0);
     // 真机自证：折算参数一次性打全（若真机预取时机偏早/偏晚，照这行日志校准权重即可）
     if (!this.contentSrcNoted && this.viewportH > 0 && count > 0) {
       this.contentSrcNoted = true;
@@ -2846,13 +2816,13 @@ struct ThreadList {
           .hitTestBehavior(HitTestMode.None)
       }
       // 新页（当前内容）：位移与旧页层对向，见 Scroll 链上的 translate
-      // 单列档虚拟化（2026-09-23）：非搜索态一律走本 WaterFlow（单列/多列仅分段不同），
-      // 治理「Scroll+Column 全量渲染越滑越卡」；搜索态仍走下方 Scroll 分支（SearchResultsBuilder）。
+      // 非搜索态一律走本 WaterFlow（单列/多列仅 crossCount 不同），搜索态仍走下方 Scroll 分支。
+      // （2026-09-24：曾试过单列档「置顶块 + 普通帖」跨 section 虚拟化，真机出现整层不渲染——
+      //   对齐 docs/floor-vanish-viewport-fix.md 的虚拟容器视口剔除同类问题，已回退单一数据源口径。）
       if (!this.searchMode) {
-        // ===== 多列档（§4.8 T-G）：WaterFlow 整页滚动，吧头作为**跨列的首个格子**随内容滚动 =====
+        // ===== WaterFlow 整页滚动，吧头作为**跨列的首个格子**随内容滚动 =====
         // 与首页（§4.2 决策 12）同一套 WaterFlow；差异仅在分段（WaterFlowSections）：
-        //   多列：section 0 = 吧头（crossCount 1）；section 1 = 主体（crossCount 3/4）。
-        //   单列：吧头 / 置顶块 / 普通帖 / 尾部哨兵 四段全 crossCount 1（见 syncSections）。
+        //   section 0 = 吧头（crossCount 1）；section 1 = 主体（单列 crossCount 1 / 多列 3/4）。
         // 卡片一律取自然高度（不设 onGetItemMainSizeByIndex），置顶卡作为普通格子、不拉伸。
         // 下拉刷新（2026-09-22，docs/下拉刷新.md）：与首页/消息页/进吧页同款——Refresh 容器
         // margin 下移到顶栏之下（默认指示器随之出现在顶栏下方），定高扣除下移量防底部溢出；
@@ -2878,8 +2848,10 @@ struct ThreadList {
           }
 
           if (this.loadState === LoadState.Success) {
-            if (this.threadColumns() > 1) {
-            // ===== 多列档：置顶卡 + 普通帖合并数据源（§4.8 决策 13，口径不变）=====
+            // ===== 置顶卡 + 普通帖合并数据源（§4.8 决策 13）：单列 / 多列共用同一段 LazyForEach，
+            // 仅 sections 的 crossCount 不同（单列 1 / 多列 3-4）。2026-09-24 回退单列虚拟化：
+            // 「置顶块 + 普通帖」跨 section 结构在真机上出现整层不渲染（同类问题见
+            // docs/floor-vanish-viewport-fix.md 的虚拟容器视口剔除结论），恢复单一数据源口径。
             // 成功态但数据为空（状态切换的瞬态）：补 0 高占位，保证「子节点数 == Σ itemsCount」，
             // 否则 WaterFlow 会因数量不匹配而无法滚动（官方硬约束）
             if (this.listDataSource.data.length === 0) {
@@ -2938,119 +2910,6 @@ struct ThreadList {
                 .translate({ x: this.sortShiftX() })
               }
             }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
-            } else {
-            // ===== 单列档虚拟化（2026-09-23）：置顶块 / 普通帖 / 尾部哨兵 三段格子 =====
-            // 与多列档共用同一 WaterFlow（数据离屏回收 → 存活卡片数恒定，流畅度与滚动深度解耦）。
-            // 置顶块原样复刻旧单列结构（「置顶」标签 + bgCard 整体容器）；空时 0 高占位
-            //（格子数恒定，「子节点数 == Σ itemsCount」硬约束只依赖普通帖数量与加载态）。
-            FlowItem() {
-              Column() {
-                if (this.pinnedThreads().length > 0) {
-                  Column({ space: 0 }) {
-                    // 置顶标签（通栏，不参与网格）
-                    Row() {
-                      Text('置顶')
-                        .fontSize(fs(13, this.fontScale))
-                        .fontWeight(FontWeight.Bold)
-                        .fontColor(Theme.textPrimary(this.isDark))
-                    }
-                    .width('100%')
-                    .padding({ left: 16, right: 16, top: 14, bottom: 4 })
-
-                    // 单列档：逐像素保持改造前结构
-                    ForEach(this.pinnedThreads(), (item: ThreadItem) => {
-                      PinnedThreadItem({
-                        item: {
-                          tid: item.tid, title: item.title, forumName: item.forumName,
-                          author: item.author, replyNum: item.replyNum, abstract: item.abstract,
-                          firstImage: item.firstImage ?? '', createTime: item.createTime,
-                          isTop: item.isTop, isGood: item.isGood,
-                        } as ThreadItemData,
-                        onTap: (tid: string) => this.openThread(tid)
-                      })
-                    }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
-                  }
-                  .width('100%')
-                  .backgroundColor(Theme.bgCard(this.isDark))
-                  // 卡片圆角 26：与首页 ThreadCard、详情页卡片、其余列表页卡片统一口径
-                  .borderRadius(26)
-                  // 置顶块与首张帖子卡的间距：WaterFlow 的 rowsGap 不跨 section 生效
-                  // （置顶块与普通帖分属两个 section），须在此显式补回旧结构 Column({space:6})
-                  // 的 6vp 卡距，与帖-帖间距（rowsGap=6）保持一致；空置顶时不渲染本层、不多占。
-                  .margin({ bottom: 6 })
-                } else {
-                  Column().width('100%').height(0)
-                }
-              }
-              .width('100%')
-              .translate({ x: this.sortShiftX() })
-            }
-
-            // 成功态但数据为空（状态切换的瞬态）：补 0 高占位，保证「子节点数 == Σ itemsCount」
-            if (this.normalDataSource.data.length === 0) {
-              FlowItem() {
-                Column().width('100%').height(0)
-              }
-            }
-            LazyForEach(this.normalDataSource, (item: ThreadItem) => {
-              FlowItem() {
-                Column() {
-                  ThreadCard({
-                    item: {
-                      tid: item.tid, postId: item.postId ?? '',
-                      title: item.title, forumName: item.forumName,
-                      forumAvatar: item.forumAvatar ?? '',
-                      author: item.author,
-                      authorAvatar: item.authorAvatar ?? '',
-                      authorId: item.authorId ?? '',
-                      replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
-                      isLiked: item.isLiked ?? false,
-                      abstract: item.abstract,
-                      firstImage: item.firstImage ?? '', images: item.images ?? [],
-                      imageThumbs: item.imageThumbs ?? [],
-                      createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
-                    } as ThreadItemData,
-                    onTap: (tid: string) => this.openThread(tid),
-                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                    onComment: (tid: string) => this.openThread(tid),
-                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-                  })
-                    .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean) => this.onCardListVisible(item.tid, isVisible))
-                }
-                .width('100%')
-                .translate({ x: this.sortShiftX() })
-              }
-            }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
-
-            // 尾部哨兵三态等高（LIST_FOOTER_SENTINEL_H）：静默占位 / 加载中 / 加载失败重试；
-            // 无更多时 0 高占位（格子数恒定）
-            FlowItem() {
-              Column() {
-                if (this.hasMore) {
-                  Row() {
-                    if (this.loadingHintVisible) {
-                      LoadingView({ message: '加载中...' }).height(LIST_FOOTER_SENTINEL_H)
-                    } else if (this.loadMoreFailed) {
-                      Button('加载失败，点击重试')
-                        .fontSize(fs(13, this.fontScale))
-                        .fontColor(Theme.brand())
-                        .backgroundColor(Color.Transparent)
-                        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-                        .onClick(() => { this.loadMore(); })
-                    }
-                    // 静默态（后台预取在途且未超时）：不显形、不转圈，仅留等高占位
-                  }
-                  .width('100%')
-                  .height(LIST_FOOTER_SENTINEL_H)
-                  .justifyContent(FlexAlign.Center)
-                } else {
-                  Column().width('100%').height(0)
-                }
-              }
-              .width('100%')
-            }
-            }
           } else if (this.loadState === LoadState.Loading) {
             // 骨架屏 / 空态 / 错误视图：该 section 的 crossCount = 1，故独占整行；
             // 骨架屏沿用单列档的 skeletonOpacity 轻淡入，避免切到未命中缓存的排序时「闪一下」
