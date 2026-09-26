@@ -85,13 +85,24 @@ struct ImagePreview {
   @State imageSources: Record<string, string> = {};
   /** 已发起过基础档解析链的 URL（去重；同一 url 的基础档只 kick 一次） */
   private kickedUrls: Set<string> = new Set<string>();
-  /** 已发起过高清档（pv_ 720/原图）下载的 URL：只对当前图拉取，邻图滑到当前时才补拉
-   *  （丢帧治理 P3 2026-09-26：削减翻页时 720 文件的下载与解码突发） */
-  private hdKickedUrls: Set<string> = new Set<string>();
+  /** 高清档（pv_ 720/原图）已尝试次数：url → 已发起次数（1=首拉，2/3=重试中）。
+   *  2026-09-26 可靠性改造：旧 Set 一次性标记导致 HD 链偶发失败后本会话永不重试，
+   *  表现为「原图加载慢/不出现，退出重开才好」——现按 2s/8s 阶梯重试（上限 2 次重试）。 */
+  private hdAttempts: Map<string, number> = new Map<string, number>();
+  /** 高清档重试定时器（url → timer；退出页面时统一清理，防空页回调继续下载） */
+  private hdRetryTimers: Map<string, number> = new Map<string, number>();
+  /** 邻图高清档串行队列：滑动停歇后逐张放行、且让位于当前图 HD 链——
+   *  保证闸门内任何时刻至多一张邻图 720 在途（保留 09-26 P3 丢帧治理语义） */
+  private hdQueue: string[] = [];
+  private hdQueueDraining: boolean = false;
+  /** 在途当前图 HD 链数（>0 时邻图队列暂停放行） */
+  private currentHdActive: number = 0;
   /** +2 远邻图延迟预取定时器（滑动停歇后再取；翻页/退出时作废重排） */
   private farNeighborTimer: number = -1;
   /** 已拿到高清档的 URL：防止基础档结果晚到时把高清显示降级覆盖回去 */
   private hdDoneUrls: Set<string> = new Set<string>();
+  /** 显示失败已重试过一次的 URL（onError 兜底防死循环；本地/直连两分支共用一次性守卫） */
+  private directRetryUrls: Set<string> = new Set<string>();
 
   private pinchBaseScale: number = 1;
   private pinchBasePanX: number = 0;
@@ -139,7 +150,7 @@ struct ImagePreview {
       this.appendStreamPage();
     }
     // 预览提速（P1 同步直出 + P2 邻图预取 / P3 收紧 2026-09-26）：当前图闸门插队（priority=1）
-    // 且含高清档；左右紧邻图普通档只拉基础档（720 高清档等滑到成为当前图时再拉）；
+    // 且含高清档；左右紧邻图普通档只拉基础档，其 720 高清档由滑动停歇后的串行队列预热；
     // +2 远邻图延迟到滑动停歇后（350ms）再拉基础档。基础档与详情宫格共用 HASH 归一缓存，
     // 大多数字图已是本地文件。
     for (const off of [-1, 0, 1]) {
@@ -177,6 +188,11 @@ struct ImagePreview {
       clearTimeout(this.farNeighborTimer);
       this.farNeighborTimer = -1;
     }
+    // 高清档重试定时器统一作废：页面已销毁，回调不应再触发下载
+    this.hdRetryTimers.forEach((t: number): void => {
+      clearTimeout(t);
+    });
+    this.hdRetryTimers.clear();
     this.restoreStatusBar();
   }
 
@@ -210,6 +226,7 @@ struct ImagePreview {
                 .width('100%')
                 .height('100%')
                 .objectFit(ImageFit.Contain)
+                .onError(() => { this.handleImageError(idx); })
                 .scale({ x: this.getScale(idx), y: this.getScale(idx) })
                 .translate({ x: this.getPanX(idx), y: this.getPanY(idx) })
 
@@ -281,7 +298,7 @@ struct ImagePreview {
           this.currentIndex = index;
           this.resetZoom();
           // P2 邻图预取 / P3 收紧（2026-09-26）：翻到新页即补齐 ±1 邻域基础档（kickedUrls 去重，
-          // 重复触发零开销）；新当前图此时才拉高清档（hdKickedUrls 去重，已拉过则跳过）；
+          // 重复触发零开销）；新当前图此时才拉高清档（hdAttempts 去重，已拉过/在途则跳过）；
           // +2 远邻图延迟到滑动停歇后再取，避免翻页动画期叠加 720 下载/解码突发
           for (const off of [-1, 0, 1]) {
             this.kickImage(index + off, off === 0 ? 1 : 0, off === 0);
@@ -429,6 +446,48 @@ struct ImagePreview {
   }
 
   /**
+   * 显示失败兜底（2026-09-26 可靠性改造）：此前预览页 Image 无 onError——
+   * 无本地缓存且直连失败即黑屏，本地文件偶发损坏则永久空白，都是「重开才能加载」的另一来源。
+   * ① 本地 file:// 失败：撤本地 src 回退直连显示，并清一次性标记重 kick 解析链一次；
+   * ② 直连失败：清 kickedUrls 重 kick 基础档链一次。
+   * directRetryUrls 一次性守卫：同一 url 每会话只兜底一次，防「重 kick → 同一坏文件 →
+   * 再 error」死循环（校验通过的缓存仍坏属极罕见场景，放弃重试维持现状）。
+   */
+  private handleImageError(idx: number): void {
+    if (idx < 0 || idx >= this.urls.length) {
+      return;
+    }
+    const url: string = this.urls[idx];
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return;
+    }
+    const local: string | undefined = this.imageSources[url];
+    if (local !== undefined && local.startsWith('file://')) {
+      if (this.directRetryUrls.has(url)) {
+        return;
+      }
+      this.directRetryUrls.add(url);
+      // 撤本地路径（整体赋新对象触发重渲染），显示回落原始 URL 直连
+      const next: Record<string, string> = {};
+      for (const k of Object.keys(this.imageSources)) {
+        if (k !== url) {
+          next[k] = this.imageSources[k];
+        }
+      }
+      this.imageSources = next;
+      this.kickedUrls.delete(url);
+      this.kickImage(idx, 1, false);
+      return;
+    }
+    if (this.directRetryUrls.has(url)) {
+      return;
+    }
+    this.directRetryUrls.add(url);
+    this.kickedUrls.delete(url);
+    this.kickImage(idx, 1, false);
+  }
+
+  /**
    * 单图解析链（2026-09-23 预览提速；P3 收紧 2026-09-26）：
    * ① P1 同步直出：getVerifiedCachedPath 命中（宫格显示/预热已落地的同 HASH 文件，
    *    90% 以上场景）→ 本帧即 file:// 上屏，零网络等待——这是「第一张图慢」的根治点；
@@ -446,10 +505,18 @@ struct ImagePreview {
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       return;
     }
-    // ① 同步直出：Z1 校验口径（≥阈值字节、非已知占位模板），与详情宫格首帧同一语义
+    // ① 同步直出基础档：Z1 校验口径（≥阈值字节、非已知占位模板），与详情宫格首帧同一语义
     const local: string | null = ImageCache.getVerifiedCachedPath(url);
     if (local !== null) {
       this.setLocalSrc(url, local, false);
+    }
+    // ② 同步直出高清档（2026-09-26）：pv_ 文件已在盘上（上次预览过/翻回看过的图）→
+    //    首帧即高清终态，零网络、零二次替换闪变；标记终态后基础档晚到不会降级覆盖
+    const hdSync: string | null = ImageCache.getPreviewCachedPath(url);
+    if (hdSync !== null) {
+      this.setLocalSrc(url, hdSync, true);
+      this.hdDoneUrls.add(url);
+      this.hdAttempts.set(url, 1);
     }
     if (!this.kickedUrls.has(url)) {
       this.kickedUrls.add(url);
@@ -457,7 +524,7 @@ struct ImagePreview {
         await acquireImagePreloadSlot(priority);
         try {
           if (local === null) {
-            // ② 基础档：in-flight 合流——宫格那条解析还在路上时这里直接等它，不排第二次队
+            // ③ 基础档：in-flight 合流——宫格那条解析还在路上时这里直接等它，不排第二次队
             const basic: string = await ImageCache.resolve(url);
             if (basic.startsWith('file://')) {
               this.setLocalSrc(url, basic, false);
@@ -470,28 +537,87 @@ struct ImagePreview {
         }
       })();
     }
-    if (includeHd && !this.hdKickedUrls.has(url)) {
-      this.hdKickedUrls.add(url);
-      (async (): Promise<void> => {
+    if (includeHd && !this.hdAttempts.has(url)) {
+      // ④ 高清档：当前图直跑（闸门 priority 插队）；邻图只经串行队列（scheduleFarNeighborKick）
+      this.hdAttempts.set(url, 1);
+      this.currentHdActive++;
+      this.runHdChain(url, priority, (): void => {
+        this.currentHdActive = Math.max(0, this.currentHdActive - 1);
+        this.pumpHdQueue();
+      });
+    }
+  }
+
+  /**
+   * 高清档下载链（2026-09-26 可靠性改造）：失败按 2s/8s 阶梯重试、上限 2 次重试——
+   * 旧版一次性标记（hdKickedUrls）导致偶发失败后本会话永不重试，只能「退出重开」自愈。
+   * onSettled：首次终局（成功或首次失败）回调一次，供当前图放行邻图串行队列；
+   * 重试链传 null（队列早已放行，重试在后台独立继续，不把队列卡死整个重试窗口）。
+   */
+  private runHdChain(url: string, priority: number, onSettled: (() => void) | null): void {
+    (async (): Promise<void> => {
+      let done: boolean = false;
+      try {
         await acquireImagePreloadSlot(priority);
         try {
-          // ③ 高清档：无宽度参数的 URL 本身即原图，resolvePreview 内部与基础档同文件，不重复下载
           const hd: string = await ImageCache.resolvePreview(url);
           if (hd.startsWith('file://')) {
             this.setLocalSrc(url, hd, true);
+            done = true;
           }
         } catch (e) {
-          // 静默：显示侧维持基础档/原始 URL 直连，不影响浏览
+          // 静默：显示侧维持基础档/原始 URL 直连
         } finally {
           releaseImagePreloadSlot();
         }
-      })();
+      } catch (e) {
+        // 闸门等待异常：按失败走重试链
+      }
+      if (done) {
+        this.hdDoneUrls.add(url);
+      } else {
+        const attempt: number = this.hdAttempts.get(url) ?? 0;
+        if (attempt <= 2) {
+          this.hdAttempts.set(url, attempt + 1);
+          const timer: number = setTimeout(() => {
+            this.hdRetryTimers.delete(url);
+            this.runHdChain(url, priority, null);
+          }, attempt === 1 ? 2000 : 8000);
+          this.hdRetryTimers.set(url, timer);
+        }
+        // attempt>2：首拉 + 2 次重试全败，放弃，显示维持现状
+      }
+      if (onSettled !== null) {
+        onSettled();
+      }
+    })();
+  }
+
+  /**
+   * 邻图高清档串行泵：队首逐张放行、一次一张；当前图 HD 在途时暂停——
+   * 全局任何时刻至多「当前图一张 + 邻图一张」720 在途，且下载全部走既有并发闸门。
+   */
+  private pumpHdQueue(): void {
+    if (this.hdQueueDraining || this.currentHdActive > 0) {
+      return;
     }
+    const next: string | undefined = this.hdQueue.shift();
+    if (next === undefined) {
+      return;
+    }
+    this.hdQueueDraining = true;
+    this.runHdChain(next, 0, (): void => {
+      this.hdQueueDraining = false;
+      this.pumpHdQueue();
+    });
   }
 
   /**
    * P3（2026-09-26）：+2 远邻图延迟预取——翻页动画与当前图高清档下载/解码期间不抢
    * 闸门与网络，停歇 350ms 后再以普通档拉基础档（清旧定时器防连翻堆积）。
+   * B2（2026-09-26 可靠性改造）：±1 紧邻图的高清档也在停歇后预热——只入串行队列
+   * （当前图 HD 在途时暂停、一次一张，不在翻页动画期抢带宽），滑到该图时 720
+   * 大概率已落地或已在途；hdAttempts 去重，同一张全会话只排一次。
    */
   private scheduleFarNeighborKick(): void {
     if (this.farNeighborTimer >= 0) {
@@ -500,6 +626,22 @@ struct ImagePreview {
     this.farNeighborTimer = setTimeout(() => {
       this.farNeighborTimer = -1;
       this.kickImage(this.currentIndex + 2, 0, false);
+      for (const off of [-1, 1]) {
+        const nIdx: number = this.currentIndex + off;
+        if (nIdx < 0 || nIdx >= this.urls.length) {
+          continue;
+        }
+        const nUrl: string = this.urls[nIdx];
+        if (!nUrl.startsWith('http://') && !nUrl.startsWith('https://')) {
+          continue;
+        }
+        if (this.hdAttempts.has(nUrl) || this.hdQueue.indexOf(nUrl) >= 0) {
+          continue;
+        }
+        this.hdAttempts.set(nUrl, 1);
+        this.hdQueue.push(nUrl);
+      }
+      this.pumpHdQueue();
     }, 350);
   }
 

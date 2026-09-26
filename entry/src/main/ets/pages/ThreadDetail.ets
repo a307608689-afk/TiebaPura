@@ -4159,6 +4159,10 @@ struct ThreadDetail {
             // 灌进 ImageCache（闸门 priority=1 插队），路由转场动画期间下载已在并行进行；
             // 预览页首图同步直出/高清升级都吃这条在途链。已在缓存则 warmImages 自动跳过。
             ImageCache.warmImages([img], 1, 1);
+            // 高清档入口并行（2026-09-26）：点击目标图的 720 档随转场动画同步起跑，
+            // 进预览页首图的高清升级已在中途——治「原图加载慢」的第一棒；
+            // pv_ 已在缓存时 resolvePreview 内部直接命中返回，零重复下载
+            ImageCache.resolvePreview(img).catch((): void => {});
             // 楼中楼宫格（singlePreview=true）：单张预览——urls 只含当前这张（单元素 Swiper 不可滑），
             // 不带流式补页上下文；主图/楼层宫格保持原「全局列表 + 流式补页」行为（2026-09-20 预览解耦）。
             if (singlePreview) {
