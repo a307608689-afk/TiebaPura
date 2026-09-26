@@ -1282,15 +1282,19 @@ struct GlobalQueryPage {
   TopFadeOverlay() {
     // 顶部渐显：只覆盖悬浮搜索行区域（下沿 = HEADER_TOP_SPACE，即搜索框底部），
     // 内容滚过搜索行下缘后即完全清晰，不再被渐隐带往下盖住；
-    // DST_IN 白区不挖洞，1.0 处与带外内容连续；悬浮栏后渲染（zIndex 2）不受影响
+    // 丢帧治理 P2（2026-09-26）：原 DST_IN 蒙版要求内容层整体 blendMode(OFFSCREEN)，滚动时
+    // 每帧全屏离屏合成；改为「页面底色 → 透明」渐变条直接盖在内容上，视觉近似且零离屏。
+    // 回退 = 恢复 alpha 形态 colors + .blendMode(DST_IN, OFFSCREEN) + 内容层 SRC_OVER OFFSCREEN。
     Stack()
       .width('100%')
       .height(HEADER_TOP_SPACE)
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 0.7], ['#FFFFFFFF', 1.0]]
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 0.7]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
 
@@ -1731,7 +1735,6 @@ struct GlobalQueryPage {
     .align(Alignment.TopStart)
     .onReachEnd(() => this.loadMoreCurrent(false))
     .onScroll((xOffset: number, yOffset: number) => this.onContentScroll(xOffset, yOffset))
-    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
     .overlay(this.TopFadeOverlay())
   }
 

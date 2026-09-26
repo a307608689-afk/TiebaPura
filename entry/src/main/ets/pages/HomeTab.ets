@@ -2146,7 +2146,6 @@ export struct HomeTab {
     .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .overlay(this.BottomFadeOverlay())
-    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
   }
 
   /** 关注动态视图：fol* 独立数据源，常驻不销毁，切换时保留内容与滚动位置 */
@@ -2327,7 +2326,6 @@ export struct HomeTab {
     .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .overlay(this.BottomFadeOverlay())
-    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
   }
 
   /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（108vp 折算，实时窗口高），手机维持 15% */
@@ -2345,9 +2343,15 @@ export struct HomeTab {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
+        // 丢帧治理 P2（2026-09-26）：原 DST_IN 蒙版要求内容层整体 blendMode(OFFSCREEN)，
+        // 滚动时每帧全屏离屏合成 + 回读（大屏旗舰 GPU 填充率瓶颈）；改为「顶栏底色 → 透明」
+        // 渐变条直接盖在内容上，视觉近似（内容被底色渐隐 ≈ alpha 渐显）且零离屏。若观感不对，
+        // 回退 = 恢复下方 DST_IN 蒙版行 + 两个 feed 容器的 blendMode(SRC_OVER, OFFSCREEN)。
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', this.topFadeStop()]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
 

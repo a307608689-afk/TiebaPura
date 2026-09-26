@@ -20,7 +20,7 @@ import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
-import { display, curves, componentSnapshot } from '@kit.ArkUI';
+import { display, curves, componentSnapshot, LengthMetrics } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
 import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { ForumSignStore } from '../service/ForumSignStore';
@@ -525,6 +525,14 @@ struct ThreadList {
   private contentSrcNoted: boolean = false;
   private loadToken: number = 0;
   @State selectedSort: number = 0;
+  /**
+   * 「最新」档内的子排序：0 = 按回复时间（sort_type 0，服务端默认序）/ 1 = 按发帖时间（sort_type 1）。
+   * 缺省 1 = 改造前「最新」档的固定参数，老用户零回归；点选即持久化（CACHE_KEY.LATEST_SORT_MODE，全局档）。
+   * 仅「最新」档生效：热门（0）/ 精选（2）不读本值。
+   */
+  @State latestSortMode: number = 1;
+  /** 「最新」档顶栏排序钮的 bindMenu 显隐（点选即关，onDisappear 兜底复位） */
+  @State showLatestSortMenu: boolean = false;
   /** WaterFlow 数据源（§4.8 T-G）：置顶卡 + 普通帖合并列表，@Watch('onThreadsChanged') 自动同步 */
   @State listDataSource: ThreadListDataSource = new ThreadListDataSource();
   /**
@@ -1022,6 +1030,15 @@ struct ThreadList {
   }
 
   aboutToAppear(): void {
+    this.initLatestSortModeThenLoad();
+  }
+
+  /**
+   * 「最新」档子排序恢复 + 首次加载（原 aboutToAppear 主体）。
+   * 子档持久化读盘是异步的，必须 await 后再 loadThreads：缓存 key（forumCacheKey）与请求参数
+   * 都以 effectiveSort() 为真源，先恢复再拉取才能命中正确的子档缓存。
+   */
+  private async initLatestSortModeThenLoad(): Promise<void> {
     // 生命周期阶段UIContext已就绪，安全初始化context缓存
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     // 首帧形态初值（§4.6 H-A / §4.8 T-B 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏若不预置
@@ -1070,6 +1087,16 @@ struct ThreadList {
     // 必须在 loadThreads 之前写：缓存 key（forumCacheKey）与请求参数都以 selectedSort 为真源。
     const savedSort: number = AppStorage.get<number>('forumDefaultSort') ?? 0;
     this.selectedSort = savedSort === 1 ? 1 : 0;
+    // 「最新」档子排序恢复（全局档）：0 = 按回复时间 / 1 = 按发帖时间（缺省 1 零回归）。
+    // 同样必须在 loadThreads 之前写（失败静默走缺省）。
+    try {
+      const raw = await CacheManager.getInstance().get(CACHE_KEY.LATEST_SORT_MODE);
+      if (raw === '0' || raw === '1') {
+        this.latestSortMode = parseInt(raw, 10);
+      }
+    } catch (_) {
+      // 读盘失败走缺省 1（现状），不阻塞首屏
+    }
     this.loadThreads();
   }
 
@@ -1687,9 +1714,40 @@ struct ThreadList {
     return `${num}`;
   }
 
-  /** 指定排序的列表缓存 key（省略 sort 时取当前选中排序；预热其它排序时显式传入） */
+  /**
+   * 数据请求真实下发的 sortType（数据侧唯一真源）：仅「最新」档被子档 latestSortMode 改写，
+   * 热门（0）/ 精选（2）原样。UI 段（底栏三钮高亮、横滑手势、selectedSort === 2 精选分支）一律不用本函数。
+   */
+  private effectiveSort(): number {
+    return this.selectedSort === 1 ? this.latestSortMode : this.selectedSort;
+  }
+
+  /** 「最新」档子排序标签（顶栏钮无障碍描述 / toast 共用） */
+  private latestSortLabel(): string {
+    return this.latestSortMode === 0 ? '按回复时间排序' : '按发帖时间排序';
+  }
+
+  /** 「最新」档子排序持久化（全局档，全局 0/1；失败静默不影响功能） */
+  private saveLatestSortMode(): void {
+    CacheManager.getInstance().put(CACHE_KEY.LATEST_SORT_MODE, String(this.latestSortMode)).catch(() => {
+    });
+  }
+
+  /** 子排序点选入口：持久化 + toast + 重新加载（走快照/缓存/网络三层，enterDir=0 直上屏路径） */
+  private applyLatestSort(mode: number): void {
+    this.showLatestSortMenu = false;
+    if (this.latestSortMode === mode) {
+      return;
+    }
+    this.latestSortMode = mode;
+    this.saveLatestSortMode();
+    this.getUIContext().getPromptAction().showToast({ message: `已切换为${this.latestSortLabel()}` });
+    this.loadThreads();
+  }
+
+  /** 指定排序的列表缓存 key（省略 sort 时取当前生效排序 = 含「最新」档子档；预热其它排序时显式传入） */
   private forumCacheKey(sort?: number): string {
-    const s: number = sort === undefined ? this.selectedSort : sort;
+    const s: number = sort === undefined ? this.effectiveSort() : sort;
     return `${CACHE_KEY.FORUM_LIST}_${this.forumName}_${s}`;
   }
 
@@ -1703,7 +1761,8 @@ struct ThreadList {
     if (this.threads.length === 0) {
       return;
     }
-    this.sortSession.set(this.selectedSort, {
+    // 子档隔离：sortSession key 用生效排序（0=回复 / 1=发帖 / 2=精选），最新档两个子档快照互不覆盖
+    this.sortSession.set(this.effectiveSort(), {
       threads: this.threads,
       page: this.page,
       hasMore: this.hasMore,
@@ -1931,8 +1990,8 @@ struct ThreadList {
    * 换排序 = 换内容集，列表同步无动画回顶（保留旧偏移对新排序没有意义）。
    */
   private applySortDisplay(d: SortDisplay): void {
-    // 竞态：数据归属的排序已不是当前排序（快速连点），丢弃
-    if (d.sort !== this.selectedSort) {
+    // 竞态：数据归属的排序已不是当前排序（快速连点 / 最新档内子档切换），丢弃
+    if (d.sort !== this.effectiveSort()) {
       return;
     }
     this.page = d.page;
@@ -1976,17 +2035,17 @@ struct ThreadList {
     const myToken: number = ++this.loadToken;
     // 预取节流基线同步复位：刷新 / 切排序后列表与内容高整体换新，沿用旧偏移基线会漏触发
     this.prefetchGate.reset();
-    // 快照本次请求的排序：期间用户切换排序会再次触发 loadThreads（代际已变），返回时据此丢弃过期结果
-    const mySort: number = this.selectedSort;
+    // 快照本次请求的排序（生效序 = 含最新档子档）：期间用户切换排序/子档会再次触发 loadThreads（代际已变），返回时据此丢弃过期结果
+    const mySort: number = this.effectiveSort();
     if (!forceRefresh && this.page === 1) {
       // 页内会话快照命中（本次进吧期间刚看过该排序）：0 开销秒开，数据足够新不做后台刷新
-      const session = this.sortSession.get(this.selectedSort);
+      const session = this.sortSession.get(mySort);
       if (session && session.threads.length > 0 && Date.now() - session.ts < SORT_SESSION_TTL) {
         this.stalledPages = 0;
         if (this.enterDir !== 0) {
           // 排序切换命中页内快照（快照命中在本 async 函数的第一段、同步执行）：同帧替换 + 起滑
           this.applySortDisplay({
-            sort: this.selectedSort, threads: session.threads,
+            sort: mySort, threads: session.threads,
             page: session.page, hasMore: session.hasMore, state: LoadState.Success,
           });
         } else {
@@ -2013,7 +2072,7 @@ struct ThreadList {
           if (this.enterDir !== 0) {
             // 排序切换命中本地缓存：同帧替换 + 起滑（与首页 Tab 切换同一形态）
             this.applySortDisplay({
-              sort: this.selectedSort, threads: cached.data.threads,
+              sort: mySort, threads: cached.data.threads,
               page: this.page, hasMore: true, state: LoadState.Success,
             });
           } else {
@@ -2033,7 +2092,7 @@ struct ThreadList {
     if (this.enterDir !== 0) {
       // 排序切换未命中缓存：落骨架屏（轻淡入）等网络返回，返回后由 applySortDisplay 滑入
       this.applySortDisplay({
-        sort: this.selectedSort, threads: [], page: this.page, hasMore: true, state: LoadState.Loading,
+        sort: mySort, threads: [], page: this.page, hasMore: true, state: LoadState.Loading,
       });
     } else {
       this.loadState = LoadState.Loading;
@@ -2047,16 +2106,16 @@ struct ThreadList {
     }
     try {
       // 预取合流版：page=1/sort=0 且点击时已起跑预取则直接消费，不另发一次请求；否则原样回落
-      const result = await TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, this.page, this.selectedSort, false);
-      // 竞态防护：请求期间用户已切换排序/刷新，丢弃晚归结果，避免旧排序内容覆盖当前列表
-      if (myToken !== this.loadToken || mySort !== this.selectedSort) {
+      const result = await TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, this.page, mySort, false);
+      // 竞态防护：请求期间用户已切换排序/子档/刷新，丢弃晚归结果，避免旧排序内容覆盖当前列表
+      if (myToken !== this.loadToken || mySort !== this.effectiveSort()) {
         return;
       }
       this.stalledPages = 0;
       if (this.enterDir !== 0) {
         // 排序切换（未命中缓存）：网络返回后同帧替换 + 起滑
         this.applySortDisplay({
-          sort: this.selectedSort, threads: result.list, page: this.page,
+          sort: mySort, threads: result.list, page: this.page,
           hasMore: result.list.length > 0,
           state: result.list.length > 0 ? LoadState.Success : LoadState.Empty,
         });
@@ -2097,9 +2156,9 @@ struct ThreadList {
   private refreshSilently(): void {
     // 竞态防护：静默刷新期间用户可能已切换排序/刷新（代际/排序变化），返回后丢弃过期结果
     const myToken: number = this.loadToken;
-    const mySort: number = this.selectedSort;
-    TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, 1, this.selectedSort, false).then((result) => {
-      if (myToken !== this.loadToken || mySort !== this.selectedSort || result.list.length === 0) {
+    const mySort: number = this.effectiveSort();
+    TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, 1, mySort, false).then((result) => {
+      if (myToken !== this.loadToken || mySort !== this.effectiveSort() || result.list.length === 0) {
         return;
       }
       // 排序切换的过场窗口内（`SORT_ANIM_SETTLE` ≈ 420ms）：只回写缓存、不上屏 ——
@@ -2210,10 +2269,13 @@ struct ThreadList {
       return;
     }
     this.warmupStarted = true;
-    for (const sort of [0, 1, 2]) {
-      if (sort === this.selectedSort) {
-        continue;
-      }
+    // 预热目标 = UI 三个档位各自的缓存 key：热门 0、「最新」= 当前子档 latestSortMode、精选 2。
+    // 「最新」档时另一个子档（回复/发帖互换）与热门同 key（子档 0）或与自身互换，天然被集合覆盖；
+    // 剔除当前生效档后逐个预热，子档互切同样命中缓存秒开。
+    const cur: number = this.effectiveSort();
+    const targets: Set<number> = new Set<number>([0, this.latestSortMode, 2]);
+    targets.delete(cur);
+    for (const sort of targets) {
       try {
         const cached = await CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey(sort));
         if (cached && !cached.expired && cached.data.threads.length > 0) {
@@ -2260,7 +2322,7 @@ struct ThreadList {
     const myToken: number = this.loadToken;
     try {
       const nextPage = this.page + 1;
-      const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, nextPage, this.selectedSort, false);
+      const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, nextPage, this.effectiveSort(), false);
       if (myToken !== this.loadToken) {
         return;
       }
@@ -2322,14 +2384,14 @@ struct ThreadList {
   private async autoLoadMore(): Promise<void> {
     // 竞态防护：自动补页期间用户可能已切换排序/刷新，快照代际+排序，每轮返回校验，不符即停
     const myToken: number = this.loadToken;
-    const mySort: number = this.selectedSort;
+    const mySort: number = this.effectiveSort();
     // Loop to fetch multiple pages until we have enough content or no more data
     while (this.hasMore && this.threads.length < 8) {
       this.loadingMore = true;
       try {
         const nextPage = this.page + 1;
-        const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, nextPage, this.selectedSort, false);
-        if (myToken !== this.loadToken || mySort !== this.selectedSort) {
+        const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, nextPage, mySort, false);
+        if (myToken !== this.loadToken || mySort !== this.effectiveSort()) {
           return;
         }
         const existing: Set<string> = new Set<string>();
@@ -3316,6 +3378,28 @@ struct ThreadList {
           Blank()
 
           Row({ space: Spacing.md }) {
+            // 「最新」档专属排序钮（仅 selectedSort === 1 渲染）：样式与同排搜索 / 更多钮四件套一致
+            if (this.selectedSort === 1) {
+              Button() {
+                Text('⇅')
+                  .fontSize(fs(22, this.fontScale))
+                  .fontColor($r('sys.color.icon_primary'))
+              }
+              .width(44).height(44)
+              .backgroundColor(Theme.segGlass(this.isDark, false))
+              .border({ width: 0.5, color: Theme.manualGlassBorder() })
+              .backgroundBlurStyle(BlurStyle.Thin, { scale: 0.85 })
+              .shadow(Theme.segGlassShadow(this.isDark, false))
+              .borderRadius(Radius.full)
+              .accessibilityText('最新排序方式')
+              .accessibilityDescription(this.latestSortLabel())
+              .onClick(() => {
+                this.showLatestSortMenu = true;
+                Haptic.light();
+              })
+              .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+            }
+
             Button() {
               SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.color.icon_primary')]).fontSize(fs(20, this.fontScale))
             }
@@ -3428,6 +3512,22 @@ struct ThreadList {
 
     // 吧主页右上角「更多」操作面板已改为系统 CustomDialog（systemMaterial 沉浸光感），
     // 由 moreSheetController + @Watch 驱动，页面 body 内不再自绘浮层
+
+    // 「最新」档排序菜单锚点（进吧页 §6.9 同款机制）：菜单不挂在顶栏排序钮上，而是 1×1 隐形锚点
+    // + `Placement.BottomRight` 钉在顶栏右下（top 99 = 顶栏 98 之下 1vp、right 16 = 屏幕右缘留白，
+    // 与进吧页 ForumSortMenu 锚点逐项同值），菜单右缘与进吧页完全同位。
+    // 锚点不参与视觉与交互（1×1 + 全透明 + hitTestBehavior None），弹出仍由顶栏排序钮发起。
+    Row()
+      .width(1)
+      .height(1)
+      .position({ top: 99, right: 16 })
+      .hitTestBehavior(HitTestMode.None)
+      .bindMenu(this.showLatestSortMenu, this.LatestSortMenuContent(), {
+        placement: Placement.BottomRight,
+        targetSpace: LengthMetrics.vp(0),
+        systemMaterial: ImmMaterial.menu(),
+        onDisappear: () => { this.showLatestSortMenu = false; }
+      })
     }
     .width('100%')
     .height('100%')
@@ -3524,6 +3624,26 @@ struct ThreadList {
         Blank()
 
         Row({ space: Spacing.md }) {
+          // 「最新」档专属排序钮（仅 selectedSort === 1 渲染）：热门 / 精选档与搜索态均不显示
+          if (this.selectedSort === 1) {
+            Button() {
+              Text('⇅')
+                .fontSize(fs(22, this.fontScale))
+                .fontColor($r('sys.color.icon_primary'))
+            }
+            .width(44).height(44)
+            .backgroundColor(Color.Transparent)
+            .systemMaterial(ImmMaterial.seg(false))
+            .borderRadius(Radius.full)
+            .accessibilityText('最新排序方式')
+            .accessibilityDescription(this.latestSortLabel())
+            .onClick(() => {
+              this.showLatestSortMenu = true;
+              Haptic.light();
+            })
+            .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+          }
+
           Button() {
             SymbolGlyph($r('sys.symbol.magnifyingglass')).fontColor([$r('sys.color.icon_primary')]).fontSize(fs(20, this.fontScale))
           }
@@ -3560,6 +3680,41 @@ struct ThreadList {
     }
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
+  }
+
+  /**
+   * 「最新」档排序菜单内容（系统 `bindMenu` 的 CustomBuilder，进吧页 ForumSortMenuContent 同款）：
+   * 背景 / 圆角 / 阴影交给 options.systemMaterial，此处只保留菜单项本体（宽 210 / 内边距 / 选中高亮 + ✓）。
+   * 两项语义：0 = 按回复时间排序（sort_type 0）/ 1 = 按发帖时间排序（sort_type 1，现状缺省）。
+   */
+  @Builder
+  LatestSortMenuContent() {
+    Column({ space: 2 }) {
+      this.LatestSortMenuItem(0, '按回复时间排序')
+      this.LatestSortMenuItem(1, '按发帖时间排序')
+    }
+    .padding({ top: 6, bottom: 6 })
+  }
+
+  @Builder
+  LatestSortMenuItem(mode: number, label: string) {
+    Row({ space: 10 }) {
+      Text(label)
+        .fontSize(fs(14, this.fontScale))
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.latestSortMode === mode ? Theme.brand() : Theme.textPrimary(this.isDark))
+        .layoutWeight(1)
+      if (this.latestSortMode === mode) {
+        Text('✓')
+          .fontSize(fs(13, this.fontScale))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Theme.brand())
+      }
+    }
+    .width(210)
+    .padding({ left: 16, right: 16, top: 13, bottom: 13 })
+    .borderRadius(Radius.md)
+    .onClick(() => { this.applyLatestSort(mode); })
   }
 
   /**
@@ -4479,7 +4634,7 @@ struct ThreadList {
     console.info(`[REFRESH] start sort=${this.selectedSort}`);
     try {
       const result = await this.withRefreshTimeout(
-        TiebaService.getInstance().fetchForumThreads(this.forumName, 1, this.selectedSort, false)
+        TiebaService.getInstance().fetchForumThreads(this.forumName, 1, this.effectiveSort(), false)
       );
       this.page = 1;
       this.threads = result.list;

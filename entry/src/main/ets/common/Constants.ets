@@ -168,6 +168,8 @@ export interface CacheKeys {
    * 吧主页 ThreadList 打开时按本档位初始化 selectedSort；缺省 null → 热门，老用户升级零回归。
    */
   FORUM_DEFAULT_SORT: string;
+  /** 吧主页「最新」档子排序偏好：0 = 按回复时间 / 1 = 按发帖时间（缺省 1 = 现状零回归），全局档 */
+  LATEST_SORT_MODE: string;
 }
 
 // 缓存键
@@ -216,6 +218,7 @@ export const CACHE_KEY: CacheKeys = {
   COLUMN_MODE: 'tieba_column_mode',
   IMMERSIVE_READ: 'tieba_immersive_read',
   FORUM_DEFAULT_SORT: 'tieba_forum_default_sort',
+  LATEST_SORT_MODE: 'tieba_latest_sort_mode',
 };
 
 // 缓存过期时间接口

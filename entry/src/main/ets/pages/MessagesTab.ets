@@ -632,9 +632,13 @@ export struct MessagesTab {
       .width('100%')
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', this.topFadeStop()], ['#FFFFFFFF', 1.0]]
+        // 丢帧治理 P2（2026-09-26）：原 DST_IN 蒙版要求内容层整体 blendMode(OFFSCREEN)，
+        // 滚动时每帧全屏离屏合成；改为「顶栏底色 → 透明」渐变条直接盖在内容上（视觉近似，零离屏）。
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', this.topFadeStop()]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
 
@@ -918,7 +922,6 @@ export struct MessagesTab {
     })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .overlay(this.BottomFadeOverlay())
-    .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
   }
 
   build() {

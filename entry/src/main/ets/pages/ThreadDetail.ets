@@ -126,6 +126,17 @@ const DETAIL_DOCK_TABLET_WIDTH: number = 400;
 const DETAIL_COL_BALANCE_THRESHOLD: number = 240;
 
 /**
+ * P4 楼层渐进挂载（2026-09-26 丢帧治理）：
+ * Scroll + Column 楼层「全量渲染」在长帖下首帧构建成本高、滚动期每帧布局/绘制树大（历史
+ * floor-vanish 修复的代价）。渐进挂载 = 只渲染 floors 前缀（非虚拟容器，不触碰历史视口剔除 bug）：
+ * 首屏挂 INITIAL 批，滚动距已挂载末尾不足 AHEAD 时按 BATCH 追加；跳楼/消息定位在定位前
+ * 先把目标层扩进挂载前缀（scrollToTargetFloor 内处理）。
+ */
+const DETAIL_FLOOR_INITIAL_MOUNT: number = 12;
+const DETAIL_FLOOR_MOUNT_BATCH: number = 12;
+const DETAIL_FLOOR_MOUNT_AHEAD_VP: number = 1800;
+
+/**
  * 「帖子沉浸式阅读」（设置 → 个性化，AppStorage `immersiveReading`，2026-09-18）：
  * 向下滑累计 24vp → 藏起顶栏三钮 / 排序胶囊 / 评论底栏；向上滑累计 12vp → 恢复显示。
  * 阈值不对称（24 / 12，用户拍板）：上滑更容易唤出，符合「要操作就先给我 UI」的预期。
@@ -858,6 +869,12 @@ struct ThreadDetail {
   @State floorsOpacity: number = 0;
   private floorsRevealTimer: number = -1;
   /**
+   * P4 楼层渐进挂载（2026-09-26 丢帧治理）：FloorColumnsBlock 只渲染 floors 的前缀
+   * mountedFloorCount 层（@State 驱动重渲染），滚动接近末尾按批追加、定位前按需扩到目标层。
+   * 非虚拟容器：已挂载卡片 key 稳定复用，与历史 floor-vanish 修复不冲突。
+   */
+  @State mountedFloorCount: number = 0;
+  /**
    * 骨架屏是否已获准出现（§P0-4 首屏免骨架屏）：
    * 首屏 open 时先按住 120ms —— 这段窗口内命中缓存（预取/内存/磁盘）就直接出内容，
    * 全程不出现骨架屏，也就没有"骨架屏一闪 → 内容"的白等；超时未出内容才放行骨架屏。
@@ -1034,6 +1051,8 @@ struct ThreadDetail {
     }
     this.detail = result.detail;
     this.floors = result.floors;
+    // P4：floors 整体替换同步重排挂载前缀（首装取 INITIAL 批；补水/刷新保留已增长量）
+    this.resetFloorMount();
     this.floorDataSource.setData(result.floors);
     this.totalFloorPage = result.detail.totalPage ?? 1;
     this.hasMoreFloors = this.currentPage < this.totalFloorPage;
@@ -1086,6 +1105,52 @@ struct ThreadDetail {
       && this.floors.some((floor: FloorItem): boolean => floor.floorId === this.targetFloorId);
   }
 
+  // ===== P4 楼层渐进挂载（2026-09-26 丢帧治理）=====
+
+  /** 当前应渲染的楼层前缀（FloorColumnsBlock 单列 ForEach 与多列分桶统一读这里） */
+  private mountedFloors(): FloorItem[] {
+    if (this.mountedFloorCount >= this.floors.length) {
+      return this.floors;
+    }
+    return this.floors.slice(0, this.mountedFloorCount);
+  }
+
+  /**
+   * floors 整体替换（applyDetailResult：缓存秒开 / 网络刷新 / 身份补水 / 切排序·只看楼主重载）
+   * 时重置挂载前缀：首装取 INITIAL 批；已有挂载量取「max(旧挂载量, INITIAL)」——
+   * 身份补水/后台刷新会整体重赋 floors，若重置回小值会让已滚到深处的视图塌掉跳屏；
+   * 切排序保留挂载量只是多渲染若干卡片，安全。
+   */
+  private resetFloorMount(): void {
+    const target: number = Math.min(this.floors.length,
+      Math.max(this.mountedFloorCount, DETAIL_FLOOR_INITIAL_MOUNT));
+    if (target !== this.mountedFloorCount) {
+      this.mountedFloorCount = target;
+    }
+  }
+
+  /** 把挂载前缀扩到至少 count 层（不超过 floors 实长；只增不减） */
+  private mountFloorsUpTo(count: number): void {
+    const target: number = Math.min(this.floors.length, count);
+    if (target > this.mountedFloorCount) {
+      this.mountedFloorCount = target;
+    }
+  }
+
+  /**
+   * 滚动期挂载推进（挂在两条 onScroll 链上）：距已挂载内容末尾不足 AHEAD_VP 时追加一批。
+   * detailContentH / detailViewportH 由内容层 onAreaChange 采集（分栏/竖屏两路径同源）。
+   */
+  private maybeMountMoreFloors(yOffset: number): void {
+    if (this.mountedFloorCount >= this.floors.length
+      || this.detailViewportH <= 0 || this.detailContentH <= 0) {
+      return;
+    }
+    if (yOffset + this.detailViewportH + DETAIL_FLOOR_MOUNT_AHEAD_VP >= this.detailContentH) {
+      this.mountFloorsUpTo(this.mountedFloorCount + DETAIL_FLOOR_MOUNT_BATCH);
+    }
+  }
+
   /**
    * 滚动并高亮目标楼层（消息点击跳转）。
    * 返回是否完成几何定位：目标楼层尚未加载或首帧几何信息未就绪时返回 false，
@@ -1098,6 +1163,13 @@ struct ThreadDetail {
     if (this.highlightFloorId === this.targetFloorId) {
       // 已定位过；若还需触发楼中楼定位（首次楼层高亮后超时中断的情形），在此兜底补发
       return true;
+    }
+    // P4：目标楼层在数据里但尚未进挂载前缀 → 先扩到目标层（多留一批余量），
+    // 本轮返回 false，由 scheduleScrollToTargetFloor 的帧后重试在渲染完成后取几何定位
+    const targetIdx: number = this.floors.findIndex((f: FloorItem): boolean => f.floorId === this.targetFloorId);
+    if (targetIdx >= this.mountedFloorCount) {
+      this.mountFloorsUpTo(targetIdx + 1 + DETAIL_FLOOR_MOUNT_BATCH);
+      return false;
     }
     const floorId: string = this.targetFloorId;
     const targetId: string = `floor_${floorId}`;
@@ -2377,10 +2449,13 @@ struct ThreadDetail {
   }
 
   /**
-   * 顶部满宽渐显带（DST_IN 遮罩，同 Search.TopFadeOverlay / ThreadList.BottomFadeOverlay 模板）：
-   * 纵向渐变（顶端全透明 → 带底全不透明）作为 alpha 源，内容滚入顶栏区域时自上而下「渐显」，
-   * 而非被顶栏硬切一刀。高度固定 = 吧名胶囊下沿（TOP_FADE_BAND_HEIGHT = 44 状态栏让位 + 44 胶囊高），
+   * 顶部满宽渐显带（丢帧治理 P2 2026-09-26：原 DST_IN 遮罩要求内容层整体 blendMode(OFFSCREEN)，
+   * 滚动时每帧全屏离屏合成 + 回读，大屏旗舰 120Hz 下 GPU 填充率瓶颈；改为「页面底色 → 透明」
+   * 渐变条直接盖在内容上，视觉近似（内容被底色渐隐 ≈ alpha 渐显）且零离屏。
+   * 高度固定 = 吧名胶囊下沿（TOP_FADE_BAND_HEIGHT = 44 状态栏让位 + 44 胶囊高），
    * 带外内容不受影响、不参与命中测试。因为只挂在楼层内容层上，悬浮顶栏（返回/分享/吧名胶囊）保持全实。
+   * 回退 = 恢复 linearGradient colors 两档 alpha 形态 + .blendMode(DST_IN, OFFSCREEN)，
+   * 以及两处内容容器的 .blendMode(SRC_OVER, OFFSCREEN)。
    */
   @Builder
   TopFadeBand() {
@@ -2389,9 +2464,11 @@ struct ThreadDetail {
       .height(TOP_FADE_BAND_HEIGHT)
       .linearGradient({
         direction: GradientDirection.Bottom,
-        colors: [['#00FFFFFF', 0.0], ['#FFFFFFFF', 1.0]]
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
+        ]
       })
-      .blendMode(BlendMode.DST_IN, BlendApplyType.OFFSCREEN)
       .hitTestBehavior(HitTestMode.None)
   }
 
@@ -2621,9 +2698,11 @@ struct ThreadDetail {
                 })
                 // 沉浸阅读（2026-09-18）：方向阈值驱动顶栏 / 底栏显隐（左栏主楼不挂，见 onDetailScroll 注释）
                 // 无感翻页（2026-09-19）：同一挂点串联滚动预取（.onScroll 只能挂一个，不能另起挂点）
+                // P4（2026-09-26）：同一挂点再串联楼层渐进挂载推进
                 .onScroll((xOffset: number, yOffset: number) => {
                   this.onDetailScroll(xOffset, yOffset);
                   this.onDetailScrollPrefetch();
+                  this.maybeMountMoreFloors(yOffset);
                 })
               }
               .width('100%')
@@ -2634,7 +2713,6 @@ struct ThreadDetail {
             .height('100%')
             .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
             .overlay(this.TopFadeBand(), { align: Alignment.Top })
-            .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
             .backgroundColor(Theme.bg(this.isDark))
             .opacity(this.contentOpacity)
             .translate({ y: this.contentTranslateY })
@@ -2693,16 +2771,17 @@ struct ThreadDetail {
           .id('thread_scroll_content')
           // 沉浸阅读（2026-09-18）：方向阈值驱动顶栏 / 底栏显隐
           // 无感翻页（2026-09-19）：同一挂点串联滚动预取（.onScroll 只能挂一个，不能另起挂点）
+          // P4（2026-09-26）：同一挂点再串联楼层渐进挂载推进
           .onScroll((xOffset: number, yOffset: number) => {
             this.onDetailScroll(xOffset, yOffset);
             this.onDetailScrollPrefetch();
+            this.maybeMountMoreFloors(yOffset);
           })
           // 沉浸：绘制扩展到状态栏与底部安全区，滚动可视区 = 整屏，无独立裁剪层
           .clip(false)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
           // 顶部满宽渐显带：只挂在楼层内容层上（悬浮顶栏是同级兄弟节点，不受此遮罩影响，胶囊钮保持全实）
           .overlay(this.TopFadeBand(), { align: Alignment.Top })
-          .blendMode(BlendMode.SRC_OVER, BlendApplyType.OFFSCREEN)
           .backgroundColor(Theme.bg(this.isDark))
           .opacity(this.contentOpacity)
           .translate({ y: this.contentTranslateY })
@@ -3539,7 +3618,9 @@ struct ThreadDetail {
   FloorColumnsBlock() {
     if (this.replyColumns() > 1) {
       Row({ space: Spacing.md }) {
-        ForEach(this.floorColumnsData(), (col: FloorItem[], colIdx: number) => {
+        // P4：分桶只吃挂载前缀（mountedFloors），滚动推进逐批扩前缀；
+        // 分桶为前缀稳定贪心，旧卡落列不变，key 稳定复用零重建
+        ForEach(this.floorColumnsData(this.mountedFloors()), (col: FloorItem[], colIdx: number) => {
           Column({ space: Spacing.md }) {
             ForEach(col, (floor: FloorItem) => {
               this.FloorCardItem(floor)
@@ -3556,7 +3637,8 @@ struct ThreadDetail {
       // 哨兵之间用的，单列时 ForEach 直接展开会被它一并套用 → 楼层卡之间偏松（2026-09-18 真机反馈）。
       // 此处独立容器给 sm，只影响单列卡间距；表头 / 哨兵与外层的间距（12）不变，多列档列内间距（md）不变。
       Column({ space: Spacing.sm }) {
-        ForEach(this.floors, (floor: FloorItem) => {
+        // P4：单列同样只渲染挂载前缀
+        ForEach(this.mountedFloors(), (floor: FloorItem) => {
           this.FloorCardItem(floor)
         }, (floor: FloorItem) => `${floor.floorId}_${floor.floor}`)
       }
@@ -3571,7 +3653,7 @@ struct ThreadDetail {
    * 高度为**确定性估算**（正文行数 + 图片宫格行 + 楼中楼条 + 固定件），同步可算、无测量循环；
    * 分桶是前缀稳定贪心：翻页追加时从头重算，旧卡落列不变（不跳位），定位 / 高亮 id 随卡走零改动。
    */
-  private floorColumnsData(): FloorItem[][] {
+  private floorColumnsData(list: FloorItem[]): FloorItem[][] {
     const cols: number = this.replyColumns();
     const buckets: FloorItem[][] = [];
     const heights: number[] = [];
@@ -3581,7 +3663,7 @@ struct ThreadDetail {
     }
     // 列宽（估算正文换行用）：屏宽 − 横向 padding(lg×2) − 列间 gap(md×(cols−1))
     const colWidth: number = (this.currentWidth - Spacing.lg * 2 - Spacing.md * (cols - 1)) / cols;
-    for (let i = 0; i < this.floors.length; i++) {
+    for (let i = 0; i < list.length; i++) {
       let target: number = i % cols;
       let shortest: number = 0;
       for (let c = 1; c < cols; c++) {
@@ -3592,8 +3674,8 @@ struct ThreadDetail {
       if (heights[target] - heights[shortest] > DETAIL_COL_BALANCE_THRESHOLD) {
         target = shortest;
       }
-      buckets[target].push(this.floors[i]);
-      heights[target] += this.estimateFloorCardHeight(this.floors[i], colWidth) + Spacing.md;
+      buckets[target].push(list[i]);
+      heights[target] += this.estimateFloorCardHeight(list[i], colWidth) + Spacing.md;
     }
     return buckets;
   }

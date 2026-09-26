@@ -83,8 +83,13 @@ struct ImagePreview {
    * 明明本地已有同图文件还要冷启动网络栈整图重下，这就是「第一张图慢」的根因。
    */
   @State imageSources: Record<string, string> = {};
-  /** 已发起过后台解析链的 URL（去重；同一 url 只 kick 一次） */
+  /** 已发起过基础档解析链的 URL（去重；同一 url 的基础档只 kick 一次） */
   private kickedUrls: Set<string> = new Set<string>();
+  /** 已发起过高清档（pv_ 720/原图）下载的 URL：只对当前图拉取，邻图滑到当前时才补拉
+   *  （丢帧治理 P3 2026-09-26：削减翻页时 720 文件的下载与解码突发） */
+  private hdKickedUrls: Set<string> = new Set<string>();
+  /** +2 远邻图延迟预取定时器（滑动停歇后再取；翻页/退出时作废重排） */
+  private farNeighborTimer: number = -1;
   /** 已拿到高清档的 URL：防止基础档结果晚到时把高清显示降级覆盖回去 */
   private hdDoneUrls: Set<string> = new Set<string>();
 
@@ -133,11 +138,14 @@ struct ImagePreview {
     if (this.currentIndex >= this.urls.length - 3) {
       this.appendStreamPage();
     }
-    // 预览提速（P1 同步直出 + P2 邻图预取）：当前图闸门插队（priority=1），
-    // 左右邻图普通档；基础档与详情宫格共用 HASH 归一缓存，大多数字图已是本地文件。
-    for (const off of [-1, 0, 1, 2]) {
-      this.kickImage(this.currentIndex + off, off === 0 ? 1 : 0);
+    // 预览提速（P1 同步直出 + P2 邻图预取 / P3 收紧 2026-09-26）：当前图闸门插队（priority=1）
+    // 且含高清档；左右紧邻图普通档只拉基础档（720 高清档等滑到成为当前图时再拉）；
+    // +2 远邻图延迟到滑动停歇后（350ms）再拉基础档。基础档与详情宫格共用 HASH 归一缓存，
+    // 大多数字图已是本地文件。
+    for (const off of [-1, 0, 1]) {
+      this.kickImage(this.currentIndex + off, off === 0 ? 1 : 0, off === 0);
     }
+    this.scheduleFarNeighborKick();
   }
 
   /**
@@ -165,6 +173,10 @@ struct ImagePreview {
   }
 
   aboutToDisappear(): void {
+    if (this.farNeighborTimer >= 0) {
+      clearTimeout(this.farNeighborTimer);
+      this.farNeighborTimer = -1;
+    }
     this.restoreStatusBar();
   }
 
@@ -268,10 +280,13 @@ struct ImagePreview {
         .onChange((index: number) => {
           this.currentIndex = index;
           this.resetZoom();
-          // P2 邻图预取：翻到新页即补齐它的邻域（kickedUrls 去重，重复触发零开销）
-          for (const off of [-1, 0, 1, 2]) {
-            this.kickImage(index + off, off === 0 ? 1 : 0);
+          // P2 邻图预取 / P3 收紧（2026-09-26）：翻到新页即补齐 ±1 邻域基础档（kickedUrls 去重，
+          // 重复触发零开销）；新当前图此时才拉高清档（hdKickedUrls 去重，已拉过则跳过）；
+          // +2 远邻图延迟到滑动停歇后再取，避免翻页动画期叠加 720 下载/解码突发
+          for (const off of [-1, 0, 1]) {
+            this.kickImage(index + off, off === 0 ? 1 : 0, off === 0);
           }
+          this.scheduleFarNeighborKick();
           // 流式补页触发：距已加载图片末尾还剩 3 张时开始拉下一页，尽量让用户滑到头时新图已就位
           if (index >= this.urls.length - 3) {
             this.appendStreamPage();
@@ -414,15 +429,16 @@ struct ImagePreview {
   }
 
   /**
-   * 单图解析链（2026-09-23 预览提速）：
+   * 单图解析链（2026-09-23 预览提速；P3 收紧 2026-09-26）：
    * ① P1 同步直出：getVerifiedCachedPath 命中（宫格显示/预热已落地的同 HASH 文件，
    *    90% 以上场景）→ 本帧即 file:// 上屏，零网络等待——这是「第一张图慢」的根治点；
    * ② 基础档：未命中时 resolve（与宫格在途请求按缓存文件名合流，不重复下载），落地即显示；
    * ③ P4 高清档：resolvePreview 拉 w%3D720（独立 pv_ 缓存），落地后静默替换——
    *    全屏 Contain 与双击/捏合放大的清晰度终态，高于改前的 400 档。
-   * 整条链只占一个闸门槽位（priority：当前图 1 插队 / 邻图 0），失败静默回落直连。
+   *    P3：高清档只在 includeHd=true（当前图）时拉取；邻图滑到成为当前图时由翻页回调补拉。
+   * 每条链各占一个闸门槽位（priority：当前图 1 插队 / 邻图 0），失败静默回落直连。
    */
-  private kickImage(idx: number, priority: number): void {
+  private kickImage(idx: number, priority: number, includeHd: boolean): void {
     if (idx < 0 || idx >= this.urls.length) {
       return;
     }
@@ -430,36 +446,61 @@ struct ImagePreview {
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       return;
     }
-    if (this.kickedUrls.has(url)) {
-      return;
-    }
-    this.kickedUrls.add(url);
     // ① 同步直出：Z1 校验口径（≥阈值字节、非已知占位模板），与详情宫格首帧同一语义
     const local: string | null = ImageCache.getVerifiedCachedPath(url);
     if (local !== null) {
       this.setLocalSrc(url, local, false);
     }
-    (async (): Promise<void> => {
-      await acquireImagePreloadSlot(priority);
-      try {
-        if (local === null) {
-          // ② 基础档：in-flight 合流——宫格那条解析还在路上时这里直接等它，不排第二次队
-          const basic: string = await ImageCache.resolve(url);
-          if (basic.startsWith('file://')) {
-            this.setLocalSrc(url, basic, false);
+    if (!this.kickedUrls.has(url)) {
+      this.kickedUrls.add(url);
+      (async (): Promise<void> => {
+        await acquireImagePreloadSlot(priority);
+        try {
+          if (local === null) {
+            // ② 基础档：in-flight 合流——宫格那条解析还在路上时这里直接等它，不排第二次队
+            const basic: string = await ImageCache.resolve(url);
+            if (basic.startsWith('file://')) {
+              this.setLocalSrc(url, basic, false);
+            }
           }
+        } catch (e) {
+          // 静默：显示侧维持原始 URL 直连（与改前行为一致），不影响浏览
+        } finally {
+          releaseImagePreloadSlot();
         }
-        // ③ 高清档：无宽度参数的 URL 本身即原图，resolvePreview 内部与基础档同文件，不重复下载
-        const hd: string = await ImageCache.resolvePreview(url);
-        if (hd.startsWith('file://')) {
-          this.setLocalSrc(url, hd, true);
+      })();
+    }
+    if (includeHd && !this.hdKickedUrls.has(url)) {
+      this.hdKickedUrls.add(url);
+      (async (): Promise<void> => {
+        await acquireImagePreloadSlot(priority);
+        try {
+          // ③ 高清档：无宽度参数的 URL 本身即原图，resolvePreview 内部与基础档同文件，不重复下载
+          const hd: string = await ImageCache.resolvePreview(url);
+          if (hd.startsWith('file://')) {
+            this.setLocalSrc(url, hd, true);
+          }
+        } catch (e) {
+          // 静默：显示侧维持基础档/原始 URL 直连，不影响浏览
+        } finally {
+          releaseImagePreloadSlot();
         }
-      } catch (e) {
-        // 静默：显示侧维持原始 URL 直连（与改前行为一致），不影响浏览
-      } finally {
-        releaseImagePreloadSlot();
-      }
-    })();
+      })();
+    }
+  }
+
+  /**
+   * P3（2026-09-26）：+2 远邻图延迟预取——翻页动画与当前图高清档下载/解码期间不抢
+   * 闸门与网络，停歇 350ms 后再以普通档拉基础档（清旧定时器防连翻堆积）。
+   */
+  private scheduleFarNeighborKick(): void {
+    if (this.farNeighborTimer >= 0) {
+      clearTimeout(this.farNeighborTimer);
+    }
+    this.farNeighborTimer = setTimeout(() => {
+      this.farNeighborTimer = -1;
+      this.kickImage(this.currentIndex + 2, 0, false);
+    }, 350);
   }
 
   private getScale(idx: number): number {
