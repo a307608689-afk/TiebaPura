@@ -18,13 +18,17 @@
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
-import { display } from '@kit.ArkUI';
+import { curves, display } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { NotifyMessage } from '../model/DataModel';
 import { Theme, Spacing, Radius, fs, isDarkMode, ImmMaterial, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { formatTime } from '../common/Constants';
+import {
+  ImmersiveReadSensor, IMMERSIVE_EXTRA_FLY_SCALE, IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 
 /**
  * 消息主 Tab 页：分为「回复我的」与「提到我的」两个子列表。
@@ -160,6 +164,16 @@ export struct MessagesTab {
   @State columnMode: number = 0;
   @StorageLink('darkTick') @Watch('onDarkTick') darkTick: number = 0;
   @StorageLink('tabLoginRefresh') @Watch('onLoginTick') tabLoginRefresh: number = 0;
+  // ===== 「沉浸式阅读补全」（2026-09-29，设置 → 个性化）=====
+  /** 设置项真源：AppStorage `immersiveReadExtra`（独立开关，默认关） */
+  @StorageLink('immersiveReadExtra') @Watch('onNotifyImmersiveExtraChanged') immersiveReadExtra: boolean = false;
+  /** 当前主 Tab 真源（Index.switchTab 维护）：仅自己为当前 Tab（=3）时才允许驱动宿主底栏 */
+  @StorageLink('currentMainTab') currentMainTab: number = 0;
+  /** 沉浸态：true = 顶栏胶囊与宿主底栏已藏起。只存页面局部 @State（本页随 Tab 切换卸载，状态自然复位） */
+  @State immersiveHidden: boolean = false;
+  /** 回复 / 提到我的两个子 Tab 各持一份判定器（基线独立，防切子 Tab 互污） */
+  private replyImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
+  private atImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
 
   private replyState: NotifyTabState = messagesCache.reply;
   private atState: NotifyTabState = messagesCache.at;
@@ -402,6 +416,7 @@ export struct MessagesTab {
       return;
     }
     this.selectedTab = tab;
+    this.resetNotifyImmersive();
     this.syncAll();
     // changeIndex 切换即带左右滑动动画（该 SDK 版本仅支持单参）
     this.tabsCtrl.changeIndex(this.tabIndexOf(tab));
@@ -414,12 +429,92 @@ export struct MessagesTab {
       return;
     }
     this.selectedTab = tab;
+    this.resetNotifyImmersive();
     this.syncAll();
     this.ensureTabLoaded(tab);
   }
 
   private tabIndexOf(tab: NotifyTab): number {
     return tab === NotifyTab.At ? 1 : 0;
+  }
+
+  // ===== 「沉浸式阅读补全」交互（2026-09-29，设置 → 个性化 / AppStorage `immersiveReadExtra`）=====
+
+  /**
+   * 子 Tab 消息列表滚动 → 沉浸显隐判定。规则与 ThreadDetail 逐项同源（24 藏 / 12 露 + 置顶 8 恒显示 + 跳变 240 丢弃）。
+   * 两个子 Tab 各持一份判定器（基线独立）。本页为条件挂载 Tab：离开即卸载，本地状态自然复位。
+   */
+  private notifyImmersiveScroll(tab: NotifyTab, scroller: Scroller): void {
+    if (!this.immersiveReadExtra) {
+      if (this.immersiveHidden) {
+        this.setNotifyImmersiveHidden(false);
+      }
+      return;
+    }
+    let pos: number = 0;
+    try {
+      pos = scroller.currentOffset().yOffset;
+    } catch (e) {
+      return;
+    }
+    const sensor: ImmersiveReadSensor = tab === NotifyTab.Reply ? this.replyImmersiveSensor : this.atImmersiveSensor;
+    const act = sensor.feed(pos);
+    if (act === 'hide') {
+      this.setNotifyImmersiveHidden(true);
+    } else if (act === 'show' || act === 'reset') {
+      this.setNotifyImmersiveHidden(false);
+    }
+  }
+
+  /** 翻转沉浸态（本地 @State，值变化才写）+ 驱动宿主底栏（仅当前 Tab = 3 消息 才写） */
+  private setNotifyImmersiveHidden(hidden: boolean): void {
+    if (this.immersiveHidden === hidden) {
+      return;
+    }
+    this.immersiveHidden = hidden;
+    this.replyImmersiveSensor.setHidden(hidden);
+    this.atImmersiveSensor.setHidden(hidden);
+    // TabIndex.Messages = 3（Index.ets 私有枚举，此处以数值对齐）
+    if (this.currentMainTab === 3) {
+      AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', hidden);
+    }
+  }
+
+  /** 复位沉浸判定（切子 Tab / 关开关）：清基线 + 恢复显示 */
+  private resetNotifyImmersive(): void {
+    this.replyImmersiveSensor.resetBaseline();
+    this.atImmersiveSensor.resetBaseline();
+    if (this.immersiveHidden) {
+      this.replyImmersiveSensor.setHidden(false);
+      this.atImmersiveSensor.setHidden(false);
+      this.immersiveHidden = false;
+      if (this.currentMainTab === 3) {
+        AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', false);
+      }
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即恢复显示 */
+  private onNotifyImmersiveExtraChanged(): void {
+    if (!this.immersiveReadExtra) {
+      this.resetNotifyImmersive();
+    }
+  }
+
+  /** 顶栏隐藏位移（vp，向上）：= 官方标题栏高 108 × 0.6 ≈ −65（同「收回」口径，其余交给 opacity 淡出） */
+  private notifyTopSink(): number {
+    return -(NOTIFY_TITLE_BAR_HEIGHT * IMMERSIVE_EXTRA_FLY_SCALE);
+  }
+
+  /** 显隐动画参数（藏 / 唤不对称）：取值以目标态为准 */
+  private notifyImmersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   private openThread(item: NotifyMessage): void {
@@ -487,6 +582,11 @@ export struct MessagesTab {
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 48, bottom: 20 })
     .backgroundColor(Color.Transparent)
     .zIndex(14)
+    // 沉浸阅读补全（2026-09-29）：兜底路径顶栏整行上移 + 淡出 + 禁用命中
+    .translate({ y: this.immersiveHidden ? this.notifyTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.notifyImmersiveAnim())
   }
 
   /**
@@ -520,6 +620,11 @@ export struct MessagesTab {
     }
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 48, bottom: 20 })
+    // 沉浸阅读补全（2026-09-29）：槽高固定 108 不参与内容布局（列表自带让位），整行上移 + 淡出
+    .translate({ y: this.immersiveHidden ? this.notifyTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.notifyImmersiveAnim())
   }
 
   @Builder
@@ -808,6 +913,8 @@ export struct MessagesTab {
             } else {
               this.atScrollY = this.atScroller.currentOffset().yOffset;
             }
+            // 沉浸式阅读补全（2026-09-29）：多列分支滚动判定
+            this.notifyImmersiveScroll(tab, tab === NotifyTab.Reply ? this.replyScroller : this.atScroller);
           })
           .onAppear(() => {
             // §4.4：加载后 UI 重建 → 立即恢复到重建前的滚动位置（用户感知"原地续接"，不跳）
@@ -858,6 +965,10 @@ export struct MessagesTab {
           .clip(false)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
           .onReachEnd(() => { this.loadMessages(tab, false); })
+          // 沉浸式阅读补全（2026-09-29）：单列分支滚动判定（多列分支在既有 onScroll 内）
+          .onScroll(() => {
+            this.notifyImmersiveScroll(tab, tab === NotifyTab.Reply ? this.replyScroller : this.atScroller);
+          })
           }
           .width('100%')
           .height('calc(100% - 98vp)')

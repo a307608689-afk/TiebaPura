@@ -17,6 +17,7 @@
  */
 
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, fs } from '../common/Theme';
+import { PerfTrace } from '../common/PerfTrace';
 import { ImageCache } from '../cache/ImageCache';
 import {
   acquireImagePreloadSlot as acquireImagePreloadSlotInner,
@@ -494,8 +495,22 @@ export struct ThreadCard {
     }
   }
 
-  /** 写入本地缓存路径（触发重渲染）+ 检查自愈（替代 @Watch） */
+  /**
+   * 写入本地缓存路径（触发重渲染）+ 检查自愈（替代 @Watch）。
+   *
+   * 2026-09-30 留痕（跨卡错峰已撤销）：曾试「给每张卡一个由 tid 决定的 0~160ms 稳定相位，
+   * 把同一瞬间到期的多次落地摊到不同帧上」。机制**确实生效**（同毫秒提交数上限从 7~8 降到 ≤3），
+   * 但对长帧**无改善** —— 两轮实测 avgMax 68→50/48、worstMax 125→67 的改善全部来自
+   * CacheManager.pruneByPrefix 的修复（见该文件 §T1），把这次错峰单独拆出来看没有可测收益。
+   * 而它的代价是实打实的：图片（本地高清档替换 srcPic 缩略图）上屏最多延后 160ms，
+   * 且每张卡多挂一个待决定时器。按「无收益即回退」撤销，避免把未论证的行为改动带进发布版，
+   * 否则下一份 AGC 报告的增量无法干净归因。
+   * 2026-09-29 留痕：更早一版「80ms 卡内合并」同样真机证伪（合并比仅 1.23:1，且新增 293 个定时器）。
+   */
   private setCachedImage(u: string, local: string): void {
+    // P0-2 归因打点：本方法整体换 Record 对象触发本卡重渲染，是「滚动中图片落地顿帧」
+    // 的首要嫌疑（每张图一次），计数后可与此窗口的帧间隔分布直接对齐
+    PerfTrace.mark('imgLand');
     const next: Record<string, string> = {};
     const keys: string[] = Object.keys(this.cachedImageMap);
     for (const k of keys) {
@@ -513,6 +528,11 @@ export struct ThreadCard {
     this.seedCachedImages();
     this.preloadImages();
   }
+
+  // 2026-09-29 撤销 @Reusable 复用（P1）：复用路径的正确性完全依赖 aboutToReuse 完整恢复
+  // item 与全部回调，任一参数缺失/时序异常即「卡片显示 A、点开却是 B」（真机实测复现）。
+  // 且 HomeTab 的 onTap 闭包捕获 item 而非转发 tid，放大了脱钩后果。流畅度收益已由
+  // 吧主页窗口化挂载（ThreadList v2）覆盖大半，正确性优先，整体回退。
 
   /**
    * Z1：同步预填已确认安全的本地缓存路径（组件创建时执行一次，整表一次性赋值）。
@@ -858,12 +878,114 @@ export struct ThreadCard {
     .borderRadius(26)
   }
 
+  /** P2（2026-09-28）宫格解码降采样 —— 真机证伪并已撤销（2026-09-29 丢帧治理 S1）。
+   *  模拟器探针曾判定 `sourceSize {w,0}` = 等比缩放解码；真机 95s 手动滑动实测给出反证：
+   *  `AceImage: Invalid SourceSize, using image size.` 出现 **501 次**，随后
+   *  `ImageSource: CreatePixelMap success, dSize:(0,0), sSize:(960,960)` —— sourceSize 被判无效、
+   *  实际按**全尺寸**解码：优化零收益，反而每次多一次属性设置 + 一条告警（每 2s 数条）。
+   *  故直接删除，回到 P2 之前的全尺寸解码行为（零视觉差异），此处留痕备日后重做。
+   *  ⚠️ 若将来重做，必须真机单点验证「Invalid SourceSize 是否仍出现」并逐像素比对不变形。 */
+
+  @Builder
+  GridCellContent(img: string, idx: number) {
+    if (this.cachedImageMap[img] !== undefined) {
+      // 本地真图（2026-09-20 宫格秒加载三级解析的第一级；降采样已在 2026-09-29 真机证伪后移除）
+      if (this.cardColumns > 1) {
+        Image(this.gridDisplayUrl(img, idx))
+          .width('100%')
+          .aspectRatio(1)
+          .constraintSize({
+            maxHeight: (this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100
+          })
+          .borderRadius(Radius.md)
+          // 图位底色（2026-09-30）：图未到达、或已被判定为"确认占位"（贴吧对失效图返回长条/贴字占位图，
+          // 客户端识别后拒绝上屏）时，阶梯重试窗口 [0,2s,8s,30s] 内不再是一片纯空白 ——
+          // 与页面底色同源，视觉上是一个凹陷的"图位"，重试成功或整卡降级后自动被覆盖/替换。
+          .backgroundColor(Theme.bg(isDarkMode()))
+          .objectFit(ImageFit.Cover)
+          .onError(() => {
+            this.handleGridImageError(img);
+          })
+          .onComplete((event) => {
+            if (!event) return;
+            this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
+          })
+      } else {
+        Image(this.gridDisplayUrl(img, idx))
+          .width('100%')
+          .height((this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100)
+          .borderRadius(Radius.md)
+          // 图位底色（2026-09-30）：图未到达、或已被判定为"确认占位"（贴吧对失效图返回长条/贴字占位图，
+          // 客户端识别后拒绝上屏）时，阶梯重试窗口 [0,2s,8s,30s] 内不再是一片纯空白 ——
+          // 与页面底色同源，视觉上是一个凹陷的"图位"，重试成功或整卡降级后自动被覆盖/替换。
+          .backgroundColor(Theme.bg(isDarkMode()))
+          .objectFit(ImageFit.Cover)
+          .onError(() => {
+            this.handleGridImageError(img);
+          })
+          .onComplete((event) => {
+            if (!event) return;
+            this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
+          })
+      }
+    } else {
+      // 直连路径（srcPic 缩略图 / bigPic 原图）：保持原样，占位检测依赖 onComplete 原始尺寸
+      if (this.cardColumns > 1) {
+        Image(this.gridDisplayUrl(img, idx))
+          .width('100%')
+          .aspectRatio(1)
+          .constraintSize({
+            maxHeight: (this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100
+          })
+          .borderRadius(Radius.md)
+          // 图位底色（2026-09-30）：图未到达、或已被判定为"确认占位"（贴吧对失效图返回长条/贴字占位图，
+          // 客户端识别后拒绝上屏）时，阶梯重试窗口 [0,2s,8s,30s] 内不再是一片纯空白 ——
+          // 与页面底色同源，视觉上是一个凹陷的"图位"，重试成功或整卡降级后自动被覆盖/替换。
+          .backgroundColor(Theme.bg(isDarkMode()))
+          .objectFit(ImageFit.Cover)
+          .onError(() => {
+            this.handleGridImageError(img);
+          })
+          .onComplete((event) => {
+            if (!event) return;
+            this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
+          })
+      } else {
+        Image(this.gridDisplayUrl(img, idx))
+          .width('100%')
+          .height((this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100)
+          .borderRadius(Radius.md)
+          // 图位底色（2026-09-30）：图未到达、或已被判定为"确认占位"（贴吧对失效图返回长条/贴字占位图，
+          // 客户端识别后拒绝上屏）时，阶梯重试窗口 [0,2s,8s,30s] 内不再是一片纯空白 ——
+          // 与页面底色同源，视觉上是一个凹陷的"图位"，重试成功或整卡降级后自动被覆盖/替换。
+          .backgroundColor(Theme.bg(isDarkMode()))
+          .objectFit(ImageFit.Cover)
+          .onError(() => {
+            this.handleGridImageError(img);
+          })
+          .onComplete((event) => {
+            if (!event) return;
+            this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
+          })
+      }
+    }
+  }
+
   /**
    * 单图加载失败：onError 后重试一次 ImageCache.resolve（带贴吧 UA/Referer/Cookie 的下载），
    * 多数偶发失败(网络抖动/原 URL 被防盗链)能命中本地缓存自愈，不立即锁死降级。
    */
   private handleSingleImageError(): void {
-    const u: string = this.getItem().images![0];
+    // 2026-09-28 崩溃护栏：模拟器深滑实测 jscrash（shortUrl 读 undefined.length）——
+    // onError 异步到达时 images 可能已被数据侧清空（同步源刷新/合并路径），images![0] 取到
+    // undefined 直接崩进程。此处只防御不改变行为：无有效 URL 直接 return（retryOrFail 对
+    // undefined 本就按 imageFailed 处理，return 与其等价且免崩溃）。
+    const imgs: string[] | undefined = this.getItem().images;
+    if (!imgs || imgs.length === 0 || !imgs[0]) {
+      hilog.warn(LOG_DOMAIN, TAG, 'onError single SKIP: images empty/invalid');
+      return;
+    }
+    const u: string = imgs[0];
     hilog.warn(LOG_DOMAIN, TAG, 'onError single url=%{public}s', shortUrl(u));
     ImageCache.debugLog(`card onError single url=${shortUrl(u)}`);
     this.retryOrFail(u);
@@ -878,9 +1000,14 @@ export struct ThreadCard {
    */
   private handleSingleImageComplete(loadingStatus: number, w: number, h: number): void {
     if (loadingStatus === 1 && ((w === 200 && h === 200) || (w === 238 && h === 238))) {
-      ImageCache.debugLog(`card onComplete PLACEHOLDER ${w}x${h} url=${shortUrl(this.getItem().images![0])}`);
-      if (!this.cachedImageMap[this.getItem().images![0]]) {
-        this.retryOrFail(this.getItem().images![0]);
+      // 同 handleSingleImageError 的崩溃护栏：onComplete 异步到达时 images 可能已空
+      const imgs: string[] | undefined = this.getItem().images;
+      if (!imgs || imgs.length === 0 || !imgs[0]) {
+        return;
+      }
+      ImageCache.debugLog(`card onComplete PLACEHOLDER ${w}x${h} url=${shortUrl(imgs[0])}`);
+      if (!this.cachedImageMap[imgs[0]]) {
+        this.retryOrFail(imgs[0]);
       }
     }
   }
@@ -981,37 +1108,7 @@ export struct ThreadCard {
                 // 多图格几何：单列档保持现状格高（2/4 张 140、其余 100）；多列档列宽随列数变，
                 // 改 1:1 比例，避免比例失真（§4.2 决策 6）。两种写法互斥（height 与 aspectRatio 同设会冲突）。
                 // 封顶同单列档：防止列宽变宽后多图格也变得比手机大。
-                if (this.cardColumns > 1) {
-                  // 2026-09-20 宫格秒加载：显示 URL 三级解析（本地缓存 → srcPic 缩略图 → bigPic 原图）
-                  Image(this.gridDisplayUrl(img, idx))
-                    .width('100%')
-                    .aspectRatio(1)
-                    .constraintSize({
-                      maxHeight: (this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100
-                    })
-                    .borderRadius(Radius.md)
-                    .objectFit(ImageFit.Cover)
-                    .onError(() => {
-                      this.handleGridImageError(img);
-                    })
-                    .onComplete((event) => {
-                      if (!event) return;
-                      this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
-                    })
-                } else {
-                  Image(this.gridDisplayUrl(img, idx))
-                    .width('100%')
-                    .height((this.getImageCount() === 2 || this.getImageCount() === 4) ? 140 : 100)
-                    .borderRadius(Radius.md)
-                    .objectFit(ImageFit.Cover)
-                    .onError(() => {
-                      this.handleGridImageError(img);
-                    })
-                    .onComplete((event) => {
-                      if (!event) return;
-                      this.handleGridImageComplete(img, event.loadingStatus, event.width, event.height);
-                    })
-                }
+                this.GridCellContent(img, idx)
               }
             }, (img: string, idx: number) => `${idx}`)
           }

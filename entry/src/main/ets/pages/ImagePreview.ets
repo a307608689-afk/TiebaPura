@@ -17,7 +17,8 @@
  */
 
 import { common } from '@kit.AbilityKit';
-import { window } from '@kit.ArkUI';
+import { window, curves } from '@kit.ArkUI';
+import image from '@ohos.multimedia.image';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { HttpClient } from '../network/HttpClient';
@@ -25,6 +26,7 @@ import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
 import { FloorItem } from '../model/DataModel';
 import { ImageCache, acquireImagePreloadSlot, releaseImagePreloadSlot } from '../cache/ImageCache';
 import { Theme, Spacing, Radius, isDarkMode, MaterialManager, fs } from '../common/Theme';
+import { PerfTrace } from '../common/PerfTrace';
 
 /**
  * 图片流式补页一次触发的最大请求页数：楼层页里可能有整页无图（纯文字楼层），
@@ -37,15 +39,70 @@ const MAX_STREAM_FETCH_PER_TRIGGER: number = 2;
  */
 const MAX_STREAM_PAGES: number = 20;
 
-@Entry
+/**
+ * 一镜到底（2026-09-27 v2，自绘飞行层方案）：飞行/黑幕弹簧参数真源（ThreadDetail 引用）。
+ * geometryTransition 的「两端内容交叉淡化」机制会造成飞行途中两个比例的图重叠、
+ * 退出时大图提前淡出（闪现感），调参无法根除——改为宿主自绘单节点飞行层后，
+ * 弹簧只驱动「一个矩形 + 一张图 + 一层黑幕」，时序完全自控。
+ * 关闭方向 response 更大（约 650ms 落定），按用户要求「非线性、慢些」。
+ */
+export const PREVIEW_MORPH_SPRING_RESPONSE: number = 0.34;
+export const PREVIEW_MORPH_CLOSE_SPRING_RESPONSE: number = 0.42;
+export const PREVIEW_MORPH_SPRING_DAMPING: number = 0.9;
+export const PREVIEW_MORPH_MS: number = 420;
+export const PREVIEW_MORPH_CLOSE_MS: number = 400;
+
+/** 打开方向弹簧（宫格 → 全屏） */
+export function previewMorphOpenAnim(): AnimateParam {
+  return {
+    duration: PREVIEW_MORPH_MS,
+    curve: curves.springMotion(PREVIEW_MORPH_SPRING_RESPONSE, PREVIEW_MORPH_SPRING_DAMPING)
+  };
+}
+
+/** 关闭方向弹簧（全屏 → 宫格） */
+export function previewMorphCloseAnim(): AnimateParam {
+  return {
+    duration: PREVIEW_MORPH_CLOSE_MS,
+    curve: curves.springMotion(PREVIEW_MORPH_CLOSE_SPRING_RESPONSE, PREVIEW_MORPH_SPRING_DAMPING)
+  };
+}
+
+/**
+ * 图片预览主体（2026-09-27 组件化）：原 @Entry 页面逻辑整体抽为本组件——
+ * ① `pages/ImagePreview` 路由页保留（楼中楼详情 SubPostDetail 仍走 pushUrl，默认转场）；
+ * ② ThreadDetail 以全屏模态 bindContentCover 挂载本组件；一镜到底由**宿主自绘飞行层**
+ *    完成（模态本体瞬开瞬收、与飞行层同帧交接，见 ThreadDetail morphOverlay*）。
+ * 关闭链路：关闭钮/系统返回 → 复位缩放 → onClose(currentIndex) 回传当前图索引，
+ * 宿主据此定位飞回的宫格格子。
+ */
 @Component
-struct ImagePreview {
+export struct PreviewView {
+  /** 路由/宿主透传参数（urls/index/tid/sortType/seeLz/forumId/commentRn/loadedPage/totalPage） */
+  previewParams: Record<string, Object> | undefined = undefined;
+  /** 关闭请求（宿主置 true）：@Watch 复位缩放后回调 onClose */
+  @Prop @Watch('onClosingChanged') closing: boolean = false;
+  /** 请求宿主关闭（路由页=router.back；模态=宿主收模态+飞行层接管），回传当前图索引 */
+  onClose: (currentIndex: number) => void = (_index: number): void => {};
+  /**
+   * 一镜到底交接位图（2026-09-27 v2.2）：宿主在打开 morph 时解码好的 PixelMap——
+   * 预览首帧直接上屏该位图，消除新 Image 节点对本地文件的二次解码空窗。
+   * initialPixelMapPath = 位图解码自哪个本地文件：仅当该图出现「不同路径」的更高清
+   * 落地（720 升级）时才切回 URL 源，同文件路径变化不切（防自 swap 造成的解码闪）。
+   */
+  initialPixelMap: image.PixelMap | null = null;
+  initialPixelMapPath: string = '';
+  /** 初始图真实上屏（onLoad）时回调一次：宿主据此撤飞行层遮罩 */
+  onReady: () => void = (): void => {};
+
   @State urls: string[] = [];
   @State currentIndex: number = 0;
+  /** 打开时的初始图索引（交接位图只服务这一页） */
+  private initialIndex: number = -1;
+  /** 交接位图已切回 URL 源（该图高清档升级落地时置 true，一次性） */
+  @State initialPmSwapped: boolean = false;
   @State isDark: boolean = isDarkMode();
   @StorageLink('fontScale') fontScale: number = 1.0;
-  /** 页面可见时自增，强制组件重建使字号实时生效 */
-  @State fontSizeTick: number = 0;
   // ===== 图片流式补页（2026-09-17）=====
   // 由 ThreadDetail 打开浏览时随路由参数带入分页上下文，滑到已加载图片末尾就继续拉后续楼层页，
   // 追加这些楼层（含其楼中楼）的图片，使用户不需先滚回列表加载楼层才能滑到那张图。
@@ -64,9 +121,6 @@ struct ImagePreview {
   /** 本次浏览允许补到的最大页码（totalPage 与会话上限取小） */
   private maxStreamPage: number = 0;
 
-  onPageShow(): void {
-    this.fontSizeTick++;
-  }
   @State saving: boolean = false;
   @State showControls: boolean = true;
   @State viewportWidth: number = 360;
@@ -119,7 +173,8 @@ struct ImagePreview {
   aboutToAppear(): void {
     MaterialManager.init();
     this.hideStatusBar();
-    const params = this.getUIContext().getRouter().getParams() as Record<string, Object>;
+    // 组件化（2026-09-27）：参数由宿主/路由页透传（previewParams），不再读路由
+    const params: Record<string, Object> | undefined = this.previewParams;
     const routeUrls: Object | undefined = params ? params.urls : undefined;
     if (Array.isArray(routeUrls)) {
       this.urls = (routeUrls as Object[])
@@ -135,6 +190,7 @@ struct ImagePreview {
     if (params && params.index !== undefined) {
       this.currentIndex = Number(params.index) || 0;
     }
+    this.initialIndex = this.currentIndex;
     this.isDark = isDarkMode();
     // 流式补页上下文：只有从帖子详情页带上下文进来才有补页能力，其它调用点（单图预览等）保持原行为
     this.initImageStream(params);
@@ -183,6 +239,17 @@ struct ImagePreview {
     this.streamEnded = false;
   }
 
+  /**
+   * 关闭请求（宿主经 closing 置 true 触发，系统返回/侧滑路径）：
+   * 先复位缩放（带缩放的图片参与反向 morph 会以放大态飞行，观感错误），再走统一 onClose。
+   */
+  onClosingChanged(): void {
+    if (this.closing) {
+      this.resetZoom();
+      this.onClose(this.currentIndex);
+    }
+  }
+
   aboutToDisappear(): void {
     if (this.farNeighborTimer >= 0) {
       clearTimeout(this.farNeighborTimer);
@@ -222,10 +289,16 @@ struct ImagePreview {
               // 双击放大/缩回瞬间不再重新解码位图，消除"闪一下"
               // src 三级解析（P1/P4）：本地高清 > 本地基础档 > 原始 URL 直连（改前行为）；
               // 后台解析落地后经 imageSources 整体赋值热替换，布局/手势/几何零改动
-              Image(this.srcOf(idx))
+              Image(this.displaySrc(idx))
                 .width('100%')
                 .height('100%')
                 .objectFit(ImageFit.Contain)
+                .onComplete(() => {
+                  // 初始图真实上屏：通知宿主撤飞行层遮罩（预览首帧稳定后才露全貌）
+                  if (idx === this.initialIndex) {
+                    this.onReady();
+                  }
+                })
                 .onError(() => { this.handleImageError(idx); })
                 .scale({ x: this.getScale(idx), y: this.getScale(idx) })
                 .translate({ x: this.getPanX(idx), y: this.getPanY(idx) })
@@ -275,6 +348,9 @@ struct ImagePreview {
             }
             .width('100%')
             .height('100%')
+            // 一镜到底 v2（2026-09-27）：morph 由宿主自绘飞行层完成——模态本体瞬开瞬收、
+            // 与飞行层同帧交接（终态帧逐像素一致），本页不再挂 geometryTransition
+            // （其「两端内容交叉淡化」机制是双影/闪现感的根源）。
             .onAreaChange((_oldArea: Area, newArea: Area) => {
               if (idx === this.currentIndex) {
                 const w = Math.max(1, Number(newArea.width));
@@ -351,7 +427,11 @@ struct ImagePreview {
             .backgroundColor(Theme.glassControlSolid(true))
             .border({ width: 0.5, color: Theme.glassControlLine(true) })
             .shadow({ radius: 12, color: '#40000000', offsetY: 2 })
-            .onClick(() => { this.getUIContext().getRouter().back(); })
+            .onClick(() => {
+              // 关闭钮：复位缩放后统一走 onClose（路由页=router.back；模态=宿主收起+飞行层接管）
+              this.resetZoom();
+              this.onClose(this.currentIndex);
+            })
 
             // 保存改用系统安全控件 SaveButton：点击即临时获得图库写入授权（约 10 秒），
             // 因此无需在 module.json5 声明 READ/WRITE_IMAGEVIDEO，也无需运行时弹权限申请。
@@ -426,6 +506,23 @@ struct ImagePreview {
   }
 
   /**
+   * 初始图的显示源（2026-09-27 v2.2）：优先用宿主解码好的交接位图（零解码空窗），
+   * 直到该图出现「不同路径」的更高清落地（720 升级到与位图不同的文件）才切回 URL 源。
+   * 同文件路径反复写不触发切换（防自 swap 造成二次解码闪）。
+   */
+  private displaySrc(idx: number): string | image.PixelMap {
+    if (idx === this.initialIndex && this.initialPixelMap !== null
+      && !this.initialPmSwapped && this.initialPixelMapPath.length > 0) {
+      const url: string = this.urls[idx] ?? '';
+      const cur: string | undefined = this.imageSources[url];
+      if (cur === undefined || cur === this.initialPixelMapPath) {
+        return this.initialPixelMap;
+      }
+    }
+    return this.srcOf(idx);
+  }
+
+  /**
    * 写入本地显示路径（整体赋新对象触发重渲染）。isHd=false 的基础档结果若晚于高清档
    * 到达则丢弃，避免显示被降级覆盖。
    */
@@ -435,6 +532,13 @@ struct ImagePreview {
     }
     if (!isHd && this.hdDoneUrls.has(url)) {
       return;
+    }
+    // 初始图的交接位图：仅当高清落地文件与位图来源不同（真升级）时切回 URL 源；
+    // 同文件（位图本来就是高清档）不切，防自 swap 造成二次解码闪
+    if (isHd && this.initialPixelMap !== null && !this.initialPmSwapped
+      && path !== this.initialPixelMapPath
+      && this.initialIndex >= 0 && url === this.urls[this.initialIndex]) {
+      this.initialPmSwapped = true;
     }
     const next: Record<string, string> = {};
     const keys: string[] = Object.keys(this.imageSources);
@@ -873,5 +977,36 @@ struct ImagePreview {
     } finally {
       this.saving = false;
     }
+  }
+}
+
+/**
+ * 路由页薄壳（2026-09-27 组件化）：保留 `pages/ImagePreview` 的 @Entry 注册——
+ * 楼中楼详情（SubPostDetail）仍走 pushUrl 打开本页（系统默认转场，零变化）。
+ * 主体逻辑全部在上方 PreviewView 组件内；ThreadDetail 的一镜到底模态也挂载同一组件。
+ */
+@Entry
+@Component
+struct ImagePreview {
+  @State pageParams: Record<string, Object> | undefined = undefined;
+
+  aboutToAppear(): void {
+    // P0-2 归因打点：预览页是报告 TOP5 之一（单机强度高、设备数少），登记页面上下文
+    PerfTrace.setPage('ImagePreview');
+    this.pageParams = this.getUIContext().getRouter().getParams() as Record<string, Object> | undefined;
+  }
+
+  build() {
+    // @Entry build 根必须是容器：薄壳包一层全屏 Stack
+    Stack() {
+      PreviewView({
+        previewParams: this.pageParams,
+        onClose: (): void => {
+          this.getUIContext().getRouter().back();
+        }
+      })
+    }
+    .width('100%')
+    .height('100%')
   }
 }

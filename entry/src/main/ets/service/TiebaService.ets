@@ -21,14 +21,15 @@ import { taskpool } from '@kit.ArkTS';
 import { HttpClient } from '../network/HttpClient';
 import { ProtoSchema } from '../network/ProtoSchema';
 import { TiebaProtoDecoder } from '../network/TiebaProtoDecoder';
-import { decodePbPageTask } from '../network/DetailDecodeTask';
+import { decodePbPageTask, decodeFrsPageTask, decodePbFloorTask } from '../network/DetailDecodeTask';
 import { connection } from '@kit.NetworkKit';
 import { AuthManager } from './AuthManager';
 import { UsageHabitsManager } from './UsageHabitsManager';
 import { CacheManager } from '../cache/CacheManager';
 import { ImageCache } from '../cache/ImageCache';
+import { PerfTrace } from '../common/PerfTrace';
 import { API, stripHtml, extractImages, extractGroup, decodeHtmlEntities, formatTime, CACHE_KEY, CACHE_TTL } from '../common/Constants';
-import { AbstractMessage, PbContentMessage, PostMessage, PostInfoListMessage, SubPostListMessage, FrsPageResponseMessage, ThreadInfoMessage, UserMessage, AgreeMessage, PbPageResponseMessage, GoodClassifyMessage } from '../model/TiebaProtoSchema';
+import { AbstractMessage, PbContentMessage, PostMessage, PostInfoListMessage, SubPostListMessage, FrsPageResponseMessage, ThreadInfoMessage, UserMessage, AgreeMessage, PbPageResponseMessage, PbFloorResponseMessage, GoodClassifyMessage } from '../model/TiebaProtoSchema';
 import {
   ThreadItem, ThreadDetail, FloorItem, CommentItem, SubPostDetail, UserStats, PersonalContentItem,
   FollowItem, Conversation, MessageItem, PagedResult, PublishResult, ForumHeaderInfo,
@@ -344,6 +345,26 @@ const PREFETCH_ATTEMPTED_CAP: number = 500;
 const PB_CLIENT_VERSION: string = '22.11.1.0';
 const PB_USER_AGENT: string = 'tieba/22.11.1.0';
 
+/**
+ * 吧主页「热门」榜（2026-09-30 路线 1）：服务端 `frs/page` 只有 sort_type 0（按最后回复时间）/ 1（按发帖时间）
+ * 两档 —— 而 UI 的「热门」档原先直接用 0，于是与「最新·按回复时间」内容完全一致。
+ * 现改为客户端热度榜：并发抓 `HOT_RANK_PAGES` 页 sort_type 0（时间序，覆盖最近活跃帖）→ 去重 →
+ * 置顶保持前置、其余按 `回复数 + 点赞×2` 降序 → 过滤冷帖（精品/置顶免过滤；过滤后不足保底条数则不过滤）。
+ * 热度只看回复数与点赞数：`createTime` 是展示串（"54 分钟前"）无法参与计算，故不做时间衰减。
+ */
+export const HOT_RANK_PAGES: number = 2;
+/**
+ * 榜单上屏条数上限（2026-09-30 修正）：热门榜一次上屏的卡片会各触发自身图片的"挂载即发"直连下载
+ * （该路径刻意不吃全局闸门，见图片加载治理），首版聚合 58 条时真机实测 **205 个图片请求 / 峰值并发 39**
+ * → 被 CDN 限流、大批 onError → 宫格显示空白。收敛为"榜"（前 N 条）后首屏图片量减半，失败随之消失；
+ * 榜单之后的翻页继续走服务端时间序（loadMore 从 HOT_RANK_PAGES+1 页续接），浏览深度不受影响。
+ */
+export const HOT_RANK_CAP: number = 30;
+/** 冷帖阈值：热度分 < 本值且非精品 → 不进热门榜 */
+const HOT_MIN_SCORE: number = 6;
+/** 保底条数：过滤后不足该条数则放弃过滤（只排序），避免热门榜太空 */
+const HOT_MIN_KEEP: number = 18;
+
 export interface ThreadDetailResult {
   detail: ThreadDetail;
   floors: FloorItem[];
@@ -478,7 +499,7 @@ export class TiebaService {
     }
     const t0: number = Date.now();
     const task: Promise<PagedResult<ThreadItem> | undefined> =
-      this.fetchForumThreads(kw, 1, 2, false)
+      this.fetchForumThreads(kw, 1, 2, false, 0, true)
         .then((result: PagedResult<ThreadItem>): PagedResult<ThreadItem> => {
           console.info(`[PREFETCH] good ${kw} ok n=${result.list.length} cost=${Date.now() - t0}ms`);
           return result;
@@ -1137,7 +1158,7 @@ export class TiebaService {
    * 获取某个吧的帖子列表
    */
   async fetchForumThreads(forumName: string, page: number = 1, sortType: number = 0, enrichAuthors: boolean = true,
-    goodClassId: number = 0): Promise<PagedResult<ThreadItem>> {
+    goodClassId: number = 0, isPrefetch: boolean = false): Promise<PagedResult<ThreadItem>> {
     const isGoodMode: boolean = sortType === 2;
     const t0: number = Date.now();
     console.info(`[FRS] enter kw=${forumName} page=${page} sort=${sortType} isGood=${isGoodMode} cid=${goodClassId}`);
@@ -1146,7 +1167,7 @@ export class TiebaService {
       console.info(`[FRS] proto SKIP kw=${forumName} sort=${sortType} failStreak=${this.protoFailStreak}`);
     } else {
       try {
-        const protoResult = await this.requestForumThreadsProto(forumName, page, sortType, isGoodMode, enrichAuthors, goodClassId);
+        const protoResult = await this.requestForumThreadsProto(forumName, page, sortType, isGoodMode, enrichAuthors, goodClassId, isPrefetch);
         if (protoResult.list.length > 0) {
           console.info(`[FRS] proto OK kw=${forumName} sort=${sortType} n=${protoResult.list.length} cost=${Date.now() - t0}ms`);
           this.protoFailStreak = 0;
@@ -1229,6 +1250,63 @@ export class TiebaService {
     throw new Error(`贴吧“${forumName}”暂时没有可显示的帖子`);
   }
 
+  /** 热度分（回复数 + 点赞×2）：不引入时间衰减 —— ThreadItem.createTime 是展示串，无法参与计算 */
+  private hotScore(item: ThreadItem): number {
+    return item.replyNum + (item.likeCount ?? 0) * 2;
+  }
+
+  /**
+   * 「热门」档数据（客户端热度榜，2026-09-30）：并发抓前者干页 → 合并去重 → 排序 + 冷帖过滤。
+   * 首屏一次性把榜单算好再上屏（不先出第 1 页再重排，避免列表内容二次跳动）；
+   * 后续翻页由页面侧按服务端时间序继续取（榜单之后自然衔接时间流）。
+   * 单页失败不致命：用已到页继续成榜，全部失败才抛错（由页面走错误态）。
+   */
+  async fetchForumHotRank(forumName: string, isPrefetch: boolean = false): Promise<PagedResult<ThreadItem>> {
+    const t0: number = Date.now();
+    const reqs: Promise<PagedResult<ThreadItem>>[] = [];
+    for (let p: number = 1; p <= HOT_RANK_PAGES; p++) {
+      // 第 1 页走合流版：命中「点击吧卡片即起跑的预取」时不再另发一次请求（省一个 RTT）
+      reqs.push((p === 1
+        ? this.fetchForumThreadsCoalesced(forumName, 1, 0, false)
+        : this.fetchForumThreads(forumName, p, 0, false, 0, isPrefetch))
+        .catch((): PagedResult<ThreadItem> => ({ list: [], hasMore: false, page: p } as PagedResult<ThreadItem>)));
+    }
+    const pages: PagedResult<ThreadItem>[] = await Promise.all(reqs);
+    const seen: Set<string> = new Set<string>();
+    const merged: ThreadItem[] = [];
+    for (const page of pages) {
+      for (const item of page.list) {
+        if (!seen.has(item.tid)) {
+          seen.add(item.tid);
+          merged.push(item);
+        }
+      }
+    }
+    if (merged.length === 0) {
+      console.info(`[FRS] HOT rank EMPTY kw=${forumName} cost=${Date.now() - t0}ms`);
+      throw new Error(`贴吧“${forumName}”暂时没有可显示的帖子`);
+    }
+    const pinned: ThreadItem[] = [];
+    const normal: ThreadItem[] = [];
+    for (const item of merged) {
+      if (item.isTop === true) {
+        pinned.push(item);
+      } else {
+        normal.push(item);
+      }
+    }
+    normal.sort((a: ThreadItem, b: ThreadItem): number => this.hotScore(b) - this.hotScore(a));
+    const kept: ThreadItem[] = normal.filter((t: ThreadItem): boolean =>
+      t.isGood === true || this.hotScore(t) >= HOT_MIN_SCORE);
+    const useFiltered: boolean = kept.length >= HOT_MIN_KEEP;
+    const list: ThreadItem[] = pinned.concat(useFiltered ? kept : normal);
+    // 榜单条数上限：控制首屏卡片数 = 控制"挂载即发"的直连图片请求量（见 HOT_RANK_CAP 注释）
+    const capped: ThreadItem[] = list.length > HOT_RANK_CAP ? list.slice(0, HOT_RANK_CAP) : list;
+    console.info(`[FRS] HOT rank kw=${forumName} raw=${merged.length} pinned=${pinned.length} ` +
+      `kept=${capped.length} filtered=${useFiltered ? 1 : 0} cost=${Date.now() - t0}ms`);
+    return { list: capped, hasMore: true, page: HOT_RANK_PAGES } as PagedResult<ThreadItem>;
+  }
+
   // ---- 吧列表点击即预取（利用路由转场窗口后台取首屏，吧页打开时合流消费，不新增请求） ----
   // 与详情页预取的关键区别：这里**不写任何缓存** —— 结果只暂存到被页面消费或超时。
   // 这样既不会用空列表覆盖本地好缓存，也无需在服务侧复刻页面私有的 forumCacheKey 格式。
@@ -1263,7 +1341,7 @@ export class TiebaService {
     }
     const t0: number = now;
     const task: Promise<PagedResult<ThreadItem> | undefined> =
-      this.fetchForumThreads(kw, 1, 0, false)
+      this.fetchForumThreads(kw, 1, 0, false, 0, true)
         .then((result: PagedResult<ThreadItem>): PagedResult<ThreadItem> => {
           console.info(`[PREFETCH] forum ${kw} ok n=${result.list.length} cost=${Date.now() - t0}ms`);
           return result;
@@ -1325,7 +1403,7 @@ export class TiebaService {
   }
 
   private async requestForumThreadsProto(forumName: string, page: number, sortType: number, isGood: boolean, enrichAuthors: boolean = true,
-    goodClassId: number = 0): Promise<PagedResult<ThreadItem>> {
+    goodClassId: number = 0, isPrefetch: boolean = false): Promise<PagedResult<ThreadItem>> {
     const common = ProtoSchema.commonRequest(new Map<string, string | number>([
       ['_client_type', 2],
       ['_client_version', '12.64.1.1'],
@@ -1360,11 +1438,12 @@ export class TiebaService {
         'Client-Type': '2',
         'Charset': 'UTF-8',
         'Referer': 'https://tieba.baidu.com/'
-      }),
+      }, isPrefetch),
       2000,
       'frs proto'
     );
-    const decoded: FrsPageResponseMessage = TiebaProtoDecoder.decodeFrsPageResponse(binary);
+    // 2026-09-29 性能优化：解码下沉 taskpool worker（理由见 decodeFrsPageOffMain）
+    const decoded: FrsPageResponseMessage = await this.decodeFrsPageOffMain(binary);
     const errorCode = decoded.error?.errorCode ?? 0;
     if (errorCode !== 0) {
       throw new Error(decoded.error?.userMsg ?? decoded.error?.errorMsg ?? `贴吧列表接口错误 ${errorCode}`);
@@ -1603,6 +1682,10 @@ export class TiebaService {
       // §Z2（2026-09-19）：prune 是「全表 getAll + 逐条前缀 JSON.parse」，而详情落盘正好发生在
       // 首屏淡入的同一帧里，每次都清会掉帧；改为每 4 次写入清一次（上限 20，突发期内最多多留 3 条，
       // 仍是有界收敛，TTL 10 分钟同样兜底）。
+      // §T1（2026-09-30）：真机归因显示，这里 4 次一清（≈5s 一次）仍把「全表扫描」稳定压在了
+      // 滚动帧上（95s 内 19 次 prune、覆盖 15/32 个长帧）。频率与时机控制已下沉到
+      // CacheManager.pruneByPrefix（最小间隔 60s + 触发后延迟 1.2s 执行），此处保持「每 4 次写入
+      // 探一次」即可 —— 被节流挡掉的调用只花一次时间戳比较，不再是全表扫描。
       this.detailWritesSincePrune += 1;
       if (this.detailWritesSincePrune >= TiebaService.DETAIL_PRUNE_EVERY_WRITES) {
         this.detailWritesSincePrune = 0;
@@ -1665,7 +1748,7 @@ export class TiebaService {
     if (this.pendingThreadDetailPrefetch.has(key)) {
       return; // 已在途，防重复请求
     }
-    const task: Promise<ThreadDetailResult | undefined> = this.fetchThreadDetail(normalizedTid, 1, 0, false, forumId, 3, 0, '')
+    const task: Promise<ThreadDetailResult | undefined> = this.fetchThreadDetail(normalizedTid, 1, 0, false, forumId, 3, 0, '', undefined, true)
       .then((result: ThreadDetailResult): Promise<ThreadDetailResult | undefined> => {
         // prefetched=true：预取项在逐出时优先级最低，先把"押注"让给真访问
         this.putThreadDetailCache(key, result, true);
@@ -1934,6 +2017,8 @@ export class TiebaService {
    * taskpool 异常（worker 创建失败 / 序列化失败等）时回退主线程同步解码，行为与改造前完全一致。
    */
   private async decodePbPageOffMain(binary: ArrayBuffer): Promise<PbPageResponseMessage> {
+    // P0-2 归因打点：解码（含 taskpool 与主线程兜底两条路）是主线程重活嫌疑之一
+    PerfTrace.mark('decode');
     try {
       const task: taskpool.Task = new taskpool.Task(decodePbPageTask, binary);
       const decoded = await taskpool.execute(task) as PbPageResponseMessage;
@@ -1945,9 +2030,44 @@ export class TiebaService {
   }
 
   /**
+   * 吧列表解码下沉 taskpool（2026-09-29 流畅度批次）：frs/page 50 条/页 + 全量图片/媒体字段，
+   * 逐字段解析在主线程与进吧转场/列表滚动同期。只下沉纯解码，模型映射段
+   * （resolveAuthorInfo / normalizeAvatar 等依赖 this）留主线程，边界与 decodePbPageOffMain 一致。
+   */
+  private async decodeFrsPageOffMain(binary: ArrayBuffer): Promise<FrsPageResponseMessage> {
+    // P0-2 归因打点：同 decodePbPageOffMain（吧列表页解码计数）
+    PerfTrace.mark('decode');
+    try {
+      const task: taskpool.Task = new taskpool.Task(decodeFrsPageTask, binary);
+      const decoded = await taskpool.execute(task) as FrsPageResponseMessage;
+      return decoded;
+    } catch (e) {
+      hilog.warn(0x0000, 'TDPERF', 'frs page taskpool decode FALLBACK err=%{public}s', `${(e as Error).message ?? '?'}`);
+      return TiebaProtoDecoder.decodeFrsPageResponse(binary);
+    }
+  }
+
+  /**
+   * 楼中楼解码下沉 taskpool（2026-09-29 流畅度批次）：pb/floor 回包随楼中楼条数可达数十~数百 KB，
+   * 打开楼中楼详情时与路由转场同期。边界同上。
+   */
+  private async decodePbFloorOffMain(binary: ArrayBuffer): Promise<PbFloorResponseMessage> {
+    // P0-2 归因打点：同 decodePbPageOffMain（楼中楼解码计数）
+    PerfTrace.mark('decode');
+    try {
+      const task: taskpool.Task = new taskpool.Task(decodePbFloorTask, binary);
+      const decoded = await taskpool.execute(task) as PbFloorResponseMessage;
+      return decoded;
+    } catch (e) {
+      hilog.warn(0x0000, 'TDPERF', 'pb floor taskpool decode FALLBACK err=%{public}s', `${(e as Error).message ?? '?'}`);
+      return TiebaProtoDecoder.decodePbFloorResponse(binary);
+    }
+  }
+
+  /**
    * 获取帖子详情与楼层
    */
-  async fetchThreadDetail(tid: string, page: number = 1, sortType: number = 0, seeLz: boolean = false, forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = '', onIdentityHydrated?: (result: ThreadDetailResult) => void): Promise<ThreadDetailResult> {
+  async fetchThreadDetail(tid: string, page: number = 1, sortType: number = 0, seeLz: boolean = false, forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = '', onIdentityHydrated?: (result: ThreadDetailResult) => void, isPrefetch: boolean = false): Promise<ThreadDetailResult> {
     const normalizedTid = tid.trim();
     if (normalizedTid.length === 0) {
       throw new Error('缺少帖子 ID，无法加载详情');
@@ -1959,7 +2079,7 @@ export class TiebaService {
     let shellResult: ThreadDetailResult | null = null;
     try {
       const __tp0: number = Date.now();
-      const payload = await this.requestThreadPage(normalizedTid, page, sortType, seeLz, forumId, commentRn, commentSortType, parentPid);
+      const payload = await this.requestThreadPage(normalizedTid, page, sortType, seeLz, forumId, commentRn, commentSortType, parentPid, isPrefetch);
       const __tp1: number = Date.now();
       const modernResult = this.parseModernThreadDetail(payload, normalizedTid, page, parentPid);
       // §Z3-lite：解析完立即后台预热楼层头像，首屏渲染时大多已命中本地文件
@@ -2070,7 +2190,8 @@ export class TiebaService {
       'Charset': 'UTF-8',
       'Referer': 'https://tieba.baidu.com/'
     });
-    const decoded = TiebaProtoDecoder.decodePbFloorResponse(binary);
+    // 2026-09-29 性能优化：解码下沉 taskpool worker（理由见 decodePbFloorOffMain）
+    const decoded = await this.decodePbFloorOffMain(binary);
     const errorCode: number = decoded.error?.errorCode ?? 0;
     if (errorCode !== 0) {
       throw new Error(decoded.error?.userMsg ?? decoded.error?.errorMsg ?? `楼中楼接口错误 ${errorCode}`);
@@ -2879,7 +3000,7 @@ export class TiebaService {
     };
   }
 
-  private async requestThreadPage(tid: string, page: number, sortType: number = 0, seeLz: boolean = false, forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = ''): Promise<ModernApiPayload> {
+  private async requestThreadPage(tid: string, page: number, sortType: number = 0, seeLz: boolean = false, forumId: string = '', commentRn: number = 3, commentSortType: number = 0, parentPid: string = '', isPrefetch: boolean = false): Promise<ModernApiPayload> {
     // _client_version 用 PB_CLIENT_VERSION（22.x）：12.x 会被服务端把楼中楼图片降级成「[图片]」文本
     const common = ProtoSchema.commonRequest(new Map<string, string | number>([
       ['_client_type', 2],
@@ -2922,7 +3043,7 @@ export class TiebaService {
         'Client-Type': '2',
         'Charset': 'UTF-8',
         'Referer': 'https://tieba.baidu.com/'
-      }),
+      }, isPrefetch),
       // 2000 → 6000（2026-09-19）：2s 是从 fetchForumThreads 三级降级链抄来的口径，
       // 但详情页的降级目标是 web 通道（更慢、更不可靠）。首页快速滑动积压大量在途请求时，
       // 详情请求常被 2s 误砍 → 绕 web 兜底 → 又慢又可能拿到空壳，改为 6s。

@@ -36,6 +36,19 @@ const TAG: string = 'HttpClient';
 const IMAGE_SEPARATE_SESSION: boolean = true;
 
 /**
+ * §PFTQ（2026-09-29）预取请求短超时开关。
+ * 背景：所有接口请求共用 15s connect / 30s transfer 超时，而预取类请求（帖子详情预取、
+ * 吧列表预取、feed 补货）语义是「失败即弃、页面打开时自行兜底」——弱网下它们挂满长超时
+ * 只会白占连接池与内存。预取请求改走独立 Session：5s connect / 10s transfer 快速失败。
+ * 置 false 即回退「预取与正常请求共用 Session/超时」（改造前行为），供 A/B 对照。
+ */
+const PREFETCH_SHORT_TIMEOUT: boolean = true;
+
+/** 预取 Session 超时档：连接 5s / 传输 10s */
+const PREFETCH_CONNECT_MS: number = 5000;
+const PREFETCH_TRANSFER_MS: number = 10000;
+
+/**
  * §NETQ 网络排队探针开关（2026-09-19，**临时诊断用，取证后整体删除**）。
  * 只打 4 类日志：图片洪峰起止 / 接口请求发出与完成时的在飞图片数，
  * 用于证实「图片洪峰是否与接口请求抢同一条会话」。零行为影响。
@@ -54,6 +67,7 @@ export interface RedirectResult {
 export class HttpClient {
   private static session: rcp.Session | null = null;
   private static imageSession: rcp.Session | null = null;
+  private static prefetchSession: rcp.Session | null = null;
 
   // §NETQ：在飞图片请求数 / 本次洪峰峰值 / 累计张数 / 洪峰起点
   private static imgInflight: number = 0;
@@ -63,14 +77,18 @@ export class HttpClient {
 
   /** 两份 Session 共用同一套 transfer 配置（超时/重定向），保证 A/B 只差「是否独立连接池」 */
   private static newSession(): rcp.Session {
+    return HttpClient.newSessionWithTimeout(15000, 30000);
+  }
+
+  private static newSessionWithTimeout(connectMs: number, transferMs: number): rcp.Session {
     return rcp.createSession({
       requestConfiguration: {
         transfer: {
           autoRedirect: true,
           maxAutoRedirects: 10,
           timeout: {
-            connectMs: 15000,
-            transferMs: 30000,
+            connectMs: connectMs,
+            transferMs: transferMs,
           },
         },
       },
@@ -96,6 +114,21 @@ export class HttpClient {
       HttpClient.imageSession = HttpClient.newSession();
     }
     return HttpClient.imageSession;
+  }
+
+  /**
+   * 预取专用 Session（§PFTQ）：独立连接池 + 短超时档。
+   * 预取请求语义是「失败即弃、页面打开时自行兜底」，弱网下快速失败释放资源，
+   * 不会拖住正常接口请求的排队位。PREFETCH_SHORT_TIMEOUT=false 时复用接口 Session（改造前行为）。
+   */
+  private static getPrefetchSession(): rcp.Session {
+    if (!PREFETCH_SHORT_TIMEOUT) {
+      return HttpClient.getSession();
+    }
+    if (HttpClient.prefetchSession === null) {
+      HttpClient.prefetchSession = HttpClient.newSessionWithTimeout(PREFETCH_CONNECT_MS, PREFETCH_TRANSFER_MS);
+    }
+    return HttpClient.prefetchSession;
   }
 
   // §NETQ 探针：图片请求进出计数（洪峰起点/终点各打一条，中间不打，避免上百行刷屏）
@@ -218,7 +251,7 @@ export class HttpClient {
     return HttpClient.request(url, 'POST', body, headers);
   }
 
-  static async postProtoMultipart(url: string, body: ArrayBuffer, extraHeaders?: Record<string, string>): Promise<ArrayBuffer> {
+  static async postProtoMultipart(url: string, body: ArrayBuffer, extraHeaders?: Record<string, string>, usePrefetch: boolean = false): Promise<ArrayBuffer> {
     const boundary = '--------7da3d81520810*';
     const prefix = `--${boundary}\r\nContent-Disposition: form-data; name="data"; filename="file"\r\nContent-Type: application/octet-stream\r\n\r\n`;
     const suffix = `\r\n--${boundary}--\r\n`;
@@ -238,7 +271,7 @@ export class HttpClient {
         headers[key] = extraHeaders[key];
       });
     }
-    return HttpClient.requestBinary(url, merged.buffer as ArrayBuffer, headers);
+    return HttpClient.requestBinary(url, merged.buffer as ArrayBuffer, headers, usePrefetch);
   }
 
   static async postEncoded(url: string, body: string, extraHeaders?: Record<string, string>): Promise<string> {
@@ -291,7 +324,7 @@ export class HttpClient {
     }
   }
 
-  private static async requestBinary(url: string, body: ArrayBuffer, headers?: Record<string, string>): Promise<ArrayBuffer> {
+  private static async requestBinary(url: string, body: ArrayBuffer, headers?: Record<string, string>, usePrefetch: boolean = false): Promise<ArrayBuffer> {
     // §NETQ 探针：接口请求（含 pb/page 详情）发出/完成时的在飞图片数
     const __nq0: number = Date.now();
     if (NETQ_PROBE) {
@@ -301,7 +334,8 @@ export class HttpClient {
       const request = new rcp.Request(url, 'POST');
       request.headers = HttpClient.buildHeaders(headers);
       request.content = body;
-      const response = await HttpClient.getSession().fetch(request);
+      // §PFTQ：预取请求走短超时独立 Session（usePrefetch=true 时）
+      const response = await (usePrefetch ? HttpClient.getPrefetchSession() : HttpClient.getSession()).fetch(request);
       if (response.statusCode >= 200 && response.statusCode < 300) {
         return response.body ?? new ArrayBuffer(0);
       }

@@ -22,16 +22,21 @@ import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { display, curves, componentSnapshot, LengthMetrics } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
-import { TiebaService, ThreadDetailResult } from '../service/TiebaService';
+import { TiebaService, ThreadDetailResult, HOT_RANK_PAGES } from '../service/TiebaService';
 import { ForumSignStore } from '../service/ForumSignStore';
-import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail } from '../model/DataModel';
+import { ThreadItem, ForumHeaderInfo, ForumSearchData, ThreadDetail, PagedResult } from '../model/DataModel';
 import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { Haptic } from '../common/Haptic';
 import { PrefetchGate } from '../common/PrefetchGate';
+import {
+  ImmersiveReadSensor, IMMERSIVE_EXTRA_FLY_SCALE, IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 import { LoadingView, EmptyView, ErrorView, ThreadCard, ThreadItemData, ThreadSharePayload, PinnedThreadItem } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
+import { PerfTrace } from '../common/PerfTrace';
 
 enum LoadState {
   Loading, Success, Empty, Error,
@@ -128,6 +133,20 @@ const THREAD_SCROLL_SNAPSHOT_ID: string = 'threadListScrollSnapshot';
  * 搬进 Navigation title 槽位吃官方沉浸材质；false 或低版本自动回退到页面主体悬浮自绘玻璃（改造前原样）。
  */
 const THREAD_LIST_OFFICIAL_TITLE_BAR: boolean = true;
+
+/**
+ * 单列档（手机）滚动容器：Scroll + Column 全量渲染 + 窗口化挂载 → WaterFlow('1fr') + LazyForEach。
+ * 与首页 HomeTab（v1.0.8）同方案，依据同一批真机实测：窗口化挂载每次推进 = 一帧 30~60ms
+ * （固定 ~15~20ms 整列重排 + ~4.5ms/张组件构建，与模糊/图片无关），滑动中表现为周期性抽搐。
+ * 本页的差异点（勿照抄首页，也勿混多列档）：
+ *   ① **不挂 WaterFlowSections** —— 单列吧头本就全宽，作为普通格子即可；避开 2026-09-24
+ *      「跨 section 单列虚拟化真机整层不渲染」的既有结论（多列档仍必须走 sections）；
+ *   ② rowsGap 置 0，卡距由卡片自身 margin.bottom(6) 承担 —— 让「置顶合并块的让位格子」不产生间距；
+ *   ③ 置顶仍以**合并卡片**呈现（一个 bgCard 内装「置顶」标签 + 全部置顶帖）：由数据源首个置顶项
+ *      渲染整块，其余置顶项渲染 0 高占位。
+ * 置 false 即一行回退到原 Scroll + 窗口化挂载路径（两条路径都保留在 build 内）。
+ */
+const THREAD_LIST_SINGLE_WATERFLOW: boolean = true;
 /** 槽位高度 = 44(状态栏让位) + 44(钮行高) + 10(底部呼吸)，与改造前悬浮顶栏 padding 逐项一致；
  *  内容让位（Scroll 首项占位 90）一行未改。 */
 const THREAD_LIST_TITLE_BAR_HEIGHT: number = 98;
@@ -221,7 +240,8 @@ const SORT_SESSION_TTL: number = 120000;
  * `sort` 用于竞态校验：快速连点时丢弃不属于当前排序的迟到数据。
  */
 interface SortDisplay {
-  sort: number;
+  /** 数据归属键（= sortKey()）：热门为 'hot'（客户端热度榜），其余为生效排序号字符串 */
+  key: string;
   threads: ThreadItem[];
   page: number;
   hasMore: boolean;
@@ -482,6 +502,15 @@ class ThreadListDataSource implements IDataSource {
       listener.onDataAdd(start);
     });
   }
+
+  /** 单点内容变更（P1-1，2026-09-29 丢帧治理）：长度与顺序不变时就地更新（昵称回填 /
+   *  点赞态变化）只重建该项，避免整表 onDataReloaded 把全部可见卡推倒重来。
+   *  与 HomeTab.ThreadDataSource.notifyChange 同口径（该页早已有此优化，本页此前缺失）。 */
+  notifyChange(index: number): void {
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataChange(index);
+    });
+  }
 }
 
 @Entry
@@ -490,8 +519,10 @@ struct ThreadList {
   @State forumName: string = '';
   @State forumId: string = '';
   @State @Watch('onThreadsChanged') threads: ThreadItem[] = [];
-  // 页内会话排序快照：切走再切回同一排序时 0 开销秒开（免 Preferences 读盘 + 免重复网络刷新）
-  private sortSession: Map<number, SortSession> = new Map<number, SortSession>();
+  // 页内会话排序快照：切走再切回同一排序时 0 开销秒开（免 Preferences 读盘 + 免重复网络刷新）。
+  // key = sortKey()（'hot' / '0' / '1' / '2'）：热门档与「最新·按回复时间」同为 sort_type 0 但内容集不同，
+  // 必须用不同键，否则两者会互相命中对方的快照（旧实现直接用 effectiveSort() 数字，正是这个隐患）。
+  private sortSession: Map<string, SortSession> = new Map<string, SortSession>();
   // 排序预热标记：首次成功展示后后台把其它两个排序的冷缓存拉好，使首次切换即命中
   private warmupStarted: boolean = false;
   @State @Watch('onLoadStateChanged') loadState: LoadState = LoadState.Loading;
@@ -533,6 +564,13 @@ struct ThreadList {
   @State latestSortMode: number = 1;
   /** 「最新」档顶栏排序钮的 bindMenu 显隐（点选即关，onDisappear 兜底复位） */
   @State showLatestSortMenu: boolean = false;
+  // ===== 「沉浸式阅读补全」（2026-09-29，设置 → 个性化）=====
+  /** 设置项真源：AppStorage `immersiveReadExtra`（独立开关，默认关）。本页为 @Entry 独立页，无宿主底栏，纯本地态 */
+  @StorageLink('immersiveReadExtra') @Watch('onListImmersiveExtraChanged') immersiveReadExtra: boolean = false;
+  /** 沉浸态：true = 顶栏（返回/搜索框/搜索/更多）+ 底部组合（排序栏+加号）已藏起。只存页面局部 @State */
+  @State immersiveHidden: boolean = false;
+  /** 滚动判定器（规则与 ThreadDetail 逐项同源） */
+  private listImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
   /** WaterFlow 数据源（§4.8 T-G）：置顶卡 + 普通帖合并列表，@Watch('onThreadsChanged') 自动同步 */
   @State listDataSource: ThreadListDataSource = new ThreadListDataSource();
   /**
@@ -653,6 +691,31 @@ struct ThreadList {
       clearTimeout(this.swipeLockTimer);
       this.swipeLockTimer = -1;
     }
+    // §AUDIT（2026-09-29 定时器审计）：以下句柄此前均未入清理——
+    // pulseTimer/sortSettleTimer 退页后写 @State（含 PixelMap 快照延迟释放），
+    // searchTimer/searchAutoTimer 退页后仍会发搜索网络请求，goodPress/listSwipe/listPrefetch
+    // 退页后仍会触发预取。
+    if (this.pulseTimer !== -1) {
+      clearTimeout(this.pulseTimer);
+      this.pulseTimer = -1;
+    }
+    if (this.sortSettleTimer !== -1) {
+      clearTimeout(this.sortSettleTimer);
+      this.sortSettleTimer = -1;
+    }
+    if (this.goodPressTimer !== -1) {
+      clearTimeout(this.goodPressTimer);
+      this.goodPressTimer = -1;
+    }
+    if (this.listSwipeTimer !== -1) {
+      clearTimeout(this.listSwipeTimer);
+      this.listSwipeTimer = -1;
+    }
+    if (this.listPrefetchTimer !== -1) {
+      clearTimeout(this.listPrefetchTimer);
+      this.listPrefetchTimer = -1;
+    }
+    this.cancelSearchTimers();
   }
 
   /**
@@ -928,6 +991,10 @@ struct ThreadList {
    * 若本次未命中缓存，则由 `applySortDisplay` 落骨架屏等网络返回（网络回来才走过场）。
    */
   private selectSort(sort: number): void {
+    // P0-2 归因打点：切排序 = 窗口复位 + 整表换血 + 过场动画三件事同帧
+    PerfTrace.mark('sortSwitch');
+    // 窗口化挂载：切排序/重复点击回顶前先复位窗口（数据换血另有长度缩短兜底）
+    this.slotReset();
     if (this.selectedSort === sort) {
       // 重复点击当前排序 = 刷新该排序（先回顶、再拉第 1 页，见 refreshByRetap）。
       // 与切排序不同：不动选中态、不播过场动画，只做「回顶 + 刷新」。
@@ -1030,6 +1097,8 @@ struct ThreadList {
   }
 
   aboutToAppear(): void {
+    // P0-2 归因打点：吧主页是本轮报告里覆盖设备数最多的一页，进入即登记页面上下文
+    PerfTrace.setPage('ThreadList');
     this.initLatestSortModeThenLoad();
   }
 
@@ -1167,7 +1236,7 @@ struct ThreadList {
       return;
     }
     this.goodPrefetchDone = true;
-    CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey(2))
+    CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey('2'))
       .then((cached) => {
         if (cached && !cached.expired && cached.data.threads.length > 0) {
           return;
@@ -1210,12 +1279,15 @@ struct ThreadList {
 
   /** 本吧搜索：进入搜索态（服务端搜索优先，失败降级本地扫描；退出返回帖子列表） */
   private openSearch(): void {
+    // 搜索框在顶栏内，搜索态不参与沉浸：复位显示（2026-09-29）
+    this.resetListImmersive();
     this.searchMode = true;
     this.searchKeyword = '';
     this.resetSearchSession();
   }
 
   private exitSearch(): void {
+    this.resetListImmersive();
     this.searchMode = false;
     this.searchKeyword = '';
     this.resetSearchSession();
@@ -1745,10 +1817,22 @@ struct ThreadList {
     this.loadThreads();
   }
 
-  /** 指定排序的列表缓存 key（省略 sort 时取当前生效排序 = 含「最新」档子档；预热其它排序时显式传入） */
-  private forumCacheKey(sort?: number): string {
-    const s: number = sort === undefined ? this.effectiveSort() : sort;
-    return `${CACHE_KEY.FORUM_LIST}_${this.forumName}_${s}`;
+  /**
+   * 数据归属键（缓存 key / 页内快照 key / 竞态判定共用真源）：
+   * 「热门」档走客户端热度榜（TiebaService.fetchForumHotRank），内容集与「最新·按回复时间」
+   * （服务端 sort_type 0 原样时间序）**不同** —— 二者必须分键，否则缓存与快照会互相污染。
+   */
+  private sortKey(): string {
+    if (this.selectedSort === 0) {
+      return 'hot';
+    }
+    return `${this.effectiveSort()}`;
+  }
+
+  /** 指定归属键的列表缓存 key（省略时取当前档；预热其它排序时显式传入 'hot' / '0' / '1' / '2'） */
+  private forumCacheKey(key?: string): string {
+    const k: string = key === undefined ? this.sortKey() : key;
+    return `${CACHE_KEY.FORUM_LIST}_${this.forumName}_${k}`;
   }
 
   /**
@@ -1761,8 +1845,9 @@ struct ThreadList {
     if (this.threads.length === 0) {
       return;
     }
-    // 子档隔离：sortSession key 用生效排序（0=回复 / 1=发帖 / 2=精选），最新档两个子档快照互不覆盖
-    this.sortSession.set(this.effectiveSort(), {
+    // 归属隔离：sortSession key 用 sortKey()（'hot' / 0=回复 / 1=发帖 / 2=精选）——
+    // 热门榜与「最新·按回复时间」同为服务端 sort 0，必须分键，否则快照互相覆盖
+    this.sortSession.set(this.sortKey(), {
       threads: this.threads,
       page: this.page,
       hasMore: this.hasMore,
@@ -1801,18 +1886,55 @@ struct ThreadList {
         }
       }
     }
+    // P1-1（2026-09-29 丢帧治理）：**等长同序**（返回本页 / 静默刷新拿到同一批数据）改走就地更新，
+    // 只对引用真正变化的项 notifyChange，不再整表 onDataReloaded 推倒重来。
+    // 真机实测依据：进入吧主页首个窗口 fps 69~81 / d33 1~2；且**二次进入（图片全命中、img0）
+    // 依然 fps 69** —— 证明成本来自整表重建而非图片下载/解码。
+    // 与 HomeTab.syncSource 同口径（该页早已具备此分支，本页此前缺失，两页不同构）。
+    // 长度变化一律走原路径（变长=追加；变短/换血=整表 reload），不做长度无关的模糊匹配。
+    if (!isAppend && oldLen === next.length) {
+      let sameOrder: boolean = true;
+      for (let i: number = 0; i < next.length; i++) {
+        if (next[i].tid !== old[i].tid) {
+          sameOrder = false;
+          break;
+        }
+      }
+      if (sameOrder) {
+        src.data = next;
+        let touched: number = 0;
+        for (let i: number = 0; i < next.length; i++) {
+          if (next[i] !== old[i]) {
+            src.notifyChange(i);
+            touched++;
+          }
+        }
+        if (touched > 0) {
+          PerfTrace.mark('listTouch');
+        }
+        return;
+      }
+    }
     src.data = next;
     if (isAppend) {
       src.notifyAdd(oldLen);
     } else {
+      PerfTrace.mark('listSwap');
       src.reload();
     }
   }
 
   /** 把合并后的列表同步进 WaterFlow 数据源（单列/多列共用） */
   private syncListDataSource(): void {
+    // 打点口径收口到 syncSourceData 的分支内部（swap=整表重建 / touch=逐项就地更新）
     const next: ThreadItem[] = this.waterFlowThreads();
     this.syncSourceData(this.listDataSource, next);
+    // 窗口化挂载：列表缩短 = 刷新/切吧换血 → 窗口回首屏（追加只会变长，不受影响）
+    if (next.length < this.listDataSource.data.length) {
+      this.slotReset();
+    }
+    // FSTAT 深度关联打点（2026-09-28 量化「越滑越卡」）：列表条数变化即打一行，与帧统计按时间对齐
+    console.info(`[FSTAT] listN=${next.length}`);
     // 数据量变化 → 主体 section 的 itemsCount 必须同步（数量不匹配会让 WaterFlow 无法滚动）
     this.syncSections();
     this.scheduleListPrefetch();
@@ -1990,8 +2112,8 @@ struct ThreadList {
    * 换排序 = 换内容集，列表同步无动画回顶（保留旧偏移对新排序没有意义）。
    */
   private applySortDisplay(d: SortDisplay): void {
-    // 竞态：数据归属的排序已不是当前排序（快速连点 / 最新档内子档切换），丢弃
-    if (d.sort !== this.effectiveSort()) {
+    // 竞态：数据归属键已不是当前档（快速连点 / 最新档内子档切换 / 热门↔按回复时间切换），丢弃
+    if (d.key !== this.sortKey()) {
       return;
     }
     this.page = d.page;
@@ -2035,17 +2157,21 @@ struct ThreadList {
     const myToken: number = ++this.loadToken;
     // 预取节流基线同步复位：刷新 / 切排序后列表与内容高整体换新，沿用旧偏移基线会漏触发
     this.prefetchGate.reset();
-    // 快照本次请求的排序（生效序 = 含最新档子档）：期间用户切换排序/子档会再次触发 loadThreads（代际已变），返回时据此丢弃过期结果
-    const mySort: number = this.effectiveSort();
+    // 快照本次请求的归属键（热门='hot' 热度榜 / 其余=生效排序）：期间用户切档会再次触发 loadThreads，
+    // 返回时据此丢弃过期结果；同时记下「是否首屏」用于缓存回写（热门首屏一次消费 HOT_RANK_PAGES 页，
+    // 分页游标 page 在请求返回后会被推进，故必须在请求前判定）
+    const myKey: string = this.sortKey();
+    const isHotRank: boolean = this.selectedSort === 0;
+    const isFirstLoad: boolean = this.page <= 1;
     if (!forceRefresh && this.page === 1) {
       // 页内会话快照命中（本次进吧期间刚看过该排序）：0 开销秒开，数据足够新不做后台刷新
-      const session = this.sortSession.get(mySort);
+      const session = this.sortSession.get(myKey);
       if (session && session.threads.length > 0 && Date.now() - session.ts < SORT_SESSION_TTL) {
         this.stalledPages = 0;
         if (this.enterDir !== 0) {
           // 排序切换命中页内快照（快照命中在本 async 函数的第一段、同步执行）：同帧替换 + 起滑
           this.applySortDisplay({
-            sort: mySort, threads: session.threads,
+            key: myKey, threads: session.threads,
             page: session.page, hasMore: session.hasMore, state: LoadState.Success,
           });
         } else {
@@ -2072,7 +2198,7 @@ struct ThreadList {
           if (this.enterDir !== 0) {
             // 排序切换命中本地缓存：同帧替换 + 起滑（与首页 Tab 切换同一形态）
             this.applySortDisplay({
-              sort: mySort, threads: cached.data.threads,
+              key: myKey, threads: cached.data.threads,
               page: this.page, hasMore: true, state: LoadState.Success,
             });
           } else {
@@ -2092,7 +2218,7 @@ struct ThreadList {
     if (this.enterDir !== 0) {
       // 排序切换未命中缓存：落骨架屏（轻淡入）等网络返回，返回后由 applySortDisplay 滑入
       this.applySortDisplay({
-        sort: mySort, threads: [], page: this.page, hasMore: true, state: LoadState.Loading,
+        key: myKey, threads: [], page: this.page, hasMore: true, state: LoadState.Loading,
       });
     } else {
       this.loadState = LoadState.Loading;
@@ -2105,17 +2231,24 @@ struct ThreadList {
       this.skeletonOpacity = 1.0;
     }
     try {
-      // 预取合流版：page=1/sort=0 且点击时已起跑预取则直接消费，不另发一次请求；否则原样回落
-      const result = await TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, this.page, mySort, false);
-      // 竞态防护：请求期间用户已切换排序/子档/刷新，丢弃晚归结果，避免旧排序内容覆盖当前列表
-      if (myToken !== this.loadToken || mySort !== this.effectiveSort()) {
+      // 热门档：并发抓 HOT_RANK_PAGES 页成「客户端热度榜」（与「最新·按回复时间」区分开）；
+      // 其余档：预取合流版（page=1/sort=0 且点击时已起跑预取则直接消费，不另发一次请求）
+      const result = isHotRank
+        ? await TiebaService.getInstance().fetchForumHotRank(this.forumName)
+        : await TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, this.page, this.effectiveSort(), false);
+      // 竞态防护：请求期间用户已切换档/刷新，丢弃晚归结果，避免旧内容覆盖当前列表
+      if (myToken !== this.loadToken || myKey !== this.sortKey()) {
         return;
       }
       this.stalledPages = 0;
+      // 热门榜本次已消费 HOT_RANK_PAGES 页：分页游标推进到已聚合页数，后续 loadMore 从下一页续接（时间序）
+      if (isHotRank) {
+        this.page = HOT_RANK_PAGES;
+      }
       if (this.enterDir !== 0) {
         // 排序切换（未命中缓存）：网络返回后同帧替换 + 起滑
         this.applySortDisplay({
-          sort: mySort, threads: result.list, page: this.page,
+          key: myKey, threads: result.list, page: this.page,
           hasMore: result.list.length > 0,
           state: result.list.length > 0 ? LoadState.Success : LoadState.Empty,
         });
@@ -2135,7 +2268,7 @@ struct ThreadList {
       if (result.list.length > 0) {
         this.enrichInBackground(result.list);
       }
-      if (this.page === 1 && result.list.length > 0) {
+      if (isFirstLoad && result.list.length > 0) {
         this.saveForumCache(result.list);
       }
       // Auto-load more if content is too short to fill the screen
@@ -2154,11 +2287,15 @@ struct ThreadList {
 
   /** 缓存命中后的后台静默刷新：更新列表与吧头，成功后回写缓存 */
   private refreshSilently(): void {
-    // 竞态防护：静默刷新期间用户可能已切换排序/刷新（代际/排序变化），返回后丢弃过期结果
+    // 竞态防护：静默刷新期间用户可能已切换档/刷新（代际/归属键变化），返回后丢弃过期结果
     const myToken: number = this.loadToken;
-    const mySort: number = this.effectiveSort();
-    TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, 1, mySort, false).then((result) => {
-      if (myToken !== this.loadToken || mySort !== this.effectiveSort() || result.list.length === 0) {
+    const myKey: string = this.sortKey();
+    const isHotRank: boolean = this.selectedSort === 0;
+    const task: Promise<PagedResult<ThreadItem>> = isHotRank
+      ? TiebaService.getInstance().fetchForumHotRank(this.forumName)
+      : TiebaService.getInstance().fetchForumThreadsCoalesced(this.forumName, 1, this.effectiveSort(), false);
+    task.then((result) => {
+      if (myToken !== this.loadToken || myKey !== this.sortKey() || result.list.length === 0) {
         return;
       }
       // 排序切换的过场窗口内（`SORT_ANIM_SETTLE` ≈ 420ms）：只回写缓存、不上屏 ——
@@ -2168,7 +2305,7 @@ struct ThreadList {
         this.saveForumCache(result.list);
         return;
       }
-      this.page = 1;
+      this.page = isHotRank ? HOT_RANK_PAGES : 1;
       this.threads = result.list;
       this.hasMore = result.list.length > 0;
       this.stalledPages = 0;
@@ -2246,11 +2383,11 @@ struct ThreadList {
     return changed ? updated : list;
   }
 
-  /** 写入吧列表快照缓存（含吧头信息），失败不影响功能 */
-  private async saveForumCache(list: ThreadItem[]): Promise<void> {
+  /** 写入吧列表快照缓存（含吧头信息）；key 省略时写当前档（sortKey），失败不影响功能 */
+  private async saveForumCache(list: ThreadItem[], key?: string): Promise<void> {
     try {
       await CacheManager.getInstance().putWithTtl<ForumListCache>(
-        this.forumCacheKey(),
+        this.forumCacheKey(key),
         { threads: list, forumInfo: this.forumInfo },
         CACHE_TTL.FORUM_LIST
       );
@@ -2269,40 +2406,42 @@ struct ThreadList {
       return;
     }
     this.warmupStarted = true;
-    // 预热目标 = UI 三个档位各自的缓存 key：热门 0、「最新」= 当前子档 latestSortMode、精选 2。
-    // 「最新」档时另一个子档（回复/发帖互换）与热门同 key（子档 0）或与自身互换，天然被集合覆盖；
-    // 剔除当前生效档后逐个预热，子档互切同样命中缓存秒开。
-    const cur: number = this.effectiveSort();
-    const targets: Set<number> = new Set<number>([0, this.latestSortMode, 2]);
+    // 预热目标 = 其它档位的归属键集合（'hot' 热门榜 / '0' 回复序 / '1' 发帖序 / '2' 精选）：
+    // 热门榜与「最新·按回复时间」内容集不同、缓存分键，故两者都要各自预热；
+    // 剔除当前档后逐个预热，切档（含「最新」两个子档互换）首次即命中缓存秒开。
+    const cur: string = this.sortKey();
+    const targets: Set<string> = new Set<string>(['hot', '0', '1', '2']);
     targets.delete(cur);
-    for (const sort of targets) {
+    for (const key of targets) {
       try {
-        const cached = await CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey(sort));
+        const cached = await CacheManager.getInstance().getWithTtlAllowStale<ForumListCache>(this.forumCacheKey(key));
         if (cached && !cached.expired && cached.data.threads.length > 0) {
           continue;
         }
       } catch (_) {
         // 缓存检查失败照常尝试预热
       }
-      this.warmupSort(sort);
+      this.warmupSort(key);
     }
   }
 
-  /** 单个排序的预热请求：拉取首屏并写本地缓存，失败不影响主流程 */
-  private async warmupSort(sort: number): Promise<void> {
+  /** 单个档位的预热请求：拉取首屏（'hot' 走客户端热度榜）并写本地缓存，失败不影响主流程 */
+  private async warmupSort(key: string): Promise<void> {
     try {
-      const result = await TiebaService.getInstance().fetchForumThreads(this.forumName, 1, sort, false);
+      const result: PagedResult<ThreadItem> = key === 'hot'
+        ? await TiebaService.getInstance().fetchForumHotRank(this.forumName, true)
+        : await TiebaService.getInstance().fetchForumThreads(this.forumName, 1, parseInt(key, 10), false);
       if (result.list.length === 0) {
         return;
       }
       await CacheManager.getInstance().putWithTtl<ForumListCache>(
-        this.forumCacheKey(sort),
+        this.forumCacheKey(key),
         { threads: result.list, forumInfo: this.forumInfo },
         CACHE_TTL.FORUM_LIST
       );
-      console.info(`[ThreadList] warmup sort=${sort} n=${result.list.length}`);
+      console.info(`[ThreadList] warmup key=${key} n=${result.list.length}`);
     } catch (e) {
-      console.info(`[ThreadList] warmup sort=${sort} fail: ${(e as Error).message}`);
+      console.info(`[ThreadList] warmup key=${key} fail: ${(e as Error).message}`);
     }
   }
 
@@ -2433,6 +2572,236 @@ struct ThreadList {
   private listSwipeTimer: number = -1;
   private listPrefetchTimer: number = -1;
 
+  // ===== 单列档窗口化挂载（2026-09-28「越滑越卡」治理）=====
+  // 量化结论：单列 Scroll+Column+ForEach 全量渲染下，翻页追加的主线程停顿随总卡数线性增长
+  // （+13 条 488ms → +19 条 1616ms）。窗口化后挂载树恒为「可见区 ± 缓冲」，append 只改占位高度。
+  // 2026-09-30 与首页 HomeTab 同口径收敛（首页实测：一次推进 = 15~20ms 整列重排固定代价
+  // + ~4.5ms/张组件构建，与模糊/图片无关）：
+  //   ① 推进从「紧贴挂载边界」改为「贴边后一次性扩到 ±SLOT_EXTEND 给足余量」——
+  //      否则缓冲越小推进越频繁，会退化成每帧一次整页重建；
+  //   ② 新增 SLOT_KEEP 卸载滞后：可见区外超过该张数才降级回占位，回滑路径上刚看过的卡零重建。
+  /** 挂载缓冲：可见区上下各「必须挂载」的张数（视口距窗口边界小于该值即视为贴边） */
+  private readonly SLOT_BUFFER: number = 4;
+  /** 扩展目标：贴边后一次性扩到「可见区 ± SLOT_EXTEND」，单帧新建量 = SLOT_EXTEND − SLOT_BUFFER */
+  private readonly SLOT_EXTEND: number = 9;
+  /** 卸载滞后：可见区外超过该张数才降级回等高占位（一次收缩最多卸载 SLOT_KEEP − SLOT_EXTEND 张） */
+  private readonly SLOT_KEEP: number = 15;
+  /** 首屏初始挂载数 */
+  private readonly SLOT_INITIAL: number = 12;
+  /** 窗口起始/结束索引（含端点）。@State：仅窗口移动时触发重建，重建范围被 key 稳定性摊薄 */
+  @State private slotStart: number = 0;
+  @State private slotEnd: number = 11;
+  /** 实测卡高表（vp，键=tid）：卡片可见期由 onAreaChange 采集（首测锁定），出窗后供占位复用 */
+  private slotHeightMap: Map<string, number> = new Map<string, number>();
+  /** 容量上限（提高到 1200：长距离下滑后回滑仍能命中实测值，避免退化到估算） */
+  private readonly SLOT_HEIGHT_CAP: number = 1200;
+  /** 未实测卡的估算高（vp）：单一 EMA 均值兜底（真机实测偏差可达 ±190vp，故仅作最后兜底） */
+  private slotAvgH: number = 340;
+  /**
+   * 内容特征桶均值（滚动中自校准）：键 = 图片数_标题行数_摘要行数。
+   * 未实测卡优先取「同特征卡」的实测均值 —— 首页实测证明占位高与真卡高不一致时
+   * （单一均值估算偏差 80~120vp）回落替换真卡会引发高度重排，把视口内容推走（观感=抽搐/露白）。
+   */
+  private slotBucketH: Map<string, number> = new Map<string, number>();
+
+  private slotList(): ThreadItem[] {
+    return this.normalThreads();
+  }
+
+  private slotHeightOf(item: ThreadItem): number {
+    const h: number | undefined = this.slotHeightMap.get(item.tid);
+    return h !== undefined ? h : this.slotEstimateHeight(item);
+  }
+
+  /** 未实测卡估算：优先同特征桶实测均值，缺样本时用结构公式打底（自校准，无需人工调参） */
+  private slotEstimateHeight(item: ThreadItem): number {
+    const learned: number | undefined = this.slotBucketH.get(this.slotBucketKey(item));
+    if (learned !== undefined) {
+      return learned;
+    }
+    return this.slotFormulaHeight(item);
+  }
+
+  /** 特征键：图片数_标题行数_摘要行数（同键卡的实际高度高度一致，故桶均值可作占位高） */
+  private slotBucketKey(item: ThreadItem): string {
+    const ic: number = item.images !== undefined ? Math.min(item.images.length, 9) : 0;
+    const scale: number = this.fontScale > 0 ? this.fontScale : 1.0;
+    const lineW: number = this.slotLineWidth();
+    const tl: number = this.slotTextLines(item.title, 17 * scale, lineW, 2);
+    const al: number = item.abstract.length > 0 ? this.slotTextLines(item.abstract, 14 * scale, lineW, 4) : 0;
+    return `${ic}_${tl}_${al}`;
+  }
+
+  /** 文本可用宽 = 视口宽 − 容器左右留白(12×2) − 卡内左右内距(16×2) */
+  private slotLineWidth(): number {
+    const w: number = this.viewportW > 0 ? this.viewportW : 360;
+    return Math.max(120, w - 56);
+  }
+
+  /** 文本行数估算：CJK 按 1 字宽、其余约 0.55 字宽；clamp 到 maxLines */
+  private slotTextLines(text: string, fontSize: number, availW: number, maxLines: number): number {
+    if (text.length === 0) {
+      return 1;
+    }
+    let units: number = 0;
+    for (let i: number = 0; i < text.length; i++) {
+      units += text.charCodeAt(i) > 0x2E80 ? 1 : 0.55;
+    }
+    const lines: number = Math.ceil((units * fontSize) / Math.max(1, availW));
+    return Math.max(1, Math.min(maxLines, lines));
+  }
+
+  /** 图片区高度（单列档，含 top 10）：1 张 220；2/4 张两列 140；其余三列 100（行间 8vp） */
+  private slotGalleryHeight(count: number): number {
+    if (count <= 0) {
+      return 0;
+    }
+    if (count === 1) {
+      return 10 + 220;
+    }
+    const twoCol: boolean = count === 2 || count === 4;
+    const cell: number = twoCol ? 140 : 100;
+    const rows: number = Math.ceil(count / (twoCol ? 2 : 3));
+    return 10 + rows * cell + (rows - 1) * 8;
+  }
+
+  /** 结构公式（桶无样本时的兜底）：逐项复刻 ThreadCard 的真实组成 */
+  private slotFormulaHeight(item: ThreadItem): number {
+    const scale: number = this.fontScale > 0 ? this.fontScale : 1.0;
+    const lineW: number = this.slotLineWidth();
+    let h: number = 16 + 40;
+    const tl: number = this.slotTextLines(item.title, 17 * scale, lineW, 2);
+    h += 8 + tl * 17 * scale * 1.45;
+    if (item.abstract.length > 0) {
+      const al: number = this.slotTextLines(item.abstract, 14 * scale, lineW, 4);
+      h += 6 + al * 14 * scale * 1.5;
+    }
+    const ic: number = item.images !== undefined ? Math.min(item.images.length, 9) : 0;
+    h += this.slotGalleryHeight(ic);
+    if (item.forumName.length > 0) {
+      h += 10 + 20;
+    }
+    h += 12 + 36 + 14;
+    return h;
+  }
+
+  /** 高度表版本号：任何卡高变化即递增，用于前缀和缓存失效 */
+  private slotHeightVer: number = 0;
+  private slotPreCache: number[] = [0];
+  private slotPreSrc: ThreadItem[] | undefined = undefined;
+  private slotPreVer: number = -1;
+
+  /** 前缀和：pre[i] = 第 i 张卡的顶部 y（pre[0]=0）。带缓存：仅在列表引用或高度表变化时重算 */
+  private slotPrefixSums(): number[] {
+    const list: ThreadItem[] = this.slotList();
+    if (this.slotPreSrc === list && this.slotPreVer === this.slotHeightVer) {
+      return this.slotPreCache;
+    }
+    const pre: number[] = new Array<number>(list.length + 1);
+    pre[0] = 0;
+    for (let i = 0; i < list.length; i++) {
+      pre[i + 1] = pre[i] + this.slotHeightOf(list[i]);
+    }
+    this.slotPreCache = pre;
+    this.slotPreSrc = list;
+    this.slotPreVer = this.slotHeightVer;
+    return pre;
+  }
+
+  /** 卡高采集（持续更新）。仅窗口内卡挂回调 → 观察者 O(窗口)。
+   *  不锁首测：图片失败降级 ↔ 自愈会改变卡高，占位必须跟上，否则回滑时错位。
+   *  同时把实测值回灌「同特征桶」（EMA），供未实测卡做占位高。 */
+  private slotRecordHeight(item: ThreadItem, h: number): void {
+    if (h <= 0 || h > 2000) {
+      return;
+    }
+    const tid: string = item.tid;
+    if (this.slotHeightMap.get(tid) !== h) {
+      this.slotHeightMap.set(tid, h);
+      this.slotHeightVer++;
+      this.slotAvgH = this.slotAvgH * 0.9 + h * 0.1;
+      const key: string = this.slotBucketKey(item);
+      const bk: number | undefined = this.slotBucketH.get(key);
+      this.slotBucketH.set(key, bk === undefined ? h : bk * 0.7 + h * 0.3);
+    }
+    if (this.slotHeightMap.size > this.SLOT_HEIGHT_CAP) {
+      let oldest: string | undefined = undefined;
+      for (const k of this.slotHeightMap.keys()) {
+        oldest = k;
+        break;
+      }
+      if (oldest !== undefined) {
+        this.slotHeightMap.delete(oldest);
+      }
+    }
+  }
+
+  /** 滚动中推进窗口（onScroll 每帧调用）：
+   *  v2（2026-09-28 真机回归修正）：①可见区贴住窗口边缘才滑动（滞回）——
+   *  窗口每动一次都是一次页面级重渲染，甩滑中逐卡滑动会变成重建风暴（真机实测更卡）；
+   *  ②前缀和走缓存，滚动帧零 O(N) 计算。
+   *  v3（2026-09-30 与首页同口径）：贴边后一次扩到 ±SLOT_EXTEND 给足余量（否则退化成每帧推进），
+   *  越过 ±SLOT_KEEP 才收缩（卸载滞后，回滑路径上刚看过的卡零重建）。 */
+  private slotUpdateWindow(atY: number): void {
+    const list: ThreadItem[] = this.slotList();
+    const n: number = list.length;
+    if (n === 0 || this.viewportH <= 0) {
+      return;
+    }
+    const pre: number[] = this.slotPrefixSums();
+    const bottom: number = atY + this.viewportH;
+    let vs: number = 0;
+    while (vs < n - 1 && pre[vs + 1] <= atY) {
+      vs++;
+    }
+    let ve: number = vs;
+    while (ve < n - 1 && pre[ve + 1] <= bottom) {
+      ve++;
+    }
+    // 必须挂载边界（可见区 ± SLOT_BUFFER）／扩展目标／保留边界
+    const mountS: number = Math.max(0, vs - this.SLOT_BUFFER);
+    const mountE: number = Math.min(n - 1, ve + this.SLOT_BUFFER);
+    const extS: number = Math.max(0, vs - this.SLOT_EXTEND);
+    const extE: number = Math.min(n - 1, ve + this.SLOT_EXTEND);
+    const keepS: number = Math.max(0, vs - this.SLOT_KEEP);
+    const keepE: number = Math.min(n - 1, ve + this.SLOT_KEEP);
+    let ns: number = this.slotStart;
+    let ne: number = this.slotEnd;
+    // ① 贴住挂载边界 → 一次扩到扩展目标
+    if (ns > mountS) {
+      ns = extS;
+    }
+    if (ne < mountE) {
+      ne = extE;
+    }
+    // ② 卸载滞后：越过保留带才收缩
+    if (ns < keepS) {
+      ns = extS;
+    }
+    if (ne > keepE) {
+      ne = extE;
+    }
+    // ③ 覆盖兜底：任何情况下视口都不得落到占位区
+    if (ns > mountS) {
+      ns = mountS;
+    }
+    if (ne < mountE) {
+      ne = mountE;
+    }
+    if (ns !== this.slotStart || ne !== this.slotEnd) {
+      // P0-2 归因打点：窗口真正推进 = 一次页面级重渲染（只在实际推进分支计数）
+      PerfTrace.mark('winSlide');
+      this.slotStart = ns;
+      this.slotEnd = ne;
+    }
+  }
+
+  /** 窗口复位（切排序 / 回顶 / 刷新换血）：回首屏挂载量；卡高表保留（同吧同卡高度可复用） */
+  private slotReset(): void {
+    this.slotStart = 0;
+    this.slotEnd = this.SLOT_INITIAL - 1;
+  }
+
   /** 卡片进入/离开视野登记（WaterFlow 与单列 Scroll 两分支的 ThreadCard 均挂） */
   private onCardListVisible(tid: string, isVisible: boolean): void {
     const idx: number = this.visibleTids.indexOf(tid);
@@ -2458,21 +2827,30 @@ struct ThreadList {
       clearTimeout(this.listSwipeTimer);
       this.listSwipeTimer = -1;
     }
+    // S1-b 缺口修复（2026-09-29）：服务层 IScrollBusy 让路只由 HomeTab 上报过 —— 吧主页
+    // 从未调 notifyFeedScrolling，导致「帖子极速开启」的滑动让路在吧主页完全失效
+    // （服务层 feedScrollActive 恒 false、lastFeedScrollAt 过期 → 预取照发）。
+    TiebaService.getInstance().notifyFeedScrolling(true);
   }
 
   /** 滑动停歇 → 300ms 防抖 → 可见登记表前 3 个预取（开关关闭时服务层入口短路） */
   private onListScrollStopPrefetch(): void {
+    TiebaService.getInstance().notifyFeedScrolling(false);
     if (this.listSwipeTimer >= 0) {
       clearTimeout(this.listSwipeTimer);
     }
     this.listSwipeTimer = setTimeout(() => {
       this.listSwipeTimer = -1;
+      // 方案二（2026-09-28 停歇预取降档）：量化发现每次停歇预取 3 帖 = [TD] 解码 400-700ms×3
+      // + 一串 [ENRICH] profile 网络回调，与用户继续滑动抢主线程，深层表现为约每 10s 一次
+      // 150-320ms 停顿。列表超过 100 条后降为只预取最近 1 帖（浅层维持 3 不变，极速开启语义不变）。
+      const cap: number = this.threads.length > 100 ? 1 : 3;
       const picks: ThreadItem[] = [];
       for (const tid of this.visibleTids) {
         const hit: ThreadItem | undefined = this.threads.find((t: ThreadItem): boolean => t.tid === tid);
         if (hit !== undefined) {
           picks.push(hit);
-          if (picks.length >= 3) {
+          if (picks.length >= cap) {
             break;
           }
         }
@@ -2493,8 +2871,12 @@ struct ThreadList {
   }
 
   private onListScroll(_x: number, _y: number): void {
+    // P0-2 归因打点：只记时间戳，供 FSTAT 判定「本窗口是否在滚动」
+    PerfTrace.noteScroll();
     const atY: number = PrefetchGate.absoluteY(this.listScroller);
     this.lastScrollY = atY;
+    // 沉浸式阅读补全（2026-09-29）：先于搜索/加载的 early-return，任何滚动都参与判定
+    this.listImmersiveScroll(atY);
     if (this.searchMode) {
       // 搜索态与列表态解耦：不依赖吧内列表的 loadState（列表可能尚未加载完就进了搜索），
       // 且按模式分派（服务端翻页 / 本地续扫），接近结果末尾即提前取下一批
@@ -2506,12 +2888,84 @@ struct ThreadList {
     if (this.loadState !== LoadState.Success) {
       return;
     }
+    // 窗口化挂载（仅回退路径）：每帧按 offset 推进可见窗口（状态未变时零重建）；
+    // 单列档虚拟化后 WaterFlow 自管可见区，不再需要外部推进
+    if (!THREAD_LIST_SINGLE_WATERFLOW) {
+      this.slotUpdateWindow(atY);
+    }
     if (this.loadingMore || !this.hasMore) {
       return;
     }
     if (this.prefetchGate.should(atY, this.listContentH(), this.viewportH)) {
       this.loadMore(true);
     }
+  }
+
+  // ===== 「沉浸式阅读补全」交互（2026-09-29，设置 → 个性化 / AppStorage `immersiveReadExtra`）=====
+
+  /**
+   * 滚动 → 沉浸显隐判定。规则与 ThreadDetail 逐项同源（24 藏 / 12 露不对称 + 置顶 8 恒显示 + 跳变 240 丢弃）。
+   * 搜索态不参与（搜索框在顶栏内须恒可见）：强制恢复显示。
+   */
+  private listImmersiveScroll(atY: number): void {
+    if (!this.immersiveReadExtra || this.searchMode) {
+      if (this.immersiveHidden) {
+        this.setListImmersiveHidden(false);
+      }
+      return;
+    }
+    const act = this.listImmersiveSensor.feed(atY);
+    if (act === 'hide') {
+      this.setListImmersiveHidden(true);
+    } else if (act === 'show' || act === 'reset') {
+      this.setListImmersiveHidden(false);
+    }
+  }
+
+  /** 翻转沉浸态（本地 @State，值变化才写）+ 同步判定器 */
+  private setListImmersiveHidden(hidden: boolean): void {
+    if (this.immersiveHidden === hidden) {
+      return;
+    }
+    this.immersiveHidden = hidden;
+    this.listImmersiveSensor.setHidden(hidden);
+  }
+
+  /** 复位沉浸判定（进出搜索态等）：清基线 + 恢复显示 */
+  private resetListImmersive(): void {
+    this.listImmersiveSensor.resetBaseline();
+    if (this.immersiveHidden) {
+      this.listImmersiveSensor.setHidden(false);
+      this.immersiveHidden = false;
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即恢复显示 */
+  private onListImmersiveExtraChanged(): void {
+    if (!this.immersiveReadExtra) {
+      this.resetListImmersive();
+    }
+  }
+
+  /** 顶栏隐藏位移（vp，向上）：= 槽位标题高 98 × 0.6 ≈ −59（同「收回」口径，其余交给 opacity 淡出） */
+  private listTopSink(): number {
+    return -(THREAD_LIST_TITLE_BAR_HEIGHT * IMMERSIVE_EXTRA_FLY_SCALE);
+  }
+
+  /** 底部组合隐藏位移（vp，向下）：= (排序栏高 56 + 底距 30) × 0.6 ≈ 52 */
+  private listBottomSink(): number {
+    return (THREAD_LIST_SORT_BAR_HEIGHT + THREAD_LIST_SORT_BAR_BOTTOM) * IMMERSIVE_EXTRA_FLY_SCALE;
+  }
+
+  /** 显隐动画参数（藏 / 唤不对称）：取值以目标态为准 */
+  private listImmersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   /** 内容尺寸变化：记录内容高；搜索态下内容变化即重判自动续载（结果不满一屏时无法滚动） */
@@ -3047,6 +3501,174 @@ struct ThreadList {
         // 与首页同款：Refresh 自身不裁切 → 列表内容可溢出到顶栏之下渲染（顶部沉浸的关键）
         .clip(false)
         .onRefreshing(() => { this.handleRefresh(true); })
+      } else if (!this.searchMode && THREAD_LIST_SINGLE_WATERFLOW) {
+        // ===== 单列档虚拟化（2026-09-30，与首页 HomeTab 同方案；差异点见 THREAD_LIST_SINGLE_WATERFLOW 注释）=====
+        // 原 Scroll + Column 全量渲染 + 窗口化挂载在真机 FSTAT 上是「每次窗口推进 = 一帧 30~60ms」，
+        // 滑动中表现为周期性抽搐；改虚拟容器后推进帧不复存在（首页同改后 max 11~34ms / d33 0~1）。
+        Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
+          WaterFlow({ scroller: this.listScroller }) {
+            // 吧头 + 兜底排序栏：单列无 sections → 作为普通格子占满整行，随内容滚动（与改造前一致）
+            FlowItem() {
+              Column() {
+                this.ForumHeaderBuilder()
+                if (!(THREAD_LIST_OFFICIAL_SORT_BAR && this.materialSupported)) {
+                  this.SortTabsBuilder()
+                }
+              }
+              .width('100%')
+              .onAreaChange((_old: Area, n: Area) => { this.headerBlockH = n.height as number; })
+              // 卡距自持（rowsGap=0）：与改造前 Column space:6 的间隙语义逐项一致
+              .margin({ bottom: 6 })
+            }
+
+            if (this.loadState === LoadState.Success) {
+              LazyForEach(this.listDataSource, (item: ThreadItem) => {
+                FlowItem() {
+                  Column() {
+                    if (item.isTop === true && this.selectedSort !== 2) {
+                      if (item.tid === this.firstPinnedTid()) {
+                        // 置顶合并块：与改造前逐像素同款（「置顶」标签 + 多条同在一个 bgCard 容器）
+                        Column({ space: 0 }) {
+                          Row() {
+                            Text('置顶')
+                              .fontSize(fs(13, this.fontScale))
+                              .fontWeight(FontWeight.Bold)
+                              .fontColor(Theme.textPrimary(this.isDark))
+                          }
+                          .width('100%')
+                          .padding({ left: 16, right: 16, top: 14, bottom: 4 })
+                          ForEach(this.pinnedThreads(), (p: ThreadItem) => {
+                            PinnedThreadItem({
+                              item: {
+                                tid: p.tid, title: p.title, forumName: p.forumName,
+                                author: p.author, replyNum: p.replyNum, abstract: p.abstract,
+                                firstImage: p.firstImage ?? '', createTime: p.createTime,
+                                isTop: p.isTop, isGood: p.isGood,
+                              } as ThreadItemData,
+                              onTap: (tid: string) => this.openThread(tid)
+                            })
+                          }, (p: ThreadItem) => `${p.tid}_${p.author}_${p.isLiked ? 1 : 0}_${p.likeCount ?? 0}`)
+                        }
+                        .width('100%')
+                        .backgroundColor(Theme.bgCard(this.isDark))
+                        .borderRadius(26)
+                        .margin({ bottom: 6 })
+                      } else {
+                        // 其余置顶项已并入上方合并块：0 高让位（rowsGap=0 故不产生间距）
+                        Column().width('100%').height(0)
+                      }
+                    } else {
+                      ThreadCard({
+                        item: {
+                          tid: item.tid, postId: item.postId ?? '',
+                          title: item.title, forumName: item.forumName,
+                          forumAvatar: item.forumAvatar ?? '',
+                          author: item.author,
+                          authorAvatar: item.authorAvatar ?? '',
+                          authorId: item.authorId ?? '',
+                          replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                          isLiked: item.isLiked ?? false,
+                          abstract: item.abstract,
+                          firstImage: item.firstImage ?? '', images: item.images ?? [],
+                          imageThumbs: item.imageThumbs ?? [],
+                          createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                        } as ThreadItemData,
+                        onTap: (tid: string) => this.openThread(tid),
+                        onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                        onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                        onComment: (tid: string) => this.openThread(tid),
+                        onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                      })
+                        .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean) => this.onCardListVisible(item.tid, isVisible))
+                        .margin({ bottom: 6 })
+                    }
+                  }
+                  .width('100%')
+                  .translate({ x: this.sortShiftX() })
+                }
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+            } else if (this.loadState === LoadState.Loading) {
+              FlowItem() {
+                ThreadListSkeleton({ count: 4, columns: this.threadColumns() })
+                  .width('100%')
+                  .opacity(this.skeletonOpacity)
+              }
+            } else if (this.loadState === LoadState.Empty) {
+              FlowItem() {
+                EmptyView({ message: '该吧暂无帖子', icon: '📭' })
+                  .height(200)
+              }
+            } else {
+              FlowItem() {
+                ErrorView({ message: this.errorMsg, onRetry: () => { this.loadThreads(); } })
+                  .height(200)
+              }
+            }
+
+            // 尾部哨兵三态（保留改造前行为：静默占位 / 加载中 / 加载失败重试）
+            if (this.loadState === LoadState.Success && this.hasMore) {
+              FlowItem() {
+                Row() {
+                  if (this.loadingHintVisible) {
+                    LoadingView({ message: '加载中...' }).height(LIST_FOOTER_SENTINEL_H)
+                  } else if (this.loadMoreFailed) {
+                    Button('加载失败，点击重试')
+                      .fontSize(fs(13, this.fontScale))
+                      .fontColor(Theme.brand())
+                      .backgroundColor(Color.Transparent)
+                      .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                      .onClick(() => { this.loadMore(); })
+                  }
+                }
+                .width('100%')
+                .height(LIST_FOOTER_SENTINEL_H)
+                .justifyContent(FlexAlign.Center)
+              }
+            }
+          }
+          .columnsTemplate('1fr')
+          // rowsGap 置 0：卡距由卡片自身 margin.bottom(6) 承担（置顶让位格才不产生间距）
+          .rowsGap(0)
+          .padding({ left: 12, right: 12, bottom: this.contentBottomSpace() })
+          // 容器在 Refresh 内 → 用满高（Refresh 已 margin 90 下移）
+          .height('100%')
+          // 排序过场：位移逐张挂卡片（容器与吧头静止），与多列档同款；快照锚点仍是本容器
+          .id(THREAD_SCROLL_SNAPSHOT_ID)
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .edgeEffect(EdgeEffect.Spring)
+          .onAreaChange((oldValue: Area, newValue: Area) => this.onViewportAreaChange(oldValue, newValue))
+          .onScroll((xOffset: number, yOffset: number) => this.onListScroll(xOffset, yOffset))
+          .onTouch((event: TouchEvent) => this.onListTouchRecord(event))
+          .onScrollStart(() => this.onListScrollStart())
+          .onScrollStop(() => this.onListScrollStopPrefetch())
+          .onReachEnd(() => {
+            this.revealLoadHintOnReachEnd();
+            if (this.hasMore && !this.loadingMore) {
+              this.loadMore();
+            }
+          })
+          .gesture(
+            PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 30 })
+              .onActionStart(() => {
+                console.info('[TL_SWIPE] single waterflow pan start');
+                this.lockSwipe();
+              })
+              .onActionEnd((event: GestureEvent) => {
+                this.onSortSwipeEnd(event);
+                this.unlockSwipeDelayed();
+              })
+              .onActionCancel(() => {
+                this.unlockSwipeDelayed();
+              })
+          )
+        }
+        .width('100%')
+        .height('calc(100% - 90vp)')
+        .margin({ top: THREAD_LIST_HEADER_TOP_SPACE })
+        .clip(false)
+        .onRefreshing(() => { this.handleRefresh(true); })
       } else {
       // 下拉刷新（2026-09-22，docs/下拉刷新.md）：单列档与多列档同款（见多列档注释）
       Refresh({ refreshing: this.refreshing, offset: 48, friction: 62 }) {
@@ -3090,6 +3712,8 @@ struct ThreadList {
                   .opacity(this.contentOpacity)
               } else if (this.loadState === LoadState.Success) {
             // 统一容器：所有卡片共享同一水平边距，保证完美对齐
+            // （2026-09-28 窗口化 v2：子项数恒定（全量列表 × 真卡/占位分支），容器级 space:6
+            //   不再随子项数漂移，恢复原写法——占位与真卡等高，间隙语义与改造前逐像素一致）
             Column({ space: 6 }) {
               // 置顶/精品帖子区域
               if (this.pinnedThreads().length > 0) {
@@ -3190,28 +3814,45 @@ struct ThreadList {
                   .alignItems(VerticalAlign.Top)
                 }, (row: ThreadItem[], rowIdx: number) => `row_${rowIdx}_${row[0].tid}`)
               } else {
-                ForEach(this.normalThreads(), (item: ThreadItem) => {
-                  ThreadCard({
-                    item: {
-                      tid: item.tid, postId: item.postId ?? '',
-                      title: item.title, forumName: item.forumName,
-                      forumAvatar: item.forumAvatar ?? '',
-                      author: item.author,
-                      authorAvatar: item.authorAvatar ?? '',
-                      authorId: item.authorId ?? '',
-                      replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
-                      isLiked: item.isLiked ?? false,
-                      abstract: item.abstract,
-                      firstImage: item.firstImage ?? '', images: item.images ?? [],
-                      createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
-                    } as ThreadItemData,
-                    onTap: (tid: string) => this.openThread(tid),
-                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                    onComment: (tid: string) => this.openThread(tid),
-                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-                  })
-                    .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean) => this.onCardListVisible(item.tid, isVisible))
+                // ===== 单列档窗口化挂载 v2（2026-09-28「越滑越卡」治理）=====
+                // ForEach 直接遍历全量列表（key 与索引全程稳定，永不移位），每项按窗口分支：
+                // 窗口内 = 真卡；窗外 = 等高轻量占位。进出窗口只是单个子项的分支翻转，
+                // 不存在「窗口滑动 → 全体 key 移位 → 整窗重建」（v1 的真机掉帧回归根因）。
+                // 等价于 LazyForEach 的边缘增量挂载，但避开本页已知的虚拟容器渲染风险。
+                // 置顶块始终全量渲染（数量少）；搜索态不走本分支。
+                ForEach(this.normalThreads(), (item: ThreadItem, idx: number) => {
+                  if (idx >= this.slotStart && idx <= this.slotEnd) {
+                    ThreadCard({
+                      item: {
+                        tid: item.tid, postId: item.postId ?? '',
+                        title: item.title, forumName: item.forumName,
+                        forumAvatar: item.forumAvatar ?? '',
+                        author: item.author,
+                        authorAvatar: item.authorAvatar ?? '',
+                        authorId: item.authorId ?? '',
+                        replyNum: item.replyNum, likeCount: item.likeCount ?? 0,
+                        isLiked: item.isLiked ?? false,
+                        abstract: item.abstract,
+                        firstImage: item.firstImage ?? '', images: item.images ?? [],
+                        createTime: item.createTime, isTop: item.isTop, isGood: item.isGood,
+                      } as ThreadItemData,
+                      onTap: (tid: string) => this.openThread(tid),
+                      onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                      onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                      onComment: (tid: string) => this.openThread(tid),
+                      onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                    })
+                      .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean) => this.onCardListVisible(item.tid, isVisible))
+                      // 卡高采集（持续更新）：出窗后占位复用实测值，避免滚动跳动
+                      .onAreaChange((_oldA: Area, newA: Area) => {
+                        this.slotRecordHeight(item, newA.height as number);
+                      })
+                  } else {
+                    // 窗口外等高占位：实测卡高优先，未实测用 EMA 估算
+                    Column()
+                      .width('100%')
+                      .height(this.slotHeightOf(item))
+                  }
                 }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
               }
 
@@ -3441,6 +4082,11 @@ struct ThreadList {
       .width('100%')
       .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
       .backgroundColor(Color.Transparent)
+      // 沉浸阅读补全（2026-09-29）：兜底路径顶栏整行上移 + 淡出 + 禁用命中（与槽位路径同节奏）
+      .translate({ y: this.immersiveHidden ? this.listTopSink() : 0 })
+      .opacity(this.immersiveHidden ? 0 : 1)
+      .enabled(!this.immersiveHidden)
+      .animation(this.listImmersiveAnim())
       }
     }
     .width('100%')
@@ -3493,12 +4139,12 @@ struct ThreadList {
     .shadow(Theme.segGlassShadow(this.isDark, false))
     .margin({ right: 28, bottom: 36 })
     .zIndex(20)
-    // 搜索态隐去：淡出 + 缩小 + 下沉，隐藏时彻底不接收触摸
-    .opacity(this.fabReveal())
+    // 搜索态隐去：淡出 + 缩小 + 下沉，隐藏时彻底不接收触摸；沉浸阅读补全（2026-09-29）下沉合并
+    .opacity(this.immersiveHidden ? 0 : this.fabReveal())
     .scale({ x: this.fabReveal(), y: this.fabReveal() })
-    .translate({ y: (1 - this.fabReveal()) * 20 })
-    .hitTestBehavior(this.searchMode ? HitTestMode.None : HitTestMode.Default)
-    .animation({ duration: 220, curve: Curve.FastOutSlowIn })
+    .translate({ y: (this.immersiveHidden ? this.listBottomSink() : 0) + (1 - this.fabReveal()) * 20 })
+    .hitTestBehavior(this.searchMode || this.immersiveHidden ? HitTestMode.None : HitTestMode.Default)
+    .animation(this.listImmersiveAnim())
     .onClick(() => this.openJumpDialog())
     }
 
@@ -3680,6 +4326,12 @@ struct ThreadList {
     }
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
+    // 沉浸阅读补全（2026-09-29）：整行上移约 0.6 倍槽高 + 淡出 + 禁用命中。
+    // 槽高固定 98 不参与内容布局（Scroll 首项自带让位），位移不影响正文排布。
+    .translate({ y: this.immersiveHidden ? this.listTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.listImmersiveAnim())
   }
 
   /**
@@ -3756,11 +4408,12 @@ struct ThreadList {
     .clip(false)
     .margin({ bottom: THREAD_LIST_FAB_SHELL_BOTTOM })
     .zIndex(20)
-    .opacity(this.fabReveal())
+    // 沉浸阅读补全（2026-09-29）：搜索态路径的加号壳 —— 搜索显隐（fabReveal）与沉浸下沉合并为一套属性
+    .translate({ y: (this.immersiveHidden ? this.listBottomSink() : 0) + (1 - this.fabReveal()) * 20 })
+    .opacity(this.immersiveHidden ? 0 : this.fabReveal())
     .scale({ x: this.fabReveal(), y: this.fabReveal() })
-    .translate({ y: (1 - this.fabReveal()) * 20 })
     .hitTestBehavior(HitTestMode.None)
-    .animation({ duration: 220, curve: Curve.FastOutSlowIn })
+    .animation(this.listImmersiveAnim())
   }
 
   /** FAB 槽内列（官方槽位版）：右对齐 + 右缘 24（与排序栏左缘对称），**只剩加号一枚**
@@ -3851,6 +4504,10 @@ struct ThreadList {
     .hitTestBehavior(HitTestMode.None)
     // 搜索态不渲染（外层条件）；进出搜索与「列表区换场」同向：自下方浮起 / 向下方收起
     .transition(this.searchSwap(0, 24))
+    // 沉浸阅读补全（2026-09-29）：兜底路径排序栏同节奏下沉淡出
+    .translate({ y: this.immersiveHidden ? this.listBottomSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .animation(this.listImmersiveAnim())
   }
 
   /**
@@ -3921,6 +4578,12 @@ struct ThreadList {
     .hitTestBehavior(HitTestMode.None)
     // 进出搜索与「列表区换场」同向：自下方浮起 / 向下方收起
     .transition(this.searchSwap(0, 24))
+    // 沉浸阅读补全（2026-09-29）：排序栏+加号整体下沉约 0.6 倍堆叠高 + 淡出
+    // （材质均为应用节点侧 systemMaterial，随节点 opacity/translate 一起消隐，无系统玻璃错帧问题）
+    .translate({ y: this.immersiveHidden ? this.listBottomSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.listImmersiveAnim())
   }
 
   /**
@@ -4369,6 +5032,15 @@ struct ThreadList {
     return slots;
   }
 
+  /**
+   * 数据源中首个置顶项的 tid：单列档（WaterFlow 逐格渲染）把「置顶合并块」挂在它对应的格子上，
+   * 其余置顶项渲染 0 高占位（rowsGap=0 故不产生间距）—— 从而在虚拟容器里保住改造前的合并卡样式。
+   */
+  private firstPinnedTid(): string {
+    const p: ThreadItem[] = this.pinnedThreads();
+    return p.length > 0 ? p[0].tid : '';
+  }
+
   private pinnedThreads(): ThreadItem[] {
     // 派生缓存（2026-09-19，零风险自失效）：键 = threads 引用 + 排序档；
     // threads 全程整体赋值 ⇒ 引用变即内容变。返回值仅被读取（.length / threadRows / ForEach），无调用方 mutate。
@@ -4633,10 +5305,14 @@ struct ThreadList {
     const t0: number = Date.now();
     console.info(`[REFRESH] start sort=${this.selectedSort}`);
     try {
+      // 热门档刷新同样重建「客户端热度榜」（与「最新·按回复时间」区分）；其余档刷新第 1 页
+      const isHotRank: boolean = this.selectedSort === 0;
       const result = await this.withRefreshTimeout(
-        TiebaService.getInstance().fetchForumThreads(this.forumName, 1, this.effectiveSort(), false)
+        isHotRank
+          ? TiebaService.getInstance().fetchForumHotRank(this.forumName)
+          : TiebaService.getInstance().fetchForumThreads(this.forumName, 1, this.effectiveSort(), false)
       );
-      this.page = 1;
+      this.page = isHotRank ? HOT_RANK_PAGES : 1;
       this.threads = result.list;
       this.hasMore = result.list.length > 0;
       this.stalledPages = 0;

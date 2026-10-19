@@ -553,7 +553,7 @@ struct FollowList {
           }
         }
         .width('100%')
-        .padding({ left: 0, right: 0, bottom: Spacing.xl })
+        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: Spacing.xl })
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
         .clip(false)
@@ -591,6 +591,7 @@ struct FollowList {
           if (this.loadState === LoadState.Loading) {
             ListRowSkeleton({ count: 6 })
               .width('100%')
+              .padding({ left: Spacing.lg, right: Spacing.lg })
               .layoutWeight(1)
           } else if (this.loadState === LoadState.Error) {
             ErrorView({ message: this.errorMsg, onRetry: () => { this.loadFirst(); } }).layoutWeight(1)

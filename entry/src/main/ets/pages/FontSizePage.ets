@@ -197,9 +197,10 @@ struct FontSizePage {
                   }
                 }
               );
-              if (clamped !== this.fontLevel) {
-                FontSizeManager.getInstance().setLevel(clamped);
-              }
+              // 持久化无条件执行（与 selectLevel 一致）：
+              // @StorageLink 已在上方 animateTo 内被 AppStorage 同步回写为 clamped，
+              // 若再以 clamped !== this.fontLevel 作判据恒为 false，导致手势调档不落盘
+              FontSizeManager.getInstance().setLevel(clamped);
             })
             .onActionCancel(() => {
               this.getUIContext().animateTo(
@@ -266,9 +267,8 @@ struct FontSizePage {
                   }
                 }
               );
-              if (clamped !== this.fontLevel) {
-                FontSizeManager.getInstance().setLevel(clamped);
-              }
+              // 持久化无条件执行（与 selectLevel 一致）：判据见上方 Scroll 手势处注释
+              FontSizeManager.getInstance().setLevel(clamped);
             })
             .onActionCancel(() => {
               this.getUIContext().animateTo(

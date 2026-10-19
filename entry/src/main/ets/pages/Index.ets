@@ -27,6 +27,11 @@ import { CACHE_KEY, CACHE_TTL, PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION } from
 import { FollowItem, UserInfo, UserStats } from '../model/DataModel';
 import { Theme, fs, isDarkMode, initDarkMode, ImmBlur, ImmMaterial, MaterialManager, isLargeFoldDevice, isPuraXMaxDevice, Breakpoint } from '../common/Theme';
 import { FrameRateBoost } from '../common/FrameRateBoost';
+import { PerfTrace } from '../common/PerfTrace';
+import {
+  IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 import { FavoriteTab } from './Favorite';
 import { MessagesTab } from './MessagesTab';
 import { MineTab } from './MineTab';
@@ -71,6 +76,15 @@ const ITEM_H_LFOLD_PORTRAIT = 54;
 const ITEM_RADIUS_LFOLD_PORTRAIT = 27; // = 54/2
 const PAD_V_LFOLD_PORTRAIT = 4;
 
+// ===== 「沉浸式阅读补全」宿主底栏错帧参数（DT-N 同源，2026-09-29）=====
+// 官方悬浮玻璃由系统绘制（barFloatingStyle.systemMaterial），改参瞬时生效、插不进动画，
+// 与槽内容（应用节点）不同步 → 玻璃侧的「撤 / 给」与内容侧错开：
+// 藏起 = 内容先起步、玻璃晚撤 BAR_GLASS_LAG_MS；唤出 = 玻璃先给、内容延后 BAR_GLASS_LEAD_MS。
+const BAR_GLASS_LAG_MS: number = 180;
+const BAR_GLASS_LEAD_MS: number = 16;
+/** 底栏内容隐藏位移（vp，向下收回）：= (栏高 + 底距 30) × 0.6，余下交给 opacity(0) */
+const BAR_BOTTOM_MARGIN: number = 30;
+
 @Entry
 @Component
 struct Index {
@@ -101,8 +115,19 @@ struct Index {
   /** 窗口高（vp）：与 currentWidth 配对做横竖屏判定（底栏三档几何）；onAreaChange 维护 */
   @State currentHeight: number = 800;
   @StorageLink('fontScale') fontScale: number = 1.0;
-  @StorageLink('favEditing') favEditing: boolean = false;
+  @StorageLink('favEditing') @Watch('onFavEditingChanged') favEditing: boolean = false;
   @State materialSupported: boolean = true;
+  // ===== 「沉浸式阅读补全」宿主底栏显隐（2026-09-29）=====
+  // 驱动真源：HomeTab / FavoriteTab（仅当前 Tab）滚动判定后写 AppStorage 'mainBarImmersiveHidden'。
+  // 两态分离（DT-N 错帧）：barContentHidden 驱动槽内容 translate/opacity 动画；
+  // barSlotRemoved 驱动 barHeight→0 + barFloatingStyle→undefined + 内容摘除（favEditing 同款先例）。
+  @StorageLink('mainBarImmersiveHidden') @Watch('onMainBarImmersiveChanged') mainBarImmersiveHidden: boolean = false;
+  @State barContentHidden: boolean = false;
+  @State barSlotRemoved: boolean = false;
+  /** 玻璃撤除延时器（藏起路径）/ 内容滑回延时器（唤出路径）/ 看门狗句柄，-1 = 空闲 */
+  private barGlassTimer: number = -1;
+  private barShowTimer: number = -1;
+  private barWatchTimer: number = -1;
   /**
    * 首启合规闸门阶段：0=正在读本地授权记录（不透明占位底，防闪主界面）1=待用户同意（隐私政策浮层）2=已通过（渲染主界面）
    * 未进入阶段 2 时主界面（Tabs / PagesStack / HomeTab）完全不参与构建，
@@ -130,6 +155,9 @@ struct Index {
   async aboutToAppear(): Promise<void> {
     // 生命周期阶段UIContext已就绪，安全初始化context缓存
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    // 「沉浸式阅读补全」：初始化当前 Tab 真源与底栏显隐态（防残留 / 驱动页闸门失效）
+    AppStorage.setOrCreate<number>('currentMainTab', TabIndex.Home);
+    AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', false);
     // 闸门前置项：仅为「确定占位底配色 + 探测材质能力」的纯本地读取，不涉及个人信息、不发起网络请求。
     // 深色态必须先算：否则系统深色下占位底会先闪一帧浅色再切黑。
     MaterialManager.init();
@@ -137,6 +165,9 @@ struct Index {
     // 高刷拉档：常驻 displaySync 120 帧率请求，把窗口 vsync 抬到 120Hz 档，
     // 解决折叠屏展开/平板多列瀑布流被 RenderService 降档锁 60 的问题（沉浸光感零改动）
     FrameRateBoost.acquire('Index');
+    // P0-2 归因打点：宿主壳把「当前页面 = Index、当前主 Tab」写入上下文，
+    // 使 AGC 上报的 /ets/pages/Index 能按 Tab 拆开（默认首页，切 Tab 时更新）
+    PerfTrace.setPage('Index', 'home');
     // 先初始化 UsageHabitsManager：恢复「跟随系统深色 / 手动深色」持久化值。
     // 必须在读 config.colorMode 之前完成，否则冷启动会按 v1.x 「永远跟随系统」语义兜底，
     // 旧用户启过深色模式再重启仍会被打回浅色。
@@ -160,6 +191,92 @@ struct Index {
 
   aboutToDisappear(): void {
     FrameRateBoost.release('Index');
+    this.clearBarTimers();
+  }
+
+  // ===== 「沉浸式阅读补全」宿主底栏错帧编排（DT-N 同源，2026-09-29）=====
+
+  /** 清理错帧延时器（离页 / favEditing / switchTab 复位路径共用） */
+  private clearBarTimers(): void {
+    if (this.barGlassTimer !== -1) {
+      clearTimeout(this.barGlassTimer);
+      this.barGlassTimer = -1;
+    }
+    if (this.barShowTimer !== -1) {
+      clearTimeout(this.barShowTimer);
+      this.barShowTimer = -1;
+    }
+    if (this.barWatchTimer !== -1) {
+      clearTimeout(this.barWatchTimer);
+      this.barWatchTimer = -1;
+    }
+  }
+
+  /**
+   * 驱动页写入「mainBarImmersiveHidden」→ 编排两态：
+   * 藏 = 内容立即起步（180ms EaseIn 收回），玻璃晚撤 BAR_GLASS_LAG_MS —— 撤玻璃那一刻槽内已
+   * opacity(0) + 位移到位 = 空槽，系统那一记「无过渡硬切」被藏住（ThreadDetail DT-N 同款）。
+   */
+  private onMainBarImmersiveChanged(): void {
+    if (this.favEditing) {
+      // 编辑态槽位本就整体摘除，不参与沉浸编排（退出编辑态时由 onFavEditingChanged 复位）
+      return;
+    }
+    this.clearBarTimers();
+    if (this.mainBarImmersiveHidden) {
+      this.barContentHidden = true;
+      this.barGlassTimer = setTimeout(() => {
+        this.barGlassTimer = -1;
+        this.barSlotRemoved = true;
+      }, BAR_GLASS_LAG_MS);
+      // 看门狗兜底（真机 2026-09-29 反馈「底部还会露出一部分」）：主定时器万一丢失，
+      // 强制把槽位/玻璃摘干净（与 favEditing 摘除终态一致，幂等）
+      this.barWatchTimer = setTimeout(() => {
+        this.barWatchTimer = -1;
+        this.barSlotRemoved = true;
+      }, BAR_GLASS_LAG_MS + 420);
+    } else {
+      // 唤出：先给玻璃（槽位与背板恢复），下一帧再放内容滑回（260ms 轻回弹）。顺序不可反：
+      // 内容先滑回时玻璃会在归位途中凭空出现。
+      this.barSlotRemoved = false;
+      if (this.barContentHidden) {
+        this.barShowTimer = setTimeout(() => {
+          this.barShowTimer = -1;
+          this.barContentHidden = false;
+        }, BAR_GLASS_LEAD_MS);
+      }
+    }
+  }
+
+  /** 收藏编辑态变化：槽位由 favEditing 独立接管，进入时清掉在途编排，退出后底栏正常显示 */
+  private onFavEditingChanged(): void {
+    if (this.favEditing) {
+      this.clearBarTimers();
+      this.barContentHidden = false;
+      this.barSlotRemoved = false;
+    }
+  }
+
+  /**
+   * 底栏内容隐藏位移（vp，向下）——**整体平移出屏**（2026-09-29 真机修复）：
+   * 原 0.6×高 + opacity 淡出方案在官方 tabBar 槽位上失效（槽位内容层 opacity 真机不可靠，
+   * 沉 58vp 后仍露出 ~38vp 一截），改为「栏高 + 底距 + 24 余量」整体平移出屏幕底缘，
+   * 不依赖 opacity 也能完全消失；opacity(0) 保留作双保险。ThreadDetail 评论岛是应用层
+   * 节点不受此影响，维持 0.6×收回口径不动。
+   */
+  private barSinkY(): number {
+    return this.barHeightVal() + BAR_BOTTOM_MARGIN + 24;
+  }
+
+  /** 底栏内容显隐动画（藏 / 唤不对称）：取值以目标态为准（barContentHidden 本帧渲染前已写入） */
+  private barImmersiveAnim(): AnimateParam {
+    if (this.barContentHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   /**
@@ -255,6 +372,9 @@ struct Index {
     if (this.privacyPhase < 2) {
       return;
     }
+    // P0-2 归因打点：从二级页（ThreadList/ThreadDetail/…）返回时，页面上下文仍是二级页名，
+    // 若不在本钩子复位，回到宿主的帧统计会被错误归到二级页头上
+    PerfTrace.setPage('Index', this.perfTabName(this.selectedTab));
     this.refreshLoginState();
     if (this.loggedIn) {
       this.loadUserStats();
@@ -408,6 +528,19 @@ struct Index {
     this.animLock = true;
     this.prevTab = this.selectedTab;
     this.selectedTab = index;
+    // 「沉浸式阅读补全」（2026-09-29）：换 Tab 时底栏必回显 + 同步当前 Tab 真源
+    // （HomeTab / FavoriteTab 仅在自己为当前 Tab 时才允许驱动底栏显隐，防双常驻 Tab 互相污染）
+    this.clearBarTimers();
+    AppStorage.setOrCreate<number>('currentMainTab', index);
+    // P0-2 归因打点：切 Tab 是 Index 页丢帧的头号嫌疑（离屏页首次挂载的整页构建
+    // 与 320ms 平移动画同帧重叠），故既登记新 Tab 上下文，也计一次 tabSwitch 事件
+    PerfTrace.setPage('Index', this.perfTabName(index));
+    PerfTrace.mark('tabSwitch');
+    if (this.mainBarImmersiveHidden) {
+      AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', false);
+      this.barSlotRemoved = false;
+      this.barContentHidden = false;
+    }
     if (index === TabIndex.Favorite) {
       // 切到收藏页：通知常驻的 FavoriteTab 无感刷新（本地回流 + 云端首页增量）
       this.notifyFavoriteEnter();
@@ -457,6 +590,23 @@ struct Index {
   /** 层级：进场页盖在退场页之上 */
   private tabLayer(index: number): number {
     return index === this.selectedTab ? 1 : 0;
+  }
+
+  /** P0-2 归因打点用 Tab 名（仅进日志，与 TabIndex 一一对应） */
+  private perfTabName(index: number): string {
+    if (index === TabIndex.Forums) {
+      return 'forums';
+    }
+    if (index === TabIndex.Favorite) {
+      return 'favorite';
+    }
+    if (index === TabIndex.Messages) {
+      return 'messages';
+    }
+    if (index === TabIndex.Mine) {
+      return 'mine';
+    }
+    return 'home';
   }
 
   /**
@@ -652,12 +802,14 @@ struct Index {
     .scrollable(false)
     .barOverlap(true)
     // favEditing（收藏编辑态）时把栏高收为 0：真实 Tabs 槽位即便 tabBar 内容为空，悬浮磨砂背板
-    // （barFloatingStyle + systemMaterial）仍会按 barHeightVal() 渲染，压住收藏页底部编辑操作栏；
-    // 收为 0 后整条背板随栏一起消失（barOverlap 下内容区尺寸不变，PagesStack 不重建、页面状态不丢）
+    // （barFloatingStyle + systemMaterial）仍会按 barHeightVal() 渲染；收为 0 后整条背板随栏一起消失。
+    // ⚠️ 沉浸隐藏态**不走 barHeight 收 0**（2026-09-29 真机二次反馈：收 0 后系统在小白条区域仍钳制
+    // 渲染一条最小高度残条+默认磨砂遮挡内容；收藏编辑态没暴露是因为 EditBar 恰好盖住）——
+    // 改走 ThreadDetail DT-N 已验证方案：barHeight 不动，玻璃用 barWidth→0 + material empty 隐去。
     .barHeight(this.favEditing ? 0 : this.barHeightVal())
     .barBackgroundColor(Color.Transparent)
-    // 收藏编辑态：barHeight 收 0 后官方悬浮背板（barFloatingStyle + systemMaterial）仍会残留一条磨砂，
-    // 压住收藏页底部编辑按钮；故编辑态整体不传 floating style（Optional 传 undefined）彻底移除残留底栏
+    // 收藏编辑态：barHeight 收 0 后官方悬浮背板仍会残留一条磨砂，故编辑态整体不传 floating style
+    // （Optional 传 undefined，既有已验证行为不动）；沉浸隐藏态传「零面积样式」（见 floatingBarStyle）
     .barFloatingStyle(this.favEditing ? undefined : this.floatingBarStyle())
     .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
@@ -665,8 +817,24 @@ struct Index {
   }
 
   /** 悬浮胶囊宽度：与手写定稿一致（宽屏 480，窄屏 屏宽-48，下限 240 防极端异常） */
-  /** 官方悬浮底栏样式（非编辑态）：编辑态不传此样式，避免 barHeight=0 时仍残留一条磨砂背板 */
+  /**
+   * 官方悬浮底栏样式。沉浸隐藏态（barSlotRemoved）传「零面积样式」：barWidth→0 + material empty——
+   * ThreadDetail 评论岛 DT-N 同款（真机已验证：barWidth 收 0 会被系统钳成 ~56px 空壳，
+   * 但空壳无材质可画 = 彻底不可见）。**不走 barHeight 收 0**（会留小白条区残条）也**不传 undefined**
+   * （槽位样式缺席会触发 barOverlap 的默认磨砂背板，坑 26）。编辑态仍由 favEditing 传 undefined。
+   */
   private floatingBarStyle(): FloatingTabBarStyle {
+    if (this.barSlotRemoved) {
+      return {
+        barWidth: {
+          smallBarWidth: 0,
+          mediumBarWidth: 0,
+          largeBarWidth: 0
+        },
+        barBottomMargin: 30,
+        systemMaterial: ImmMaterial.empty()
+      };
+    }
     return {
       barWidth: {
         smallBarWidth: this.pillWidth(),
@@ -751,6 +919,8 @@ struct Index {
 
   @Builder
   FloatingBarSlot() {
+    // 沉浸隐藏态内容**保持挂载**（仅整体平移出屏 + 淡出 + 禁用命中，见下方属性链）：
+    // 不摘除重建，玻璃隐去由 floatingBarStyle 的零面积样式承担（barSlotRemoved 驱动）
     if (!this.favEditing) {
       Stack() {
         Row() {
@@ -777,6 +947,11 @@ struct Index {
       }
       .width('100%')
       .height('100%')
+      // 沉浸阅读补全（2026-09-29）：内容下沉 + 淡出 + 禁用命中（玻璃侧错帧由 onMainBarImmersiveChanged 编排）
+      .translate({ y: this.barContentHidden ? this.barSinkY() : 0 })
+      .opacity(this.barContentHidden ? 0 : 1)
+      .enabled(!this.barContentHidden)
+      .animation(this.barImmersiveAnim())
     }
   }
 
@@ -896,6 +1071,11 @@ struct Index {
     })
     .margin({ bottom: 30 })
     .zIndex(20)
+    // 沉浸阅读补全（2026-09-29）：兜底路径（API<26）无官方玻璃，直接下沉 + 淡出 + 禁用命中
+    .translate({ y: this.barContentHidden ? this.barSinkY() : 0 })
+    .opacity(this.barContentHidden ? 0 : 1)
+    .enabled(!this.barContentHidden)
+    .animation(this.barImmersiveAnim())
   }
 
   @Builder

@@ -146,6 +146,12 @@ struct PersonalizedPage {
    * 真源与 UsageHabitsManager 共用（写走 setImmersiveReading：AppStorage + 落盘），页面开关只作显示。
    */
   @StorageLink('immersiveReading') immersiveReading: boolean = false;
+  /**
+   * 「沉浸式阅读补全」开关（默认关）：独立开关项，不与「帖子沉浸式阅读」联挂。
+   * 开启后首页 / 收藏页 / 收藏夹二级页 / 吧主页向下滑动自动收起顶栏与底栏。
+   * 真源与 UsageHabitsManager 共用（写走 setImmersiveReadExtra：AppStorage + 落盘），页面开关只作显示。
+   */
+  @StorageLink('immersiveReadExtra') immersiveReadExtra: boolean = false;
   /** 「列数调整」三选一弹窗控制器（几何与工程既有 CustomDialog 同源：宽 dialogCardWidth()、圆角 32、底部锚点 dy -110） */
   private columnModeController: CustomDialogController = new CustomDialogController({
     builder: ColumnModeDialog({
@@ -419,6 +425,40 @@ struct PersonalizedPage {
           .onClick(() => {
             const isOn: boolean = !UsageHabitsManager.getInstance().isImmersiveReading();
             UsageHabitsManager.getInstance().setImmersiveReading(isOn);
+          })
+
+          // 沉浸式阅读补全（独立开关项）：首页 / 收藏页 / 收藏夹二级页 / 吧主页同款自动收起。
+          // 与上方开关同模式：Toggle 只作显示，意图由外层 Row.onClick 承接。
+          Row({ space: Spacing.md }) {
+            SymbolGlyph($r('sys.symbol.bookmark'))
+              .fontColor([Theme.textPrimary(this.isDark)])
+              .fontSize(fs(22, this.fontScale))
+
+            Column({ space: 2 }) {
+              Text('沉浸式阅读补全')
+                .fontSize(fs(18, this.fontScale))
+                .fontWeight(FontWeight.Medium)
+                .fontColor(Theme.textPrimary(this.isDark))
+              Text('让更多地方会自动隐藏顶栏和底栏')
+                .fontSize(fs(12, this.fontScale))
+                .fontColor(Theme.textSecondary(this.isDark))
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            .margin({ left: Spacing.xs })
+
+            Toggle({ type: ToggleType.Switch, isOn: this.immersiveReadExtra })
+              .selectedColor(BRAND_BLUE)
+              .hitTestBehavior(HitTestMode.None)
+          }
+          .width('100%')
+          .padding({ left: Spacing.lg, right: Spacing.lg, top: Spacing.xl, bottom: Spacing.xl })
+          .backgroundColor(Theme.bgCard(this.isDark))
+          .borderRadius(Radius.lg)
+          .margin({ top: Spacing.sm })
+          .onClick(() => {
+            const isOn: boolean = !UsageHabitsManager.getInstance().isImmersiveReadExtra();
+            UsageHabitsManager.getInstance().setImmersiveReadExtra(isOn);
           })
         }
         .width('100%')

@@ -319,6 +319,28 @@ export class FollowFeedStore {
   }
 
   /**
+   * 系统内存压力响应（2026-09-29 稳定性批次，EntryAbility.onMemoryLevel 分发）。
+   * CRITICAL：待展示池裁到低水位（被消费条目照常保留，不产生重复推荐），
+   * 池内 ThreadItem 是纯数据但数百条常驻也有可观内存占用；裁剪后异步落盘。
+   * 纯后台逻辑，零 UI 影响。
+   */
+  onSystemMemoryLevel(level: number): void {
+    try {
+      if (level < 2 || this.pool.length <= POOL_LOW) {
+        return;
+      }
+      while (this.pool.length > POOL_LOW) {
+        const tail: ThreadItem | undefined = this.pool.pop();
+        if (tail !== undefined) {
+          this.poolTids.delete(tail.tid);
+        }
+      }
+      this.persistSoon();
+      console.info(`[MEMLEVEL] FollowFeedStore CRITICAL: pool trimmed to ${POOL_LOW}`);
+    } catch (e) { /* 内存响应失败不影响主流程 */ }
+  }
+
+  /**
    * 补货：轮转拉取直到池达目标水位或枯竭熔断。
    * 每轮取 BARS_PER_ROUND 个「最久未拉且未翻尽」的吧并发拉取；
    * 全部翻尽时回卷（页码归 1 + sort_type 翻转）再试；连续 2 轮零进度熔断。

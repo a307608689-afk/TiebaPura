@@ -669,7 +669,10 @@ struct UserProfile {
     );
     // SDK 的 animateTo 无 onFinish：定时器在动画结束后卸载退场页并释放切换锁
     // （时长取动画约 1.3 倍，弹簧曲线可能略有回弹超时）
-    setTimeout(() => {
+    this.tabSettleTimer = setTimeout(() => {
+      if (!this.pageAlive) {
+        return;
+      }
       this.prevTab = -1;
       this.outOffset = 0;
       this.animLock = false;
@@ -909,7 +912,10 @@ struct UserProfile {
       this.getUIContext().animateTo({ duration: 220, curve: curves.springMotion(0.72, 0.86) }, () => {
         this.dragPct = 0;
       });
-      setTimeout(() => {
+      this.dragSettleTimer = setTimeout(() => {
+        if (!this.pageAlive) {
+          return;
+        }
         this.dragging = false;
         this.dragPct = 0;
       }, 280);
@@ -926,11 +932,31 @@ struct UserProfile {
       this.outOffset = -dir * 100;
       this.inOffset = 0;
     });
-    setTimeout(() => {
+    this.tabSettleTimer = setTimeout(() => {
+      if (!this.pageAlive) {
+        return;
+      }
       this.prevTab = -1;
       this.outOffset = 0;
       this.animLock = false;
     }, 420);
+  }
+
+  /** §AUDIT（2026-09-29 定时器审计）：Tab 切换/拖拽回弹延时器句柄 + 页面存活守卫（本页此前无清理点） */
+  private tabSettleTimer: number = -1;
+  private dragSettleTimer: number = -1;
+  private pageAlive: boolean = true;
+
+  aboutToDisappear(): void {
+    this.pageAlive = false;
+    if (this.tabSettleTimer !== -1) {
+      clearTimeout(this.tabSettleTimer);
+      this.tabSettleTimer = -1;
+    }
+    if (this.dragSettleTimer !== -1) {
+      clearTimeout(this.dragSettleTimer);
+      this.dragSettleTimer = -1;
+    }
   }
 
   // ===== 页面结构 =====

@@ -33,6 +33,7 @@ import { deviceInfo } from '@kit.BasicServicesKit';
 import { display } from '@kit.ArkUI';
 import { Theme, Radius, Breakpoint, fs, isDarkMode, ImmMaterial, MaterialManager, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { PrefetchGate } from '../common/PrefetchGate';
+import { PerfTrace } from '../common/PerfTrace';
 import { TiebaService } from '../service/TiebaService';
 import {
   GlobalForumResult, GlobalForumSearchData, GlobalPostResult, GlobalPostSearchData,
@@ -146,6 +147,9 @@ struct GlobalQueryPage {
   @State userLoadingMore: boolean = false;
 
   aboutToAppear(): void {
+    // P0-2 归因打点：搜索页是本期报告里「每小时丢帧数」最高的一页（但只 1 台设备），
+    // 登记页面上下文以便下一期用同口径数据判断它是离群还是必现
+    PerfTrace.setPage('Search');
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
     this.isDark = isDarkMode();

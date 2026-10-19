@@ -17,21 +17,27 @@
  */
 
 import { common } from '@kit.AbilityKit';
-import { display, LengthMetrics } from '@kit.ArkUI';
+import { curves, display, LengthMetrics } from '@kit.ArkUI';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { pasteboard, BusinessError, deviceInfo } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, CACHE_TTL } from '../common/Constants';
 import { PrefetchGate } from '../common/PrefetchGate';
+import {
+  ImmersiveReadSensor, IMMERSIVE_EXTRA_FLY_SCALE, IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 import { FollowFeedStore, POOL_HIGH, sortThreadsByTimeDesc } from '../service/FollowFeedStore';
 import { HistoryStore } from '../service/HistoryStore';
 import { FollowItem, PagedResult, ThreadItem, PersonalContentItem } from '../model/DataModel';
 import { Theme, Spacing, Radius, Breakpoint, CARD_COLUMNS_KEY, isDarkMode, ImmBlur, ImmMaterial, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { ErrorView, EmptyView, ThreadCard, ThreadItemData, ThreadSharePayload } from '../components/CommonComponents';
 import { ThreadListSkeleton } from '../components/Skeleton';
+import { PerfTrace } from '../common/PerfTrace';
 
 interface FollowSets {
   ids: Set<string>;
@@ -118,6 +124,26 @@ const FOLLOW_FEED_PAGE_SIZE: number = 20;
  */
 const HOME_TOP_PAD: number = 98;
 
+/**
+ * 单列档窗口化挂载诊断打点（2026-09-30「滑动抽搐 / 回滑露空白」定位期使用，问题已修复）。
+ * 结论存档：抽搐 = 一次窗口推进的一帧耗时（15~20ms 整列重排固定代价 + ~4.5ms/张组件构建，
+ * 与模糊/图片无关），故单列档已改走 WaterFlow（见 HOME_SINGLE_USE_WATERFLOW）；
+ * 空白 = 等高占位估算偏差（errAvg 80~120vp）导致视口上方内容被推走，已由内容特征桶估算修复。
+ * 打点只在「窗口化挂载」回退路径（HOME_SINGLE_USE_WATERFLOW=false）下才会触发。
+ * 出口三个：SLIDE=窗口推进、GAP=可见区越出窗口（视口内有占位）、HEST=估算与实测卡高偏差。
+ */
+const HSLOT_DIAG: boolean = false;
+const HSLOT_TAG: string = 'HSLOT';
+
+/**
+ * 单列档（手机）滚动容器：Scroll + Column 全量布局 + 窗口化挂载 → WaterFlow('1fr') + LazyForEach。
+ * 依据（2026-09-30 真机 A/B 归因）：窗口化挂载每次推进要付 ~15~20ms 的固定代价（整列重排）
+ * 外加 ~4.5ms/张的组件树构建，且与模糊/图片均无关（去模糊、去图片耗时不变）——120Hz 下必然掉帧；
+ * 而多列档的 WaterFlow + LazyForEach 是虚拟化 + 节点复用，同一页面长期无卡顿反馈。
+ * 置 false 即一行回退到原窗口化挂载路径（两条路径都保留在 build 内）。
+ */
+const HOME_SINGLE_USE_WATERFLOW: boolean = true;
+
 /** 缓存落盘合并窗口：列表变化后合并多次落盘为一次（600ms ≈ 一次翻页 + 一屏停留） */
 const HOME_CACHE_WRITE_DELAY: number = 600;
 /** 滚动空闲判定阈值：距上次 onScroll 不足该值视为仍在滑行，落盘与昵称回填一律顺延 */
@@ -184,6 +210,20 @@ export struct HomeTab {
   @StorageLink('homePageShownTick') @Watch('onPageTick') homePageShownTick: number = 0;
   // 宿主底栏重复点击首页 Tab：整页刷新（按当前 feed 重拉第一页）
   @StorageLink('homeRetapRequest') @Watch('onRetapTick') homeRetapRequest: number = 0;
+  // ===== 「沉浸式阅读补全」（2026-09-29，设置 → 个性化）=====
+  /** 设置项真源：AppStorage `immersiveReadExtra`（独立开关，默认关） */
+  @StorageLink('immersiveReadExtra') @Watch('onImmersiveExtraChanged') immersiveReadExtra: boolean = false;
+  /** 当前主 Tab 真源（Index.switchTab / aboutToAppear 维护）：仅自己为当前 Tab 时才允许驱动宿主底栏 */
+  @StorageLink('currentMainTab') @Watch('onCurrentMainTabChanged') currentMainTab: number = 0;
+  /**
+   * 沉浸态：true = 顶部胶囊与宿主底栏已藏起。
+   * **只存页面局部 @State，绝不写 AppStorage**（宿主底栏的驱动键 mainBarImmersiveHidden 除外，
+   * 且仅当前 Tab 才写）—— 切 Tab 残留由 Index.switchTab 复位兜底。
+   */
+  @State immersiveHidden: boolean = false;
+  /** 推荐流 / 关注流各持一份滚动判定器（基线独立，防切 feed 互污）；初始隐藏态与 @State 同步 */
+  private recImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
+  private folImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
   @State loggedIn: boolean = false;
   @State @Watch('onThreadsChange') threads: ThreadItem[] = [];
   @State loadState: LoadState = LoadState.Loading;
@@ -286,6 +326,8 @@ export struct HomeTab {
   async aboutToAppear(): Promise<void> {
     this.isDark = isDarkMode();
     this.loggedIn = AuthManager.getInstance().isLogin();
+    // §MEMLEVEL：向 AppStorage 注册关注流引擎实例，EntryAbility.onMemoryLevel 据此分发内存压力收缩
+    AppStorage.setOrCreate<FollowFeedStore>('followFeedStore', this.followFeed);
     // 首帧形态初值（§4.6 H-A 同源）：onAreaChange 只在尺寸变化后触发，冷启动平板横屏若不预置
     // 会出现「先 1 列再跳 3 列」的首帧跳变。取不到就保持 0，由 onAreaChange 兜底。
     try {
@@ -363,10 +405,17 @@ export struct HomeTab {
       }
       if (sameOrder) {
         ds.data = next;
+        let touched: number = 0;
         for (let i: number = 0; i < next.length; i++) {
           if (next[i] !== old[i]) {
             ds.notifyChange(i);
+            touched++;
           }
+        }
+        // P1 打点口径：等长同序 = 就地更新，只重建引用变化的项（成本比整表 reload 低一个量级）；
+        // 与下面的整表 onDataReloaded 分开计数，真机才能区分两种成本
+        if (touched > 0) {
+          PerfTrace.mark('listTouch');
         }
         return;
       }
@@ -375,6 +424,7 @@ export struct HomeTab {
     if (isAppend) {
       ds.notifyAdd(old.length);
     } else {
+      PerfTrace.mark('listSwap');
       ds.reload();
     }
   }
@@ -382,12 +432,14 @@ export struct HomeTab {
   /** threads 变化 → 同步到数据源（全量替换或尾部追加）+ 内容变化后补一次不满一屏判定 */
   private onThreadsChange(): void {
     this.syncSource(this.recDataSource, this.threads);
+    this.slotSyncAfterDataChange(false);
     this.checkUnderfillPrefetch();
   }
 
   /** folThreads 变化 → 同步到数据源（全量替换或尾部追加）+ 内容变化后补一次不满一屏判定 */
   private onFolThreadsChange(): void {
     this.syncSource(this.folDataSource, this.folThreads);
+    this.slotSyncAfterDataChange(true);
     this.checkUnderfillPrefetch();
   }
 
@@ -434,6 +486,9 @@ export struct HomeTab {
       this.folScroller.scrollTo({ xOffset: 0, yOffset: 0 });
     } catch (e) {
     }
+    // 列数档切换会换容器（WaterFlow ↔ Scroll），单列窗口一律回首屏
+    this.slotReset(false);
+    this.slotReset(true);
   }
 
   private homeColumns(): number {
@@ -502,7 +557,8 @@ export struct HomeTab {
    */
   private homeColumnsTemplate(): string {
     const n: number = this.homeColumns();
-    return n === 4 ? '1fr 1fr 1fr 1fr' : n === 2 ? '1fr 1fr' : '1fr 1fr 1fr';
+    // 单列档必须同为 1 列：模板与列数单点同源（历史上「模板直绑 this.columns」曾让中档小窗铺成 3 列）
+    return n <= 1 ? '1fr' : n === 4 ? '1fr 1fr 1fr 1fr' : n === 2 ? '1fr 1fr' : '1fr 1fr 1fr';
   }
 
   /**
@@ -527,16 +583,14 @@ export struct HomeTab {
   }
 
   /**
-   * 渐隐停靠点：视口高 × 0.15 夹取到 [HOME_FADE_MIN, HOME_FADE_MAX] 后折算百分比。
-   * 平板收窄（2026-09-13 用户反馈）：平板竖屏下 15% 渐显覆盖到第一个卡片用户名位置，
-   * 要求「只覆盖顶部按钮与标题」→ 平板档 raw 直接取顶栏高度 HOME_TITLE_BAR_HEIGHT(108)；
-   * 手机维持原公式（夹取后 108~180 不变）。
+   * 渐隐停靠点：所有形态统一只盖顶栏（2026-09-29 用户反馈：手机 15% 覆盖过多），
+   * raw 直接取顶栏高度 HOME_TITLE_BAR_HEIGHT(108)（= 状态栏让位 + 按钮行 + 呼吸，即顶部胶囊底部）。
    */
   private updateFadeStop(viewportHeightVp: number): void {
     if (viewportHeightVp <= 0) {
       return;
     }
-    const raw: number = this.isWideFormDevice ? HOME_TITLE_BAR_HEIGHT : viewportHeightVp * 0.15;
+    const raw: number = HOME_TITLE_BAR_HEIGHT;
     const clamped: number = Math.min(Math.max(raw, HOME_FADE_MIN), HOME_FADE_MAX);
     this.fadeStop = clamped / viewportHeightVp;
   }
@@ -597,6 +651,8 @@ export struct HomeTab {
 
   /** 宿主底栏重复点击首页 Tab：整页刷新（按当前 feed 重拉第一页，与下拉刷新同一路径） */
   private onRetapTick(): void {
+    // 回顶整页刷新：沉浸态一并复位（回顶后置顶保护也会兜底恢复显示）
+    this.resetImmersive();
     this.reloadHomeFromTab();
   }
 
@@ -711,11 +767,17 @@ export struct HomeTab {
     }
   }
 
-  /** 用详情页回填的作者昵称缓存刷新列表显示（不重新请求网络） */
+  /** 用详情页回填的作者昵称缓存刷新列表显示（不重新请求网络）。
+   *  §P1-1（2026-09-29 丢帧治理）：`changed` 由「只打日志」升级为**短路条件** ——
+   *  没有任何昵称需要回填时（返回宿主的大多数场景）直接 return、不写 @State。
+   *  原先无条件 `updateCurrentThreads(map(...))` 会产出新数组引用 → 本组件 build 整树重跑
+   *  → @Watch onThreadsChange → syncSource 全量比对，真机实测「详情页返回首页」窗口
+   *  fps 74 / d33=2（全流程最稳定的掉帧点之一）。
+   *  map 仍要跑完才知道有没有变化（纯内存遍历，微秒级），只是不再把结果写回状态。 */
   private refreshAuthorsFromCache(): void {
     const service = TiebaService.getInstance();
     let changed = false;
-    this.updateCurrentThreads(this.currentFeedThreads().map((t: ThreadItem): ThreadItem => {
+    const updated: ThreadItem[] = this.currentFeedThreads().map((t: ThreadItem): ThreadItem => {
       if (t.authorId !== undefined && t.authorId.length > 0) {
         const cachedName: string | undefined = service.getCachedAuthorName(t.authorId);
         if (cachedName !== undefined && cachedName.length > 0 && cachedName !== t.author) {
@@ -731,10 +793,12 @@ export struct HomeTab {
         }
       }
       return t;
-    }));
-    if (changed) {
-      console.info('[AUTHORDIAG] 首页列表已用详情页昵称回填刷新');
+    });
+    if (!changed) {
+      return;
     }
+    this.updateCurrentThreads(updated);
+    console.info('[AUTHORDIAG] 首页列表已用详情页昵称回填刷新');
   }
 
   /** 「仅推荐关注的吧」是否生效：已登录且开关开启 */
@@ -747,7 +811,8 @@ export struct HomeTab {
     try {
       const st: number = sortType !== undefined ? sortType : (Math.random() < 0.5 ? 0 : 1);
       const pg: number = page !== undefined ? page : (Math.random() < 0.5 ? 1 : 2);
-      const r: PagedResult<ThreadItem> = await TiebaService.getInstance().fetchForumThreads(forumName, pg, st, false);
+      // isPrefetch=true：feed 补货语义同预取（后台供给），走短超时 Session 弱网快失败
+      const r: PagedResult<ThreadItem> = await TiebaService.getInstance().fetchForumThreads(forumName, pg, st, false, 0, true);
       return r.list.slice(0, limit);
     } catch (e) {
       return [];
@@ -852,6 +917,10 @@ export struct HomeTab {
     if (!this.shouldOnlyFollow() || !this.followFeed.poolLow()) {
       return;
     }
+    // 注（2026-09-29 留痕）：曾在此加「滚动静默门闸」（推迟到停手后发起），真机实测
+    // FRS 请求 -53% 但 `dec` 仅 -20%、长帧占比无改善，且门闸在连续滚动下会把任务全部
+    // 丢弃（defer=10/run=0/drop=10）导致供给被饿死 → 已回退。
+    // 教训：只推迟「请求发起」无效——回包仍在滚动中到达；要治必须推迟「回包处理」。
     this.ensureFollowEngine().then((ok: boolean): Promise<void> => {
       if (!ok) {
         return Promise.resolve();
@@ -993,11 +1062,361 @@ export struct HomeTab {
   private lastVisFollow: boolean = false;
   private swipePrefetchTimer: number = -1;
 
-  /** 记录可见 item 区间（WaterFlow/List 的 onScrollIndex 回调通用） */
+  /** 记录可见 item 区间（WaterFlow 的 onScrollIndex 回调通用；单列 Scroll 档由 slotUpdateWindow 写入） */
   private onFeedVisibleRange(useFollow: boolean, start: number, end: number): void {
     this.lastVisFollow = useFollow;
     this.lastVisStart = start;
     this.lastVisEnd = end;
+  }
+
+  // ===== 单列档窗口化挂载 v2（2026-09-29「首页顶部卡片整层消失」根治）=====
+  // 与 docs/floor-vanish-viewport-fix.md 同源问题：List 虚拟容器的视口剔除窗口与
+  // clip(false)+expandSafeArea(TOP) 的沉浸绘制区错位，卡片滚入顶栏区被整层剔除不绘制
+  // （ThreadDetail 当年在底部 / 首页在顶部，两例互为镜像；探针 A/B 均无法消除 → 容器根治）。
+  // 单列档 List → Scroll + Column 全量布局 + 窗口化挂载（ThreadList 2026-09-28 v2 同款）：
+  // ForEach 遍历全量列表（key 稳定不移位），窗口内真卡 / 窗外等高轻量占位，
+  // 等价 LazyForEach 的边缘增量挂载，但 Scroll 无任何视口剔除机制。
+  /**
+   * 挂载缓冲：可见区上下各「必须挂载」的张数。视口距窗口边界小于该值即视为贴边，必须推进。
+   * 取 4（约 1500vp）：甩滑一帧最多移动百来 vp，足够安全，同时把单次推进量压到最小。
+   */
+  private readonly SLOT_BUFFER: number = 4;
+  /**
+   * 扩展目标：贴边后一次性把窗口扩到「可见区 ± SLOT_EXTEND」（而非紧贴挂载边界）。
+   * 真机第二轮实测证明：若扩展只跟随挂载边界（=SLOT_BUFFER），会变成**每帧推进一次**
+   * （win 25 次/2s，每秒十余次整列 diff + 重布局），持续掉帧比大步长推进更难忍。
+   * 单次新建张数 = SLOT_EXTEND − SLOT_BUFFER，推进间隔张数亦同 —— 这一对常量决定
+   * 「单帧创建量 ⇄ 推进频率」的取舍（5 张 ≈ 35ms / 每滑 5 张一次）。
+   */
+  private readonly SLOT_EXTEND: number = 9;
+  /**
+   * 卸载滞后：可见区上下各「允许保留」的真卡张数，超出才降级回等高占位。
+   * 与 SLOT_EXTEND 的差值（6 张）= 一次收缩最多卸载的张数；同时让反向回滑
+   * （用户刚滑过的卡仍在保留带内）直接命中已挂载真卡，零重建。
+   */
+  private readonly SLOT_KEEP: number = 15;
+  /** 首屏初始挂载数 */
+  private readonly SLOT_INITIAL: number = 12;
+  /** 实测卡高表容量上限（提高到 1200：长距离下滑后回滑仍能命中实测值，避免退化到估算） */
+  private readonly SLOT_HEIGHT_CAP: number = 1200;
+  /** 实测卡高表（vp，键=tid；推荐/关注两 feed 共享，同帖高度一致） */
+  private slotHeightMap: Map<string, number> = new Map<string, number>();
+  /** 未实测卡的估算高（vp）：以实测值 EMA 收敛（初值取图文/纯文字卡中间偏保守） */
+  private slotAvgH: number = 340;
+  /** 高度表版本号：任何卡高变化即递增，用于前缀和缓存失效 */
+  private slotHeightVer: number = 0;
+  /** 每 feed 独立窗口（两 feed 常驻同树，不能共用一份窗口态） */
+  @State private recSlotStart: number = 0;
+  @State private recSlotEnd: number = 11;
+  @State private folSlotStart: number = 0;
+  @State private folSlotEnd: number = 11;
+  /** 前缀和缓存（每 feed 一份）：pre[i] = 第 i 张卡的顶部 y（pre[0]=0） */
+  private recPreCache: number[] = [0];
+  private recPreSrc: ThreadItem[] | undefined = undefined;
+  private recPreVer: number = -1;
+  private folPreCache: number[] = [0];
+  private folPreSrc: ThreadItem[] | undefined = undefined;
+  private folPreVer: number = -1;
+  /** 诊断（HSLOT_DIAG）：首次实测卡高与当时估算值的偏差累计，随窗口推进一并输出并清零 */
+  private diagErrSum: number = 0;
+  private diagErrN: number = 0;
+  private diagErrMax: number = 0;
+  /** 诊断：GAP 打点限流时间戳（越界可能连续多帧成立） */
+  private diagGapAt: number = 0;
+  /**
+   * 内容特征桶均值（滚动中自校准）：键 = 图片数_标题行数_摘要行数。
+   * 未实测卡优先取「同特征卡」的实测均值，比单一 EMA 均值准一个量级 ——
+   * 真机 FSTAT 证明「占位高 ≠ 真卡高」引发的布局重排与内容位移，才是滚动抽搐、
+   * 回滑露白的直接来源（errN 高的窗口其最差帧是 errN≈0 窗口的 4 倍）。
+   */
+  private slotBucketH: Map<string, number> = new Map<string, number>();
+
+  private slotList(useFollow: boolean): ThreadItem[] {
+    return useFollow ? this.folThreads : this.threads;
+  }
+
+  private slotHeightOf(item: ThreadItem): number {
+    const h: number | undefined = this.slotHeightMap.get(item.tid);
+    return h !== undefined ? h : this.estimateCardHeight(item);
+  }
+
+  /** 未实测卡估算：优先同特征桶实测均值，缺样本时用结构公式打底（自校准，无需人工调参） */
+  private estimateCardHeight(item: ThreadItem): number {
+    const learned: number | undefined = this.slotBucketH.get(this.slotBucketKey(item));
+    if (learned !== undefined) {
+      return learned;
+    }
+    return this.slotFormulaHeight(item);
+  }
+
+  /** 特征键：图片数_标题行数_摘要行数（同键卡的实际高度高度一致，故桶均值可用作占位高） */
+  private slotBucketKey(item: ThreadItem): string {
+    const ic: number = item.images !== undefined ? Math.min(item.images.length, 9) : 0;
+    const scale: number = this.fontScale > 0 ? this.fontScale : 1.0;
+    const lineW: number = this.slotLineWidth();
+    const tl: number = this.slotTextLines(item.title, 17 * scale, lineW, 2);
+    const al: number = item.abstract.length > 0 ? this.slotTextLines(item.abstract, 14 * scale, lineW, 4) : 0;
+    return `${ic}_${tl}_${al}`;
+  }
+
+  /** 文本可用宽 = 屏宽 − 列表左右留白(Spacing.lg×2) − 卡内左右内距(16×2) */
+  private slotLineWidth(): number {
+    const w: number = this.pageWidth > 0 ? this.pageWidth : 360;
+    return Math.max(120, w - Spacing.lg * 2 - 32);
+  }
+
+  /** 文本行数估算：CJK 按 1 字宽、其余约 0.55 字宽；clamp 到 maxLines（误差 1 行内可接受） */
+  private slotTextLines(text: string, fontSize: number, availW: number, maxLines: number): number {
+    if (text.length === 0) {
+      return 1;
+    }
+    let units: number = 0;
+    for (let i: number = 0; i < text.length; i++) {
+      units += text.charCodeAt(i) > 0x2E80 ? 1 : 0.55;
+    }
+    const lines: number = Math.ceil((units * fontSize) / Math.max(1, availW));
+    return Math.max(1, Math.min(maxLines, lines));
+  }
+
+  /** 图片区高度（单列档，含 top 10）：1 张 220；2/4 张两列 140；其余三列 100（行间 8vp） */
+  private slotGalleryHeight(count: number): number {
+    if (count <= 0) {
+      return 0;
+    }
+    if (count === 1) {
+      return 10 + 220;
+    }
+    const twoCol: boolean = count === 2 || count === 4;
+    const cell: number = twoCol ? 140 : 100;
+    const rows: number = Math.ceil(count / (twoCol ? 2 : 3));
+    return 10 + rows * cell + (rows - 1) * 8;
+  }
+
+  /** 结构公式（桶无样本时的兜底）：逐项复刻 ThreadCard 的真实组成 */
+  private slotFormulaHeight(item: ThreadItem): number {
+    const scale: number = this.fontScale > 0 ? this.fontScale : 1.0;
+    const lineW: number = this.slotLineWidth();
+    let h: number = 16 + 40;
+    const tl: number = this.slotTextLines(item.title, 17 * scale, lineW, 2);
+    h += 8 + tl * 17 * scale * 1.45;
+    if (item.abstract.length > 0) {
+      const al: number = this.slotTextLines(item.abstract, 14 * scale, lineW, 4);
+      h += 6 + al * 14 * scale * 1.5;
+    }
+    const ic: number = item.images !== undefined ? Math.min(item.images.length, 9) : 0;
+    h += this.slotGalleryHeight(ic);
+    if (item.forumName.length > 0) {
+      h += 10 + 20;
+    }
+    h += 12 + 36 + 14;
+    return h;
+  }
+
+  /** 窗口外占位块高度 = 区间 [from, to) 内卡高之和（卡间 space 由 Column 的 space 承担） */
+  private slotRangeHeight(useFollow: boolean, from: number, to: number): number {
+    const pre: number[] = this.slotPrefixSums(useFollow);
+    const last: number = pre.length - 1;
+    const a: number = from >= 0 && from <= last ? pre[from] : 0;
+    const b: number = to >= 0 && to <= last ? pre[to] : pre[last];
+    return Math.max(0, b - a);
+  }
+
+  /** 卡高采集（持续更新）。仅窗口内真卡挂回调 → 观察者 O(窗口)。
+   *  不锁首测：图片失败降级 ↔ 自愈会改变卡高，占位必须跟上，否则回滑时错位。
+   *  同时把实测值回灌「同特征桶」（EMA），供未实测卡做占位高。 */
+  private slotRecordHeight(item: ThreadItem, h: number): void {
+    if (h <= 0 || h > 2000) {
+      return;
+    }
+    const tid: string = item.tid;
+    const prev: number | undefined = this.slotHeightMap.get(tid);
+    if (prev !== h) {
+      if (HSLOT_DIAG && prev === undefined) {
+        // 首次实测：与「占位实际使用的估算值」（桶均值/结构公式）比对，量化占位高 ≠ 真卡高
+        const est: number = this.estimateCardHeight(item);
+        const d: number = h - est;
+        this.diagErrSum += Math.abs(d);
+        this.diagErrN++;
+        if (Math.abs(d) > this.diagErrMax) {
+          this.diagErrMax = Math.abs(d);
+        }
+        if (Math.abs(d) > 60) {
+          hilog.info(0x0000, HSLOT_TAG,
+            'HEST tid=%{public}s est=%{public}d real=%{public}d d=%{public}d map=%{public}d',
+            tid, Math.round(est), Math.round(h), Math.round(d), this.slotHeightMap.size);
+        }
+      }
+      this.slotHeightMap.set(tid, h);
+      this.slotHeightVer++;
+      this.slotAvgH = this.slotAvgH * 0.9 + h * 0.1;
+      const key: string = this.slotBucketKey(item);
+      const bk: number | undefined = this.slotBucketH.get(key);
+      this.slotBucketH.set(key, bk === undefined ? h : bk * 0.7 + h * 0.3);
+    }
+    if (this.slotHeightMap.size > this.SLOT_HEIGHT_CAP) {
+      let oldest: string | undefined = undefined;
+      for (const k of this.slotHeightMap.keys()) {
+        oldest = k;
+        break;
+      }
+      if (oldest !== undefined) {
+        this.slotHeightMap.delete(oldest);
+      }
+    }
+  }
+
+  /** 前缀和：pre[i] = 第 i 张卡的顶部 y。带缓存：仅在列表引用或高度表变化时重算 */
+  private slotPrefixSums(useFollow: boolean): number[] {
+    const list: ThreadItem[] = this.slotList(useFollow);
+    const src: ThreadItem[] | undefined = useFollow ? this.folPreSrc : this.recPreSrc;
+    const ver: number = useFollow ? this.folPreVer : this.recPreVer;
+    if (src === list && ver === this.slotHeightVer) {
+      return useFollow ? this.folPreCache : this.recPreCache;
+    }
+    const pre: number[] = new Array<number>(list.length + 1);
+    pre[0] = 0;
+    for (let i = 0; i < list.length; i++) {
+      pre[i + 1] = pre[i] + this.slotHeightOf(list[i]);
+    }
+    if (useFollow) {
+      this.folPreCache = pre;
+      this.folPreSrc = list;
+      this.folPreVer = this.slotHeightVer;
+    } else {
+      this.recPreCache = pre;
+      this.recPreSrc = list;
+      this.recPreVer = this.slotHeightVer;
+    }
+    return pre;
+  }
+
+  /** 滚动中推进窗口（onScroll 每帧调用）：①双向滞回——只有可见区贴住「必须挂载边界」才扩展、
+   *  越过「保留边界」才收缩（卸载滞后），单次推进量上限 = 2×(SLOT_KEEP − SLOT_BUFFER)，
+   *  把原本一次 50~75ms 的冻结帧拆成几帧小重建（真机 FSTAT 实测归因，2026-09-30）；
+   *  ②前缀和走缓存，滚动帧零 O(N) 计算。同时把可见区间写入 lastVis*（停歇预取沿用，
+   *  替代 List.onScrollIndex 的可见区间来源）。 */
+  private slotUpdateWindow(useFollow: boolean, atY: number): void {
+    const list: ThreadItem[] = this.slotList(useFollow);
+    const n: number = list.length;
+    const vh: number = useFollow ? this.folViewportH : this.homeViewportH;
+    if (n === 0 || vh <= 0) {
+      return;
+    }
+    const t0: number = HSLOT_DIAG ? Date.now() : 0;
+    const pre: number[] = this.slotPrefixSums(useFollow);
+    const preMs: number = HSLOT_DIAG ? Date.now() - t0 : 0;
+    const bottom: number = atY + vh;
+    let vs: number = 0;
+    while (vs < n - 1 && pre[vs + 1] <= atY) {
+      vs++;
+    }
+    let ve: number = vs;
+    while (ve < n - 1 && pre[ve + 1] <= bottom) {
+      ve++;
+    }
+    this.lastVisFollow = useFollow;
+    this.lastVisStart = vs;
+    this.lastVisEnd = ve;
+    const s: number = useFollow ? this.folSlotStart : this.recSlotStart;
+    const e: number = useFollow ? this.folSlotEnd : this.recSlotEnd;
+    // 必须挂载边界（可见区 ± SLOT_BUFFER）：视口内不得出现占位
+    const mountS: number = Math.max(0, vs - this.SLOT_BUFFER);
+    const mountE: number = Math.min(n - 1, ve + this.SLOT_BUFFER);
+    // 扩展目标（可见区 ± SLOT_EXTEND）：贴边时一次性扩到这里，给足余量避免每帧跟随式推进
+    const extS: number = Math.max(0, vs - this.SLOT_EXTEND);
+    const extE: number = Math.min(n - 1, ve + this.SLOT_EXTEND);
+    // 保留边界（可见区 ± SLOT_KEEP）：越过才收缩（卸载滞后，回滑路径上刚看过的卡不重建）
+    const keepS: number = Math.max(0, vs - this.SLOT_KEEP);
+    const keepE: number = Math.min(n - 1, ve + this.SLOT_KEEP);
+    let ns: number = s;
+    let ne: number = e;
+    // ① 贴住挂载边界 → 扩展到目标（单帧创建量 = SLOT_EXTEND − SLOT_BUFFER）
+    if (s > mountS) {
+      ns = extS;
+    }
+    if (e < mountE) {
+      ne = extE;
+    }
+    // ② 卸载滞后：越过保留带才收缩，且一次收到扩展目标（避免小步反复收）
+    if (ns < keepS) {
+      ns = extS;
+    }
+    if (ne > keepE) {
+      ne = extE;
+    }
+    // ③ 覆盖兜底：任何情况下视口都不得落到占位区
+    if (ns > mountS) {
+      ns = mountS;
+    }
+    if (ne < mountE) {
+      ne = mountE;
+    }
+    if (HSLOT_DIAG && (vs < ns || ve > ne)) {
+      // 可见区越出新窗口 = 视口内存在「等高占位」而非真卡 → 用户看到的空白/内容缺失
+      const now: number = Date.now();
+      if (now - this.diagGapAt > 200) {
+        this.diagGapAt = now;
+        hilog.info(0x0000, HSLOT_TAG,
+          'GAP vis=%{public}d..%{public}d win=%{public}d..%{public}d atY=%{public}d vh=%{public}d n=%{public}d',
+          vs, ve, ns, ne, atY, vh, n);
+      }
+    }
+    if (ns !== s || ne !== e) {
+      // P0-2 归因打点：窗口真正推进 = 一次页面级重渲染（只在实际推进分支计数，静止帧零开销）
+      PerfTrace.mark('winSlide');
+      if (useFollow) {
+        this.folSlotStart = ns;
+        this.folSlotEnd = ne;
+      } else {
+        this.recSlotStart = ns;
+        this.recSlotEnd = ne;
+      }
+      if (HSLOT_DIAG) {
+        const errAvg: number = this.diagErrN > 0 ? Math.round(this.diagErrSum / this.diagErrN) : 0;
+        // mount = 本次推进新挂载（占位→真卡）张数，直接反映这一帧的重建负荷
+        const mount: number = (ns < s ? s - ns : 0) + (ne > e ? ne - e : 0);
+        // imgs = 新挂载卡携带的图片总数（宫格 Image 组件数），用于区分「组件创建」与「图片加载/解码」谁在吃帧
+        let imgs: number = 0;
+        for (let i: number = ns; i <= ne && i < n; i++) {
+          if (i >= s && i <= e) {
+            continue;
+          }
+          const it: ThreadItem | undefined = list[i];
+          if (it !== undefined && it.images !== undefined) {
+            imgs += it.images.length;
+          }
+        }
+        hilog.info(0x0000, HSLOT_TAG,
+          'SLIDE vis=%{public}d..%{public}d win=%{public}d..%{public}d->%{public}d..%{public}d mount=%{public}d imgs=%{public}d out=%{public}d preMs=%{public}d atY=%{public}d vh=%{public}d n=%{public}d errN=%{public}d errAvg=%{public}d errMax=%{public}d avg=%{public}d',
+          vs, ve, s, e, ns, ne, mount, imgs, (vs < ns || ve > ne) ? 1 : 0, preMs,
+          atY, vh, n, this.diagErrN, errAvg, Math.round(this.diagErrMax), Math.round(this.slotAvgH));
+        this.diagErrSum = 0;
+        this.diagErrN = 0;
+        this.diagErrMax = 0;
+      }
+    }
+  }
+
+  /** 窗口复位（回顶刷新 / 数据换血 / 列数档切换）：回首屏挂载量；卡高表保留（同帖高度可复用） */
+  private slotReset(useFollow: boolean): void {
+    if (useFollow) {
+      this.folSlotStart = 0;
+      this.folSlotEnd = this.SLOT_INITIAL - 1;
+    } else {
+      this.recSlotStart = 0;
+      this.recSlotEnd = this.SLOT_INITIAL - 1;
+    }
+  }
+
+  /** 数据变化后窗口自纠：列表缩短（刷新换血 / 数据失效重拉）时窗口可能越界 → 复位并按当前偏移重定位 */
+  private slotSyncAfterDataChange(useFollow: boolean): void {
+    const n: number = this.slotList(useFollow).length;
+    const e: number = useFollow ? this.folSlotEnd : this.recSlotEnd;
+    if (n === 0 || e >= n) {
+      this.slotReset(useFollow);
+      const scroller: Scroller = useFollow ? this.folScroller : this.homeScroller;
+      this.slotUpdateWindow(useFollow, PrefetchGate.absoluteY(scroller));
+    }
   }
 
   /** 记录手指按下 y（按下让滑动暂停时，预取"最接近按下位置"的卡） */
@@ -1046,14 +1465,24 @@ export struct HomeTab {
         cands.push(list[i]);
       }
       if (pressY >= 0) {
+        // 单列档（Scroll+窗口化挂载）：getItemRect 对 Scroll 不可靠，用前缀和精确算卡中心视口 y
+        // （pressY 为视口本地 y，卡中心视口 y = pre[i] + h/2 − atY）
+        // 单列档现在也走 WaterFlow（getItemRect 可用），只有回退路径才用前缀和几何
+        const single: boolean = !HOME_SINGLE_USE_WATERFLOW && this.homeColumns() === 1;
+        const pre: number[] = single ? this.slotPrefixSums(useFollow) : [];
+        const atY: number = this.homeScrollY;
         const scored: ScoredThread[] = [];
         for (let i: number = start; i <= end && i < list.length; i++) {
           let d: number = Math.abs(i - (start + end) / 2) * 1000;
-          try {
-            const rect: RectResult = scroller.getItemRect(i);
-            d = Math.abs((rect.y + rect.height / 2) - pressY);
-          } catch (e) {
-            // getItemRect 不支持该容器时用"可见区中段优先"兜底距离
+          if (single) {
+            d = Math.abs((pre[i] + this.slotHeightOf(list[i]) / 2) - (atY + pressY));
+          } else {
+            try {
+              const rect: RectResult = scroller.getItemRect(i);
+              d = Math.abs((rect.y + rect.height / 2) - pressY);
+            } catch (e) {
+              // getItemRect 不支持该容器时用"可见区中段优先"兜底距离
+            }
           }
           scored.push({ it: list[i], d: d });
         }
@@ -1299,6 +1728,8 @@ export struct HomeTab {
    * 拉列表时触发），延迟补校准，覆盖用户停留在页面期间自动补齐，最终与详情页/个人信息页一致。
    */
   private enrichHomeInBackground(list: ThreadItem[]): void {
+    // 注（2026-09-29 留痕）：曾在此加「滚动静默门闸」推迟网络发起，真机实测 ENRICH -70%
+    // 但长帧无改善 → 已回退（理由同 kickPoolRefill；回包处理才是代价所在）。
     TiebaService.getInstance().enrichHomeAuthors(list).then((enriched: ThreadItem[]) => {
       this.applyEnrichedAuthors(enriched);
       this.scheduleHomeAuthorReEnrich();
@@ -1320,12 +1751,8 @@ export struct HomeTab {
     const snapshot: ThreadItem[] = this.currentFeedThreads();
     this.homeReEnrichAttempts += 1;
     setTimeout(() => {
-      TiebaService.getInstance().enrichHomeAuthors(snapshot).then((enriched: ThreadItem[]) => {
-        this.applyEnrichedAuthors(enriched);
-        this.scheduleHomeAuthorReEnrich();
-      }).catch((_: Error) => {
-        // 补校准失败，等待下一轮 / 用户手动刷新
-      });
+      // 复用富化入口（apply + 递归调度语义与原内联实现逐项一致）
+      this.enrichHomeInBackground(snapshot);
     }, 4000);
   }
 
@@ -1500,6 +1927,9 @@ export struct HomeTab {
     this.firstHomeMount = false;
     this.homeFeed = feed;
     this.errorMsg = '';
+    // 切 feed：沉浸判定基线随目标 feed 重置（恢复滚动位置的 scrollTo 由跳变保护兜底，不会误判方向）
+    this.recImmersiveSensor.resetBaseline();
+    this.folImmersiveSensor.resetBaseline();
     if (feed === HomeFeed.Recommended) {
       if (this.recommendLoaded) {
         // 已加载过：不重新拉取，直接恢复常驻内容与上次浏览位置（与关注动态一致）
@@ -1531,6 +1961,11 @@ export struct HomeTab {
     setTimeout(() => {
       if (this.homeFeed === feed && feedState === LoadState.Success) {
         scroller.scrollTo({ xOffset: 0, yOffset: targetY, animation: { duration: 0 } });
+        // 单列档回退路径：恢复偏移后立刻把可见窗口推到目标位置（防恢复位全是占位）；
+        // WaterFlow 路径由 LazyForEach 自管，无需外部推进
+        if (!HOME_SINGLE_USE_WATERFLOW && this.homeColumns() === 1) {
+          this.slotUpdateWindow(feed === HomeFeed.Following, targetY);
+        }
       }
     }, 80);
   }
@@ -1561,11 +1996,14 @@ export struct HomeTab {
     if (this.homeFeed === HomeFeed.Following) {
       if (this.folState === LoadState.Success) {
         this.folScroller.scrollEdge(Edge.Top);
+        // 单列档：回顶即窗口回首屏（刷新换血后由 slotSyncAfterDataChange 兜底）
+        this.slotReset(true);
       }
       this.loadFollowingThreads();
     } else {
       if (this.loadState === LoadState.Success) {
         this.homeScroller.scrollEdge(Edge.Top);
+        this.slotReset(false);
       }
       this.loadHomeThreads(true);
     }
@@ -1740,6 +2178,8 @@ export struct HomeTab {
    * - homeLoadingMore 锁 + 偏移节流防重；onReachEnd 保留作兜底（锁会挡住重复请求）
    */
   private onHomeScroll(_x: number, _y: number): void {
+    // P0-2 归因打点：只记一个时间戳（普通字段，零分配零重建），供 FSTAT 判定「本窗口是否在滚动」
+    PerfTrace.noteScroll();
     // 滚动活动时间戳：缓存落盘与昵称回填都以「距上次滚动时长」判空闲（写普通字段，不触发 UI 重建）
     this.lastScrollAt = Date.now();
     // 偏移取 Scroller 真值（onScroll 回调入参语义在工具链间有差异，非绝对偏移会让剩余距离恒小）
@@ -1747,6 +2187,13 @@ export struct HomeTab {
       this.homeFeed === HomeFeed.Following ? this.folScroller : this.homeScroller);
     // 无条件记录当前 feed 浏览位置（切走/切回时恢复）：存绝对偏移，恢复时 scrollTo 才准
     this.homeScrollY = atY;
+    // 沉浸式阅读补全：方向判定（先于预取的 early-return，保证任何滚动都参与判定）
+    this.feedImmersiveScroll(atY);
+    // 单列档窗口化挂载（仅在 HOME_SINGLE_USE_WATERFLOW=false 的回退路径下存在）：
+    // WaterFlow 走 LazyForEach 自管可见区，不需要也不允许外部推进窗口
+    if (!HOME_SINGLE_USE_WATERFLOW && this.homeColumns() === 1) {
+      this.slotUpdateWindow(this.homeFeed === HomeFeed.Following, atY);
+    }
     if (this.homeFeed === HomeFeed.Following) {
       this.folScrollY = atY;
     } else {
@@ -1768,6 +2215,96 @@ export struct HomeTab {
         this.loadMoreHomeThreads(true);
       }
     }
+  }
+
+  // ===== 「沉浸式阅读补全」交互（2026-09-29，设置 → 个性化 / AppStorage `immersiveReadExtra`）=====
+
+  /**
+   * 当前 feed 的滚动 → 沉浸显隐判定。挂点 = 4 个 feed 容器共用的 onHomeScroll（位置真源已取 Scroller）。
+   * 规则与 ThreadDetail 逐项同源（24 藏 / 12 露不对称 + 置顶 8 恒显示 + 跳变 240 丢弃），
+   * 判定器按 feed 各持一份（基线独立，防切 feed 互污）。
+   */
+  private feedImmersiveScroll(atY: number): void {
+    if (!this.immersiveReadExtra) {
+      // 开关关闭：确保处于显示态（设置页关闭开关路径由 @Watch 兜底，此处防漏网）
+      if (this.immersiveHidden) {
+        this.setImmersiveHidden(false);
+      }
+      return;
+    }
+    const sensor: ImmersiveReadSensor =
+      this.homeFeed === HomeFeed.Following ? this.folImmersiveSensor : this.recImmersiveSensor;
+    const act = sensor.feed(atY);
+    if (act === 'hide') {
+      this.setImmersiveHidden(true);
+    } else if (act === 'show' || act === 'reset') {
+      this.setImmersiveHidden(false);
+    }
+  }
+
+  /**
+   * 翻转沉浸态：顶部胶囊（本地 @State）+ 宿主底栏（AppStorage 驱动键，仅当前 Tab 才写）。
+   * 值变化才写，滚动回调高频触发不会逐帧打 AppStorage。
+   */
+  private setImmersiveHidden(hidden: boolean): void {
+    if (this.immersiveHidden === hidden) {
+      return;
+    }
+    this.immersiveHidden = hidden;
+    this.recImmersiveSensor.setHidden(hidden);
+    this.folImmersiveSensor.setHidden(hidden);
+    // TabIndex.Home = 0（Index.ets 私有枚举，此处以数值对齐）
+    if (this.currentMainTab === 0) {
+      AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', hidden);
+    }
+  }
+
+  /** 复位沉浸判定（切 feed / 回顶整页刷新 / 切 Tab 回来）：清基线 + 恢复显示（静默，不带动画判定） */
+  private resetImmersive(): void {
+    this.recImmersiveSensor.resetBaseline();
+    this.folImmersiveSensor.resetBaseline();
+    if (this.immersiveHidden) {
+      this.immersiveHidden = false;
+      this.recImmersiveSensor.setHidden(false);
+      this.folImmersiveSensor.setHidden(false);
+      if (this.currentMainTab === 0) {
+        AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', false);
+      }
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即恢复显示 */
+  private onImmersiveExtraChanged(): void {
+    if (!this.immersiveReadExtra) {
+      this.resetImmersive();
+    }
+  }
+
+  /** 当前主 Tab 变化（@Watch）：切走时本地态复位（底栏由 Index.switchTab 复位兜底）；切回时重建基线 */
+  private onCurrentMainTabChanged(): void {
+    if (this.currentMainTab === 0) {
+      this.resetImmersive();
+    } else {
+      // 离开首页：只清基线，隐藏态交由 Index.switchTab 统一复位（此处不写宿主键，防覆盖其它 Tab 判定）
+      this.recImmersiveSensor.resetBaseline();
+      this.folImmersiveSensor.resetBaseline();
+    }
+  }
+
+  /** 顶部胶囊隐藏位移（vp，向上）：= 官方标题栏高 108 × 0.6 ≈ −65（同「收回」口径，其余交给 opacity） */
+  private homeTopSink(): number {
+    return -(HOME_TITLE_BAR_HEIGHT * IMMERSIVE_EXTRA_FLY_SCALE);
+  }
+
+  /** 显隐动画参数（藏 / 唤不对称）：取值以目标态为准（immersiveHidden 本帧渲染前已写入） */
+  private homeImmersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   /**
@@ -1917,6 +2454,29 @@ export struct HomeTab {
     await HistoryStore.getInstance().record(historyItem);
   }
 
+  /**
+   * 卡片点击统一入口（2026-09-29 防串帖收口）：按卡片实传的 tid 回查 feed 数据再开帖，
+   * 不再信任点击闭包捕获的 item —— 闭包与卡片显示内容可能因任何复用/重建机制脱钩，
+   * 而显示内容与 tid 永远同源（卡片渲染与点击同读 item.tid），按 tid 回查必与所见一致。
+   * 回查失败（数据已被刷新换血）宁可不跳转，也不能开成别的帖子。
+   */
+  private openThreadByTid(tid: string): void {
+    const t: string = tid.trim();
+    if (t.length === 0) {
+      this.getUIContext().getPromptAction().showToast({ message: '帖子信息暂不可用' });
+      return;
+    }
+    let hit: ThreadItem | undefined = this.threads.find((x: ThreadItem): boolean => x.tid === t);
+    if (hit === undefined) {
+      hit = this.folThreads.find((x: ThreadItem): boolean => x.tid === t);
+    }
+    if (hit === undefined) {
+      this.getUIContext().getPromptAction().showToast({ message: '帖子信息暂不可用' });
+      return;
+    }
+    this.openThread(hit);
+  }
+
   private openThread(item: ThreadItem): void {
     // 左右滑切 feed 期间锁点按：滑动抬指时手势仲裁仍可能给卡片派发 click（评论钮同样走本入口），
     // 这里直接短路，避免「滑动切 feed 的同时把帖子点开」
@@ -1989,7 +2549,7 @@ export struct HomeTab {
       } else {
         // 刷新区整体下移到"推荐/关注动态"按钮下方：系统默认指示器从按钮下方出现，跟手、松手刷新
         Refresh({ refreshing: this.homeRefreshing, offset: 48, friction: 62 }) {
-          if (this.homeColumns() > 1) {
+          if (this.homeColumns() > 1 || HOME_SINGLE_USE_WATERFLOW) {
             // ===== WaterFlow 瀑布流（§4.2 决策 12）：LazyForEach 虚拟滚动 + 自然高度卡片 =====
             WaterFlow({ scroller: this.homeScroller }) {
               LazyForEach(this.recDataSource, (item: ThreadItem) => {
@@ -2016,10 +2576,10 @@ export struct HomeTab {
                       isTop: item.isTop,
                       isGood: item.isGood,
                     } as ThreadItemData,
-                    onTap: (_tid: string) => this.openThread(item),
+                    onTap: (tid: string) => this.openThreadByTid(tid),
                     onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
                     onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                    onComment: (_tid: string) => this.openThread(item),
+                    onComment: (tid: string) => this.openThreadByTid(tid),
                     onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
                   })
                 }
@@ -2028,7 +2588,8 @@ export struct HomeTab {
             .columnsTemplate(this.homeColumnsTemplate())
             // 预加载窗口（2026-09-19）：默认 1 个 FlowItem 太少，快速甩滑时新格子出屏后才开始
             // 构建 → 空白/卡顿。按「列数×2」预建（2 列=4、3 列=6），只改离屏构建窗口。
-            .cachedCount(Math.max(2, this.homeColumns() * 2))
+            // 单列档下限抬到 5（约 2 屏）：单列时 1 个 FlowItem 就是一整屏，太小会在甩滑时补不上卡
+            .cachedCount(Math.max(5, this.homeColumns() * 2))
             .columnsGap(Spacing.md)
             .rowsGap(Spacing.md)
             .padding({ left: Spacing.lg, right: Spacing.lg })
@@ -2049,44 +2610,60 @@ export struct HomeTab {
               }
             })
           } else {
-          List({ scroller: this.homeScroller }) {
-            LazyForEach(this.recDataSource, (item: ThreadItem) => {
-              ListItem() {
-                ThreadCard({
-                  item: {
-                    tid: item.tid,
-                    postId: item.postId ?? '',
-                    forumId: item.forumId,
-                    title: item.title,
-                    forumName: item.forumName,
-                    forumAvatar: item.forumAvatar ?? '',
-                    author: item.author,
-                    authorId: item.authorId,
-                    authorAvatar: item.authorAvatar ?? '',
-                    replyNum: item.replyNum,
-                    likeCount: item.likeCount ?? 0,
-                    isLiked: item.isLiked ?? false,
-                    abstract: item.abstract,
-                    firstImage: item.firstImage ?? '',
-                    images: item.images ?? [],
-                    imageThumbs: item.imageThumbs ?? [],
-                    createTime: item.createTime,
-                    isTop: item.isTop,
-                    isGood: item.isGood,
-                  } as ThreadItemData,
-                  onTap: (_tid: string) => this.openThread(item),
-                  onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-                  onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                  onComment: (_tid: string) => this.openThread(item),
-                  onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-                })
-                  .margin({ bottom: Spacing.md })
+          // 单列档：Scroll + Column 全量布局 + 窗口化挂载 v2（机制详见 slotUpdateWindow 处注释）。
+          // 根治 List 视口剔除与沉浸绘制区错位导致的「卡片滚入顶栏区整层消失」，且保住懒挂载性能与图片按需下载。
+          Scroll(this.homeScroller) {
+            Column({ space: Spacing.md }) {
+              // 窗口外上方：单个等高占位块（高度 = 前缀和区间和），不再为每张未挂载卡建节点
+              if (this.recSlotStart > 0) {
+                Column()
+                  .width('100%')
+                  .height(this.slotRangeHeight(false, 0, this.recSlotStart))
               }
-            }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+              ForEach(this.threads.slice(this.recSlotStart, this.recSlotEnd + 1), (item: ThreadItem) => {
+                  ThreadCard({
+                    item: {
+                      tid: item.tid,
+                      postId: item.postId ?? '',
+                      forumId: item.forumId,
+                      title: item.title,
+                      forumName: item.forumName,
+                      forumAvatar: item.forumAvatar ?? '',
+                      author: item.author,
+                      authorId: item.authorId,
+                      authorAvatar: item.authorAvatar ?? '',
+                      replyNum: item.replyNum,
+                      likeCount: item.likeCount ?? 0,
+                      isLiked: item.isLiked ?? false,
+                      abstract: item.abstract,
+                      firstImage: item.firstImage ?? '',
+                      images: item.images ?? [],
+                      imageThumbs: item.imageThumbs ?? [],
+                      createTime: item.createTime,
+                      isTop: item.isTop,
+                      isGood: item.isGood,
+                    } as ThreadItemData,
+                    onTap: (tid: string) => this.openThreadByTid(tid),
+                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                    onComment: (tid: string) => this.openThreadByTid(tid),
+                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                  })
+                    // 卡高采集（持续更新）：出窗后占位复用实测值，避免滚动跳动
+                    .onAreaChange((_oldA: Area, newA: Area) => {
+                      this.slotRecordHeight(item, newA.height as number);
+                    })
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
 
-            // 预加载/触底加载进行中的占位尾卡：触底时也有"正在加载"反馈，避免空等停顿感
-            if (this.homeLoadingMore && this.homeHasMore) {
-              ListItem() {
+              // 窗口外下方：单个等高占位块（高度 = 前缀和区间和）
+              if (this.recSlotEnd < this.threads.length - 1) {
+                Column()
+                  .width('100%')
+                  .height(this.slotRangeHeight(false, this.recSlotEnd + 1, this.threads.length))
+              }
+
+              // 预加载/触底加载进行中的占位尾卡：触底时也有"正在加载"反馈，避免空等停顿感
+              if (this.homeLoadingMore && this.homeHasMore) {
                 Row({ space: 8 }) {
                   LoadingProgress()
                     .width(20)
@@ -2098,16 +2675,14 @@ export struct HomeTab {
                 .width('100%')
                 .height(56)
                 .justifyContent(FlexAlign.Center)
-                .margin({ bottom: Spacing.md })
               }
-            }
 
-            // 底部空间（List 的直接子节点必须是 ListItem，故用 ListItem 包裹）
-            ListItem() {
+              // 底部空间
               Column()
                 .width('100%')
                 .height(150)
             }
+            .width('100%')
           }
           .width('100%')
           .layoutWeight(1)
@@ -2118,7 +2693,6 @@ export struct HomeTab {
           .edgeEffect(EdgeEffect.Spring)
           .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeViewportAreaChange(oldValue, newValue))
           .onScroll((xOffset: number, yOffset: number) => this.onHomeScroll(xOffset, yOffset))
-          .onScrollIndex((start: number, end: number) => this.onFeedVisibleRange(false, start, end))
           .onTouch((event: TouchEvent) => this.onFeedTouchRecord(event))
           .onScrollStart(() => this.onFeedScrollStart())
           .onScrollStop(() => this.onFeedScrollStop(false))
@@ -2145,7 +2719,6 @@ export struct HomeTab {
     .layoutWeight(1)
     .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .overlay(this.BottomFadeOverlay())
   }
 
   /** 关注动态视图：fol* 独立数据源，常驻不销毁，切换时保留内容与滚动位置 */
@@ -2170,7 +2743,7 @@ export struct HomeTab {
         }).layoutWeight(1)
       } else {
         Refresh({ refreshing: this.folRefreshing, offset: 48, friction: 62 }) {
-          if (this.homeColumns() > 1) {
+          if (this.homeColumns() > 1 || HOME_SINGLE_USE_WATERFLOW) {
             // ===== WaterFlow 瀑布流（§4.2 决策 12）：与推荐流同款写法 =====
             WaterFlow({ scroller: this.folScroller }) {
               LazyForEach(this.folDataSource, (item: ThreadItem) => {
@@ -2197,10 +2770,10 @@ export struct HomeTab {
                       isTop: item.isTop,
                       isGood: item.isGood,
                     } as ThreadItemData,
-                    onTap: (_tid: string) => this.openThread(item),
+                    onTap: (tid: string) => this.openThreadByTid(tid),
                     onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
                     onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                    onComment: (_tid: string) => this.openThread(item),
+                    onComment: (tid: string) => this.openThreadByTid(tid),
                     onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
                   })
                 }
@@ -2209,7 +2782,8 @@ export struct HomeTab {
             .columnsTemplate(this.homeColumnsTemplate())
             // 预加载窗口（2026-09-19）：默认 1 个 FlowItem 太少，快速甩滑时新格子出屏后才开始
             // 构建 → 空白/卡顿。按「列数×2」预建（2 列=4、3 列=6），只改离屏构建窗口。
-            .cachedCount(Math.max(2, this.homeColumns() * 2))
+            // 单列档下限抬到 5（约 2 屏）：单列时 1 个 FlowItem 就是一整屏，太小会在甩滑时补不上卡
+            .cachedCount(Math.max(5, this.homeColumns() * 2))
             .columnsGap(Spacing.md)
             .rowsGap(Spacing.md)
             .padding({ left: Spacing.lg, right: Spacing.lg })
@@ -2230,44 +2804,59 @@ export struct HomeTab {
               }
             })
           } else {
-          List({ scroller: this.folScroller }) {
-            LazyForEach(this.folDataSource, (item: ThreadItem) => {
-              ListItem() {
-                ThreadCard({
-                  item: {
-                    tid: item.tid,
-                    postId: item.postId ?? '',
-                    forumId: item.forumId,
-                    title: item.title,
-                    forumName: item.forumName,
-                    forumAvatar: item.forumAvatar ?? '',
-                    author: item.author,
-                    authorId: item.authorId,
-                    authorAvatar: item.authorAvatar ?? '',
-                    replyNum: item.replyNum,
-                    likeCount: item.likeCount ?? 0,
-                    isLiked: item.isLiked ?? false,
-                    abstract: item.abstract,
-                    firstImage: item.firstImage ?? '',
-                    images: item.images ?? [],
-                    imageThumbs: item.imageThumbs ?? [],
-                    createTime: item.createTime,
-                    isTop: item.isTop,
-                    isGood: item.isGood,
-                  } as ThreadItemData,
-                  onTap: (_tid: string) => this.openThread(item),
-                  onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
-                  onShare: (d: ThreadSharePayload) => this.shareThread(d),
-                  onComment: (_tid: string) => this.openThread(item),
-                  onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
-                })
-                  .margin({ bottom: Spacing.md })
+          // 单列档：Scroll + Column 全量布局 + 窗口化挂载 v2（与推荐流同款，机制详见 slotUpdateWindow 处注释）
+          Scroll(this.folScroller) {
+            Column({ space: Spacing.md }) {
+              // 窗口外上方：单个等高占位块（高度 = 前缀和区间和）
+              if (this.folSlotStart > 0) {
+                Column()
+                  .width('100%')
+                  .height(this.slotRangeHeight(true, 0, this.folSlotStart))
               }
-            }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
+              ForEach(this.folThreads.slice(this.folSlotStart, this.folSlotEnd + 1), (item: ThreadItem) => {
+                  ThreadCard({
+                    item: {
+                      tid: item.tid,
+                      postId: item.postId ?? '',
+                      forumId: item.forumId,
+                      title: item.title,
+                      forumName: item.forumName,
+                      forumAvatar: item.forumAvatar ?? '',
+                      author: item.author,
+                      authorId: item.authorId,
+                      authorAvatar: item.authorAvatar ?? '',
+                      replyNum: item.replyNum,
+                      likeCount: item.likeCount ?? 0,
+                      isLiked: item.isLiked ?? false,
+                      abstract: item.abstract,
+                      firstImage: item.firstImage ?? '',
+                      images: item.images ?? [],
+                      imageThumbs: item.imageThumbs ?? [],
+                      createTime: item.createTime,
+                      isTop: item.isTop,
+                      isGood: item.isGood,
+                    } as ThreadItemData,
+                    onTap: (tid: string) => this.openThreadByTid(tid),
+                    onLike: (tid: string, postId: string, liked: boolean) => this.handleLike(tid, postId, liked),
+                    onShare: (d: ThreadSharePayload) => this.shareThread(d),
+                    onComment: (tid: string) => this.openThreadByTid(tid),
+                    onAvatarTap: (id: string, name: string) => this.openUserProfile(id, name)
+                  })
+                    // 卡高采集（持续更新）：出窗后占位复用实测值，避免滚动跳动
+                    .onAreaChange((_oldA: Area, newA: Area) => {
+                      this.slotRecordHeight(item, newA.height as number);
+                    })
+              }, (item: ThreadItem) => `${item.tid}_${item.author}_${item.isLiked ? 1 : 0}_${item.likeCount ?? 0}`)
 
-            // 预加载/触底加载进行中的占位尾卡
-            if (this.folLoadingMore && this.folHasMore) {
-              ListItem() {
+              // 窗口外下方：单个等高占位块（高度 = 前缀和区间和）
+              if (this.folSlotEnd < this.folThreads.length - 1) {
+                Column()
+                  .width('100%')
+                  .height(this.slotRangeHeight(true, this.folSlotEnd + 1, this.folThreads.length))
+              }
+
+              // 预加载/触底加载进行中的占位尾卡
+              if (this.folLoadingMore && this.folHasMore) {
                 Row({ space: 8 }) {
                   LoadingProgress()
                     .width(20)
@@ -2279,16 +2868,14 @@ export struct HomeTab {
                 .width('100%')
                 .height(56)
                 .justifyContent(FlexAlign.Center)
-                .margin({ bottom: Spacing.md })
               }
-            }
 
-            // 底部空间（List 的直接子节点必须是 ListItem，故用 ListItem 包裹）
-            ListItem() {
+              // 底部空间
               Column()
                 .width('100%')
                 .height(150)
             }
+            .width('100%')
           }
           .width('100%')
           .layoutWeight(1)
@@ -2299,7 +2886,6 @@ export struct HomeTab {
           .edgeEffect(EdgeEffect.Spring)
           .onAreaChange((oldValue: Area, newValue: Area) => this.onHomeViewportAreaChange(oldValue, newValue))
           .onScroll((xOffset: number, yOffset: number) => this.onHomeScroll(xOffset, yOffset))
-          .onScrollIndex((start: number, end: number) => this.onFeedVisibleRange(true, start, end))
           .onTouch((event: TouchEvent) => this.onFeedTouchRecord(event))
           .onScrollStart(() => this.onFeedScrollStart())
           .onScrollStop(() => this.onFeedScrollStop(true))
@@ -2325,31 +2911,24 @@ export struct HomeTab {
     .layoutWeight(1)
     .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .overlay(this.BottomFadeOverlay())
   }
 
-  /** 顶部渐显覆盖比例（2026-09-13）：平板只覆盖顶部按钮与标题（108vp 折算，实时窗口高），手机维持 15% */
-  private topFadeStop(): number {
-    if (!this.isWideFormDevice || this.pageHeight <= 0) {
-      return 0.15;
-    }
-    return Math.min(0.15, HOME_TITLE_BAR_HEIGHT / this.pageHeight);
-  }
-
+  /**
+   * 顶部满宽渐显带（2026-09-29 定稿：进吧页 ForumsTab.TopFadeBand 逐项照搬）：
+   * 背景色渐变条挂页面层（盖列表内容），高 108 = 顶栏（状态栏让位 + 按钮行 + 呼吸）；
+   * 渐变自顶部线性、无全实段（否则内容到顶栏会被"硬切"）；不与标题栏沉浸隐藏联动——
+   * 标题自动隐藏时照常保留（用户指定），行为与进吧页完全一致。
+   */
   @Builder
-  BottomFadeOverlay() {
-    Stack()
-      .height('100%')
+  TopFadeBand() {
+    Column()
       .width('100%')
+      .height(HOME_TITLE_BAR_HEIGHT)
       .linearGradient({
         direction: GradientDirection.Bottom,
-        // 丢帧治理 P2（2026-09-26）：原 DST_IN 蒙版要求内容层整体 blendMode(OFFSCREEN)，
-        // 滚动时每帧全屏离屏合成 + 回读（大屏旗舰 GPU 填充率瓶颈）；改为「顶栏底色 → 透明」
-        // 渐变条直接盖在内容上，视觉近似（内容被底色渐隐 ≈ alpha 渐显）且零离屏。若观感不对，
-        // 回退 = 恢复下方 DST_IN 蒙版行 + 两个 feed 容器的 blendMode(SRC_OVER, OFFSCREEN)。
         colors: [
           [Theme.bg(this.isDark), 0.0],
-          [this.isDark ? '#00101114' : '#00F2F4F7', this.topFadeStop()]
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
         ]
       })
       .hitTestBehavior(HitTestMode.None)
@@ -2415,6 +2994,11 @@ export struct HomeTab {
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 20 }) // 加大按钮与下方首张卡片的视觉空隙（v1.15.9）
     .backgroundColor(Color.Transparent)
     .zIndex(15)
+    // 沉浸阅读补全（2026-09-29）：整行上移约 0.6 倍高 + 淡出 + 禁用命中（与宿主底栏同节奏）
+    .translate({ y: this.immersiveHidden ? this.homeTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.homeImmersiveAnim())
   }
 
   /**
@@ -2475,6 +3059,11 @@ export struct HomeTab {
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 20 })
     .backgroundColor(Color.Transparent)
+    // 沉浸阅读补全（2026-09-29）：槽高固定 108 不参与内容布局（Scroll 首项自带让位），整行上移 + 淡出
+    .translate({ y: this.immersiveHidden ? this.homeTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.homeImmersiveAnim())
   }
 
   /**
@@ -2501,6 +3090,11 @@ export struct HomeTab {
         .height('100%')
         .transition(this.firstHomeMount ? TransitionEffect.IDENTITY : this.feedTabTransition(1))
       }
+
+      // 顶部满宽渐显带（进吧页 ForumsTab.TopFadeBand 同款照搬，2026-09-29）：
+      // 挂页面层盖列表内容；位置在悬浮 TopBar 之前，故不会盖住顶栏按钮——
+      // 官方 title 槽位路径 TopBar 在 Navigation title 层，更不受影响
+      this.TopFadeBand()
 
       // 悬浮按钮层（独立于滚动内容，帖子可穿过按钮区域）
       // 官方标题栏路径下按钮已在 Navigation title 槽位里，这里不再叠一层

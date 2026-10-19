@@ -147,17 +147,18 @@ entry/src/main/ets/
 
 专项方案与 BUG 应对记录统一存放于 `docs/` 目录：
 
-- `docs/floor-vanish-viewport-fix.md` — 沉浸场景下 `List` 虚拟滚动列表项整层消失问题的实证排查与修复（含可复用的快速排查清单）
+- `docs/楼层整层消失（List 虚拟滚动视口剔除）排查与修复 — 维护文档.md` — 沉浸场景下 `List` 虚拟滚动列表项整层消失问题的实证排查与修复（含可复用的快速排查清单）
 - `docs/图片加载治理.md` — 图片链路治理：`ImageCache` 同步 IO 掉帧治理（Z1~Z4 / 异步缓存清理 / 调试日志开关）、图片专用 Session 与全局并发闸门（§IMGQ）、详情页首帧宫格图不显示的竞态修复
-- `docs/fade-band-fullwidth-fix.md` — 沉浸场景下顶部渐显带不满宽（右缘缺竖带）的实证排查与修复：整页 DST_IN 遮罩离屏层宽度解析异常的判定、背景色渐变条替代方案与快速排查清单
-- `docs/immersive-light-sense-api26-official.md` — API 26 官方沉浸光感能力的适用槽位与实证结论
+- `docs/渐显带不满宽（右缘缺一条竖带）排查与修复.md` — 沉浸场景下顶部渐显带不满宽（右缘缺竖带）的实证排查与修复：整页 DST_IN 遮罩离屏层宽度解析异常的判定、背景色渐变条替代方案与快速排查清单
+- `docs/API 26 沉浸光感（Immersive Light Sense）官方能力全解.md` — API 26 官方沉浸光感能力的适用槽位与实证结论
 - `docs/新API26沉浸光感经验汇总.md` — 沉浸光感落地经验汇总（各页面清单与判据）
-- `docs/immersive-material-guide.md` — 沉浸材质总览指南
-- `docs/tangs-components-immersion-analysis.md` — 三方沉浸组件能力边界分析（结论：不突破官方槽位范围）
-- `docs/favorite-module-supplement.md` — 收藏模块补充说明
-- `docs/sort-rework-delivery.md` — 排序交互重构交付记录
-- `docs/follow-list-delivery.md` — 关注 / 粉丝列表交付记录
-- `docs/user-profile-delivery.md` — 用户主页交付记录
+- `docs/一镜到底动画实现.md` — 一镜到底转场动画实现说明
+- `docs/收藏功能模块.md` — 收藏模块说明
+- `docs/排序功能重构 — 交付说明 v1.11.md` — 排序交互重构交付记录
+- `docs/关注列表页.md` — 关注 / 粉丝列表说明
+- `docs/用户主页 + 黑名单管理 — 交付说明 v1.12.md` — 用户主页 / 黑名单管理交付记录
+- `docs/TiebaPura v1.0.8首页信息流掉帧问题和空白问题修复.md` — 单列档掉帧 / 空白 / 热门档重复的诊断体系与修复记录
+- `docs/TiebaPura 上架自检清单.md` — 向应用市场提交前的逐项自检清单（版本号 / 隐私政策 / 后台表单三处一致性）
 
 以上为 `docs/` 当前全部专项文档，各自配套对应模块使用。新增排障 / 方案记录时请沿用该目录与既有命名风格。
 

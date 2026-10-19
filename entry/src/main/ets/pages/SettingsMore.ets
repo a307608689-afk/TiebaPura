@@ -31,7 +31,7 @@ import { BRAND_BLUE } from '../common/Constants';
 @Entry
 @Component
 struct SettingsMorePage {
-  @StorageLink('threadFastOpen') threadFastOpen: boolean = true;
+  @StorageLink('threadFastOpen') threadFastOpen: boolean = false;
   @StorageLink('threadFastWifi') threadFastWifi: boolean = true;
   @State isDark: boolean = isDarkMode();
   @StorageLink('fontScale') fontScale: number = 1.0;
@@ -69,7 +69,7 @@ struct SettingsMorePage {
                 .fontSize(fs(16, this.fontScale))
                 .fontWeight(FontWeight.Medium)
                 .fontColor(Theme.textPrimary(this.isDark))
-              Text('主动预加载部分内容，实现更快加载，但流量消耗会上升')
+              Text('主动预加载部分内容，实现更快加载，但流量消耗会上升，同时性能内存占用也会提高。')
                 .fontSize(fs(13, this.fontScale))
                 .fontColor(Theme.textSecondary(this.isDark))
             }

@@ -24,6 +24,7 @@ import { TiebaService } from '../service/TiebaService';
 import { Theme, Spacing, Radius, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, Breakpoint, tabletTopFadeStop, isWideBarDevice, isLargeFoldDevice, overlayCardWidth, isWideFormDevice as detectWideFormDevice } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 import { EmojiLoader } from '../network/EmojiLoader';
+import { PerfTrace } from '../common/PerfTrace';
 import image from '@ohos.multimedia.image';
 
 enum LoadState {
@@ -388,6 +389,8 @@ struct SubPostDetail {
   }
 
   aboutToAppear(): void {
+    // P0-2 归因打点：楼中楼详细页登记页面上下文（从详情页内联预览进入时逐层切换）
+    PerfTrace.setPage('SubPostDetail');
     MaterialManager.init();
     this.materialSupported = MaterialManager.isSupported() && MaterialManager.getApiLevel() >= 26;
     // 首帧形态初值（§4.10 SP-A）：onAreaChange 只在尺寸变化后触发，横屏冷启动若不预置会先按竖屏判定再跳分栏
@@ -519,10 +522,31 @@ struct SubPostDetail {
     }
   }
 
+  /** §AUDIT（2026-09-29 定时器审计）：定位/高亮延时器句柄，aboutToDisappear 统一清理 */
+  private locateScrollTimer: number = -1;
+  private highlightResetTimer: number = -1;
+  /** 页面存活守卫：本页此前无任何清理点 */
+  private pageAlive: boolean = true;
+
+  aboutToDisappear(): void {
+    this.pageAlive = false;
+    if (this.locateScrollTimer !== -1) {
+      clearTimeout(this.locateScrollTimer);
+      this.locateScrollTimer = -1;
+    }
+    if (this.highlightResetTimer !== -1) {
+      clearTimeout(this.highlightResetTimer);
+      this.highlightResetTimer = -1;
+    }
+  }
+
   /** 高亮目标楼中楼并滚动到可视位置，短暂闪烁后清除 */
   private flashHighlightComment(commentId: string): void {
     this.highlightCommentId = commentId;
-    setTimeout(() => {
+    this.locateScrollTimer = setTimeout(() => {
+      if (!this.pageAlive) {
+        return;
+      }
       try {
         const uiUtils = this.getUIContext().getComponentUtils();
         const targetRect = uiUtils.getRectangleById('spc_' + commentId);
@@ -538,7 +562,10 @@ struct SubPostDetail {
         // 部分 SDK 版本缺少 getComponentUtils，静默降级
       }
     }, 260);
-    setTimeout(() => {
+    this.highlightResetTimer = setTimeout(() => {
+      if (!this.pageAlive) {
+        return;
+      }
       if (this.highlightCommentId === commentId) {
         this.highlightCommentId = '';
       }

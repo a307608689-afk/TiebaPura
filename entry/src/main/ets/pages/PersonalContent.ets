@@ -19,12 +19,16 @@
 import { CacheManager } from '../cache/CacheManager';
 import { CACHE_KEY, formatTime } from '../common/Constants';
 import { PrefetchGate } from '../common/PrefetchGate';
+import {
+  ImmersiveReadSensor, IMMERSIVE_EXTRA_FLY_SCALE, IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 import { PersonalContentItem, PagedResult } from '../model/DataModel';
 import { TiebaService } from '../service/TiebaService';
 import { AuthManager } from '../service/AuthManager';
 import { HistoryStore } from '../service/HistoryStore';
 import { deviceInfo } from '@kit.BasicServicesKit';
-import { display } from '@kit.ArkUI';
+import { curves, display } from '@kit.ArkUI';
 import { Theme, Spacing, Radius, Breakpoint, isDarkMode, ImmBlur, ImmMaterial, MaterialManager, fs, isWideBarDevice, isLargeFoldDevice, isWideFormDevice as detectWideFormDevice, readColumnMode, overrideColumns, isLargeScreenForm, isWideBarFullscreen } from '../common/Theme';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 
@@ -96,11 +100,20 @@ struct PersonalContent {
   private listScroller: Scroller = new Scroller();
   /** 下拉刷新进行中（2026-09-22，docs/下拉刷新.md）：显式 true→false 变化链 + 看门狗 */
   @State pullRefreshing: boolean = false;
+  // ===== 「沉浸式阅读补全」（2026-09-29，设置 → 个性化）=====
+  /** 设置项真源：AppStorage `immersiveReadExtra`（独立开关，默认关）。本页为 @Entry 独立页，无宿主底栏，仅藏顶栏 */
+  @StorageLink('immersiveReadExtra') @Watch('onPcImmersiveExtraChanged') immersiveReadExtra: boolean = false;
+  /** 沉浸态：true = 顶栏（返回钮 + 标题）已藏起。只存页面局部 @State */
+  @State immersiveHidden: boolean = false;
+  /** 滚动判定器（规则与 ThreadDetail 逐项同源） */
+  private pcImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
   /** API26+ 沉浸光感能力：true 时顶栏走官方 title 槽位，否则回退自绘玻璃 TopBar（与 ThreadDetail 同判据） */
   @State materialSupported: boolean = false;
 
   onPageShow(): void {
     this.fontSizeTick++;
+    // 沉浸式阅读补全（2026-09-29）：从帖子详情返回本页时复位沉浸判定（详情页有自己的沉浸态互不相干）
+    this.resetPcImmersive();
     // 浏览历史「实时更新」（2026-09-23）：本页被别的页面盖住后重新显示（例如从历史里点开帖子再返回）时
     // 重读本地记录，让刚浏览的帖立刻回到列表顶部。仅历史模式重读——点赞 / 收藏是云端分页，
     // 每次回页都重拉会打断浏览（点赞翻页重排曾出现抽搐）。首次 onPageShow 与 aboutToAppear 的
@@ -200,6 +213,8 @@ struct PersonalContent {
     // 首屏 / 重新加载：递增代际作废在途的「加载更多」，并复位预加载节流基线
     this.loadToken++;
     this.prefetchGate.reset();
+    // 单列档窗口化挂载：整页换血 → 窗口回首屏（追加只会变长，loadMore 路径不受影响）
+    this.slotReset();
     // silent（下拉刷新）：不切 Loading 态，保持当前列表在场，结果返回后一次性替换
     if (!silent) {
       this.state = LoadState.Loading;
@@ -302,13 +317,13 @@ struct PersonalContent {
         // margin 下移到顶栏之下（默认指示器随之出现在顶栏下方），定高扣除下移量防底部溢出；
         // 内容里原 98vp 顶栏让位与顶部渐显带（容器高度比例，会随容器下移压到首卡上）一并交接/移除
         Refresh({ refreshing: this.pullRefreshing, offset: 48, friction: 62 }) {
-        List({ scroller: this.listScroller }) {
-          if (this.pcColumns() > 1) {
-            // 多列档（§4.11 P-B，2026-09-14）：列内独立堆叠瀑布流（与首页 / 收藏页 / 搜索页同款观感）。
-            // 结构照收藏页五轮教训：外层 ForEach **只遍历列索引**（key 稳定 → 列容器复用），
-            // 内层数据源**直读状态源** `pcColumnsData()[colIdx]`（不用外层传入 col，否则复用断链不更新）；
-            // ⚠️ 列外必须有**横排 Row**（首个版本漏了 → 4 个 ListItem 纵排通栏，视觉与单列无异）；
-            // List 容器不变 → onReachEnd / onScrollIndex / 滚动架构零改动。
+        if (this.pcColumns() > 1) {
+          // 多列档（§4.11 P-B，2026-09-14）：列内独立堆叠瀑布流（与首页 / 收藏页 / 搜索页同款观感）。
+          // 结构照收藏页五轮教训：外层 ForEach **只遍历列索引**（key 稳定 → 列容器复用），
+          // 内层数据源**直读状态源** `pcColumnsData()[colIdx]`（不用外层传入 col，否则复用断链不更新）；
+          // ⚠️ 列外必须有**横排 Row**（首个版本漏了 → 4 个 ListItem 纵排通栏，视觉与单列无异）。
+          // 整个内容区只有 1 个巨型 ListItem → 不存在逐条视口剔除，保持 List 结构零改动。
+          List({ scroller: this.listScroller }) {
             ListItem() {
               Row({ space: 6 }) {
                 ForEach(this.pcColIndexes(), (colIdx: number) => {
@@ -327,48 +342,73 @@ struct PersonalContent {
               .width('100%')
               .alignItems(VerticalAlign.Top)
             }
-          } else {
-            // 单列档：逐像素保持改造前结构
-            // key 只用 tid：tid 是合并去重的主键，用 `${id}_${tid}` 时同一条帖的 id 若在
-            // 本地缓存 / 云端之间不一致会换 key，导致 ListItem 被销毁重建（闪现）。
-            ForEach(this.items, (item: PersonalContentItem) => {
-              ListItem() {
-                this.ContentCard(item, Spacing.md)
-              }
-            }, (item: PersonalContentItem) => item.tid)
           }
-        }
-        .height('100%')
-        .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
-        .scrollBar(BarState.Off)
-        .clip(false)
-        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        // 剩余距离预加载（docs/帖子预加载.md §2/§4.4）：距底 < PERSONAL_PREFETCH_DISTANCE 提前静默取下一页；
-        // 与 onScrollIndex 预取位互补（本阈值支持多列档按剩余距离提前量触发）；onReachEnd 保留作兜底
-        .onScroll((_x: number, y: number) => { this.onListScroll(_x, y); })
-        .onAreaChange((_old: Area, n: Area) => { this.onListAreaChange(_old, n); })
-        .onReachEnd(() => { this.loadMore(); })
-        // 距末尾还有 5 项就提前取下一页：让追加落在视口下方、在用户滑到底部边界之前完成，
-        // 避免「边界回弹的瞬间插入新内容」造成抽搐；onReachEnd 保留作兜底（列表不满一屏等）。
-        // 多列档整个内容区只有 1 个 ListItem（内含横排 Row）→ end >= 1 即「内容行可见」时提前取
-        // （loadMore 有 loadingMore 防抖，重复触发无副作用；内容超过一屏后 end 恒为 1 → 相当于持续预取位）。
-        .onScrollIndex((start: number, end: number) => {
-          if (this.pcColumns() > 1) {
+          .height('100%')
+          .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          // 剩余距离预加载（docs/帖子预加载.md §2/§4.4）：距底 < PERSONAL_PREFETCH_DISTANCE 提前静默取下一页；
+          // onReachEnd 保留作兜底
+          .onScroll((_x: number, y: number) => { this.onListScroll(_x, y); })
+          .onAreaChange((_old: Area, n: Area) => { this.onListAreaChange(_old, n); })
+          .onReachEnd(() => { this.loadMore(); })
+          // 多列档：唯一巨型 ListItem 与视口相交即整段渲染 → end >= 1 即「内容行可见」时提前取
+          .onScrollIndex((_start: number, end: number) => {
             if (end >= 1) {
               this.loadMore();
             }
-            return;
+          })
+        } else {
+          // 单列档窗口化挂载 v2（2026-09-29「顶栏自动隐藏时吞内容」根治，首页 HomeTab 同款）：
+          // List 的逐条视口剔除把滚出让位线（y≈98）的卡片整层剔除不绘制（clip(false) 沉浸下该区域
+          // 本应可画到顶栏之下），表现为顶栏处「吞内容」。Scroll 无任何视口剔除机制；窗口内真卡 /
+          // 窗外等高占位，等价 LazyForEach 的边缘增量挂载（机制见 slotUpdateWindow 注释）。
+          // key 只用 tid：tid 是合并去重的主键（复合 key 在本地/云端 id 不一致时会换 key 重建闪现）。
+          Scroll(this.listScroller) {
+            Column({ space: Spacing.md }) {
+              ForEach(this.items, (item: PersonalContentItem, idx: number) => {
+                if (idx >= this.slotStart && idx <= this.slotEnd) {
+                  Column() {
+                    this.ContentCard(item, 0)
+                  }
+                  // 卡高采集（持续更新）：出窗后占位复用实测值，避免滚动跳动
+                  .onAreaChange((_oldA: Area, nA: Area) => {
+                    this.slotRecordHeight(item.tid, nA.height as number);
+                  })
+                } else {
+                  // 窗口外等高占位：实测卡高优先，未实测用 EMA 估算
+                  Column()
+                    .width('100%')
+                    .height(this.slotHeightOf(item.tid))
+                }
+              }, (item: PersonalContentItem) => item.tid)
+            }
+            .width('100%')
           }
-          if (end >= this.items.length - 5) {
-            this.loadMore();
-          }
-        })
+          .width('100%')
+          .height('100%')
+          .padding({ left: Spacing.lg, right: Spacing.lg, top: 0, bottom: Spacing.xl })
+          .scrollBar(BarState.Off)
+          .clip(false)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          .onScroll((_x: number, y: number) => { this.onListScroll(_x, y); })
+          .onAreaChange((_old: Area, n: Area) => { this.onListAreaChange(_old, n); })
+          .onReachEnd(() => { this.loadMore(); })
+        }
         }
         .width('100%')
         .height('calc(100% - 98vp)')
         .margin({ top: 98 })
+        // 与进吧页同款（顶部沉浸的关键）：Refresh 自身不裁切 → 列表内容可溢出到材质顶栏之下渲染
+        .clip(false)
         .onRefreshing(() => { this.pullRefresh(); })
       }
+
+      // 顶部渐显带（2026-09-29，同进吧页 TopFadeBand 同款）：固定 98 高背景色渐变条盖在列表内容上、
+      // 顶栏材质之下，让滚过顶栏的卡片渐隐不生硬。此前版本曾因「随 Refresh 容器下移压到首卡」被移除，
+      // 现按进吧页改固定高度不再随容器下移。hitTestBehavior None 不挡点击。
+      this.TopFadeBand()
 
       // 悬浮顶栏（内容可穿过）；官方 title 槽位路径下已在槽位里（PersonalTitleBar），不再叠一层
       if (!(PERSONAL_CONTENT_OFFICIAL_TITLE_BAR && this.materialSupported)) {
@@ -631,6 +671,12 @@ struct PersonalContent {
    * 双重防重：loadingMore 状态锁 + 偏移 PERSONAL_PREFETCH_THROTTLE 节流；loadMore 内另做请求代际校验。
    */
   private onListScroll(_x: number, _y: number): void {
+    // 沉浸式阅读补全（2026-09-29）：先于预加载的 early-return，任何滚动都参与判定
+    this.pcImmersiveScroll();
+    // 单列档（Scroll+窗口化挂载）：每帧按 offset 推进可见窗口；多列档 List（单巨型 ListItem）不参与
+    if (this.pcColumns() === 1) {
+      this.slotUpdateWindow(PrefetchGate.absoluteY(this.listScroller));
+    }
     if (this.loadingMore || !this.hasMore || this.state !== LoadState.Success) {
       return;
     }
@@ -646,6 +692,187 @@ struct PersonalContent {
   /** 视口尺寸变化：记录 List 视口高（供剩余距离估算；普通字段，避免写入 @State 触发整树重建） */
   private onListAreaChange(_old: Area, n: Area): void {
     this.viewportH = n.height as number;
+  }
+
+  // ===== 单列档窗口化挂载（2026-09-29「顶栏自动隐藏时吞内容」根治）=====
+  // 首页 HomeTab / ThreadList 2026-09-28 v2 同款范式：ForEach 遍历全量列表（key 稳定不移位），
+  // 窗口内真卡 / 窗外等高轻量占位；Scroll 无任何视口剔除机制，卡片滚出顶栏让位线不再被整层剔除
+  // （List 的虚拟化剔除发生在视口上缘 y≈98，而 clip(false) 沉浸下该区域本应可见 → 表现为「吞内容」）。
+  /** 窗口缓冲：可见区上下各多挂的张数（甩滑追赶余量） */
+  private readonly SLOT_BUFFER: number = 10;
+  /** 首屏初始挂载数 */
+  private readonly SLOT_INITIAL: number = 12;
+  /** 实测卡高表容量上限 */
+  private readonly SLOT_HEIGHT_CAP: number = 400;
+  /** 实测卡高表（vp，键=tid） */
+  private slotHeightMap: Map<string, number> = new Map<string, number>();
+  /** 未实测卡的估算高（vp）：以实测值 EMA 收敛 */
+  private slotAvgH: number = 200;
+  /** 高度表版本号：任何卡高变化即递增，用于前缀和缓存失效 */
+  private slotHeightVer: number = 0;
+  /** 窗口起始/结束索引（含端点）。@State：仅窗口移动时触发重建，重建范围被 key 稳定性摊薄 */
+  @State private slotStart: number = 0;
+  @State private slotEnd: number = 11;
+  /** 前缀和缓存：pre[i] = 第 i 张卡的顶部 y（pre[0]=0） */
+  private preCache: number[] = [0];
+  private preSrc: PersonalContentItem[] | undefined = undefined;
+  private preVer: number = -1;
+  /** 最近一次窗口推进算出的可见末索引：替代 List.onScrollIndex 的「距末尾 5 项提前预取」判据 */
+  private visEnd: number = 0;
+
+  private slotHeightOf(tid: string): number {
+    const h: number | undefined = this.slotHeightMap.get(tid);
+    return h !== undefined ? h : this.slotAvgH;
+  }
+
+  /** 卡高采集（持续更新；EMA 收敛估算值）。仅窗口内真卡挂回调 → 观察者 O(窗口)。
+   *  不锁首测：卡片内容变化（摘要行数等）会改变卡高，占位必须跟上，否则回滑时错位。 */
+  private slotRecordHeight(tid: string, h: number): void {
+    if (h <= 0 || h > 2000) {
+      return;
+    }
+    if (this.slotHeightMap.get(tid) !== h) {
+      this.slotHeightMap.set(tid, h);
+      this.slotHeightVer++;
+      this.slotAvgH = this.slotAvgH * 0.9 + h * 0.1;
+    }
+    if (this.slotHeightMap.size > this.SLOT_HEIGHT_CAP) {
+      let oldest: string | undefined = undefined;
+      for (const k of this.slotHeightMap.keys()) {
+        oldest = k;
+        break;
+      }
+      if (oldest !== undefined) {
+        this.slotHeightMap.delete(oldest);
+      }
+    }
+  }
+
+  /** 前缀和：pre[i] = 第 i 张卡的顶部 y。带缓存：仅在列表引用或高度表变化时重算 */
+  private slotPrefixSums(): number[] {
+    const list: PersonalContentItem[] = this.items;
+    if (this.preSrc === list && this.preVer === this.slotHeightVer) {
+      return this.preCache;
+    }
+    const pre: number[] = new Array<number>(list.length + 1);
+    pre[0] = 0;
+    for (let i = 0; i < list.length; i++) {
+      pre[i + 1] = pre[i] + this.slotHeightOf(list[i].tid);
+    }
+    this.preCache = pre;
+    this.preSrc = list;
+    this.preVer = this.slotHeightVer;
+    return pre;
+  }
+
+  /** 滚动中推进窗口（onScroll 每帧调用）：可见区距窗口两边缘 ≥3 张不动（滞回，防重建风暴）；
+   *  同时维护 visEnd 供「距末尾 5 项提前预取」判据（替代 List.onScrollIndex）。 */
+  private slotUpdateWindow(atY: number): void {
+    const n: number = this.items.length;
+    if (n === 0 || this.viewportH <= 0) {
+      return;
+    }
+    const pre: number[] = this.slotPrefixSums();
+    const bottom: number = atY + this.viewportH;
+    let vs: number = 0;
+    while (vs < n - 1 && pre[vs + 1] <= atY) {
+      vs++;
+    }
+    let ve: number = vs;
+    while (ve < n - 1 && pre[ve + 1] <= bottom) {
+      ve++;
+    }
+    this.visEnd = ve;
+    // 距末尾还有 5 项就提前取下一页（原 List.onScrollIndex 单列档判据；loadMore 内部防抖）
+    if (ve >= n - 5 && this.hasMore && !this.loadingMore) {
+      this.loadMore();
+    }
+    // 滞回：可见区仍在窗口内部（距两边缘 ≥3 张）则不动窗口
+    if (vs - this.slotStart >= 3 && this.slotEnd - ve >= 3) {
+      return;
+    }
+    const ns: number = Math.max(0, vs - this.SLOT_BUFFER);
+    const ne: number = Math.min(n - 1, ve + this.SLOT_BUFFER);
+    if (ns !== this.slotStart || ne !== this.slotEnd) {
+      this.slotStart = ns;
+      this.slotEnd = ne;
+    }
+  }
+
+  /** 窗口复位（整页重新加载 / 下拉刷新换血）：回首屏挂载量；卡高表保留（同帖高度可复用） */
+  private slotReset(): void {
+    this.slotStart = 0;
+    this.slotEnd = this.SLOT_INITIAL - 1;
+    this.visEnd = 0;
+  }
+
+  // ===== 「沉浸式阅读补全」交互（2026-09-29，设置 → 个性化 / AppStorage `immersiveReadExtra`）=====
+
+  /**
+   * 列表滚动 → 顶栏（返回钮 + 标题）显隐判定。规则与 ThreadDetail 逐项同源
+   * （24 藏 / 12 露不对称 + 置顶 8 恒显示 + 跳变 240 丢弃）。本页为 @Entry 独立页（我的帖子 /
+   * 我的点赞 / 我的收藏 / 浏览历史四模式共用），无宿主底栏，仅藏顶栏。
+   */
+  private pcImmersiveScroll(): void {
+    if (!this.immersiveReadExtra) {
+      if (this.immersiveHidden) {
+        this.setPcImmersiveHidden(false);
+      }
+      return;
+    }
+    let pos: number = 0;
+    try {
+      pos = this.listScroller.currentOffset().yOffset;
+    } catch (e) {
+      return;
+    }
+    const act = this.pcImmersiveSensor.feed(pos);
+    if (act === 'hide') {
+      this.setPcImmersiveHidden(true);
+    } else if (act === 'show' || act === 'reset') {
+      this.setPcImmersiveHidden(false);
+    }
+  }
+
+  /** 翻转沉浸态（本地 @State，值变化才写）+ 同步判定器 */
+  private setPcImmersiveHidden(hidden: boolean): void {
+    if (this.immersiveHidden === hidden) {
+      return;
+    }
+    this.immersiveHidden = hidden;
+    this.pcImmersiveSensor.setHidden(hidden);
+  }
+
+  /** 复位沉浸判定（回页 onPageShow / 关开关）：清基线 + 恢复显示 */
+  private resetPcImmersive(): void {
+    this.pcImmersiveSensor.resetBaseline();
+    if (this.immersiveHidden) {
+      this.pcImmersiveSensor.setHidden(false);
+      this.immersiveHidden = false;
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即恢复显示 */
+  private onPcImmersiveExtraChanged(): void {
+    if (!this.immersiveReadExtra) {
+      this.resetPcImmersive();
+    }
+  }
+
+  /** 顶栏隐藏位移（vp，向上）：= 槽位标题高 98 × 0.6 ≈ −59（同「收回」口径，其余交给 opacity 淡出） */
+  private pcTopSink(): number {
+    return -(PERSONAL_CONTENT_TITLE_BAR_HEIGHT * IMMERSIVE_EXTRA_FLY_SCALE);
+  }
+
+  /** 显隐动画参数（藏 / 唤不对称）：取值以目标态为准 */
+  private pcImmersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   /** 单列卡宽（vp）：与 pcColumnsData 同式（内容区宽 − List 左右 padding(lg×2) − 列间 gap(6×(cols−1))） */
@@ -674,6 +901,26 @@ struct PersonalContent {
     return '暂时没有浏览历史';
   }
 
+  /**
+   * 顶部满宽渐显带（同进吧页 ForumsTab.TopFadeBand 逐项同款）：固定 98 高 = 顶栏高，背景色渐变条
+   * 叠在列表内容之上（视觉等价内容渐隐），宽度不依赖滚动容器 / 离屏层解析；渐变自顶部线性、
+   * 无全实段（否则内容到顶栏会被"硬切"）。
+   */
+  @Builder
+  TopFadeBand() {
+    Column()
+      .width('100%')
+      .height(98)
+      .linearGradient({
+        direction: GradientDirection.Bottom,
+        colors: [
+          [Theme.bg(this.isDark), 0.0],
+          [this.isDark ? '#00101114' : '#00F2F4F7', 1.0]
+        ]
+      })
+      .hitTestBehavior(HitTestMode.None)
+  }
+
   /** 兜底路径专用（开关关闭 / 低版本时才挂载）：页面主体悬浮自绘玻璃顶栏 */
   @Builder
   TopBar() {
@@ -700,6 +947,11 @@ struct PersonalContent {
     .height(98)
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
+    // 沉浸阅读补全（2026-09-29）：兜底路径顶栏整行上移 + 淡出 + 禁用命中
+    .translate({ y: this.immersiveHidden ? this.pcTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.pcImmersiveAnim())
   }
 
   /**
@@ -732,6 +984,11 @@ struct PersonalContent {
     }
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
+    // 沉浸阅读补全（2026-09-29）：槽高固定 98 不参与内容布局（列表自带让位），整行上移 + 淡出
+    .translate({ y: this.immersiveHidden ? this.pcTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.pcImmersiveAnim())
   }
 
   /**

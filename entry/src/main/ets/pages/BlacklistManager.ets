@@ -438,7 +438,8 @@ struct BlacklistManager {
   }
 
   build() {
-    Stack() {
+    // 对齐 Settings.ets：Stack 必须显式 TopStart，否则默认居中会把悬浮 TopBar 落到屏幕中部
+    Stack({ alignContent: Alignment.TopStart }) {
       Column() {
         // 内容层（TopBar 已悬浮于 Stack 层）
         if (this.loadState === LoadState.Loading) {

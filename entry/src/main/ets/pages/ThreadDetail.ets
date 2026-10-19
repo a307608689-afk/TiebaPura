@@ -36,7 +36,10 @@ import { ThreadDetailSkeleton } from '../components/Skeleton';
 import { FavCategoryPicker } from '../components/FavCategoryPicker';
 import { EmojiLoader } from '../network/EmojiLoader';
 import { ImageCache } from '../cache/ImageCache';
+// 一镜到底（2026-09-27 v2 自绘飞行层方案）：预览模态组件 + 开/关方向弹簧参数
+import { PreviewView, previewMorphOpenAnim, previewMorphCloseAnim } from './ImagePreview';
 import { Haptic } from '../common/Haptic';
+import { PerfTrace } from '../common/PerfTrace';
 import image from '@ohos.multimedia.image';
 
 enum LoadState {
@@ -290,6 +293,12 @@ const GRID_VISIBILITY_FALLBACK_MS: number = 1500;
 struct ThreadGridImage {
   @Prop src: string = '';
   @Prop isDark: boolean = false;
+  /**
+   * 原图宽高比上报（2026-09-27 v2.5）：onComplete 事件自带图源原始宽高——
+   * 一镜到底第一次点开（图片尚无本地缓存文件）时，宿主据此计算 Contain 矩形，
+   * 让第一次也有完整 morph（此前无本地文件只能兜底直开、丢动画）。
+   */
+  onAspect: (aspect: number) => void = (_a: number): void => {};
   /** 本地真图（file://）—— 显示优先级最高 */
   @State current: string = '';
   /** 直连图已确认为真图（未被贴吧占位模板命中）→ 撤除遮罩 */
@@ -369,12 +378,13 @@ struct ThreadGridImage {
     const delays: number[] = [2000, 8000];
     let idx: number = 0;
     const tick = (): void => {
-      if (this.resolvedLocal) {
+      // 退页守卫：组件销毁后不再续链（无句柄延时链的回调不能落到已销毁组件上）
+      if (this.disposed || this.resolvedLocal) {
         return;
       }
       this.attemptResolve(url).then((ok: boolean) => {
         // 拿到本地真图即成功（Image 已可加载 file://）
-        if (ok || this.resolvedLocal) {
+        if (this.disposed || ok || this.resolvedLocal) {
           return;
         }
         idx++;
@@ -384,6 +394,13 @@ struct ThreadGridImage {
       }).catch(() => { /* 静默失败,占位已被 onError 兜底 */ });
     };
     setTimeout(tick, delays[0]);
+  }
+
+  /** 退页守卫：2s/8s 重试链与 1.5s 安全网均为无句柄匿名延时，销毁后统一短路 */
+  private disposed: boolean = false;
+
+  aboutToDisappear(): void {
+    this.disposed = true;
   }
 
   aboutToAppear(): void {
@@ -411,6 +428,9 @@ struct ThreadGridImage {
     // 上百张同时发起会把接口拖慢（§IMGQ 要压的洪峰）；可见性回调失效时由 1.5s 安全网兜底。
     this.directUrl = thumb;
     setTimeout(() => {
+      if (this.disposed) {
+        return;
+      }
       if (!GRID_VISIBILITY_PROBE_FIRED) {
         // 安全网兜底：非视口路径，与后台预取同档（不插队）
         this.startResolve(0);
@@ -429,6 +449,11 @@ struct ThreadGridImage {
         // 不借用全局 Radius.md（=12）；本组件仅供本文件 ImageGrid 使用（楼主卡、楼层卡、楼中楼三处共用）
         .borderRadius(18)
         .alt(this.isDark ? '#2A2A2E' : '#E9E9EB')
+        .onComplete((event) => {
+          if (event && event.loadingStatus === 1 && event.width > 0 && event.height > 0) {
+            this.onAspect(event.width / event.height);
+          }
+        })
         .onError(() => {
           // 本地文件损坏（读不出）→ 退回「直连 + 遮罩」态并解除终态，交给阶梯重试重新解析；
           // 重试链本身封顶两档（2s/8s），不会因此兜圈。
@@ -457,6 +482,10 @@ struct ThreadGridImage {
                 || (event.width === 238 && event.height === 238);
               if (!ph) {
                 this.directOk = true;
+                // 真图上屏：上报原图宽高比（第一次点开无本地文件时的 morph 依据）
+                if (event.width > 0 && event.height > 0) {
+                  this.onAspect(event.width / event.height);
+                }
               }
             })
             .onError(() => { /* 直连失败：保持遮罩，等 resolve */ })
@@ -498,6 +527,13 @@ struct AvatarImage {
   /** v1.25：直连用的 CDN URL（挂载即取，快速上屏） */
   private directUrl: string = '';
 
+  /** 退页守卫：1.5s 安全网为无句柄匿名延时，销毁后不再写 @State / 发请求 */
+  private disposed: boolean = false;
+
+  aboutToDisappear(): void {
+    this.disposed = true;
+  }
+
   aboutToAppear(): void {
     if (this.url.startsWith('http://') || this.url.startsWith('https://')) {
       // Z1 同步命中 → 直接渲染本地真图，零等待
@@ -512,6 +548,9 @@ struct AvatarImage {
       // resolve（落地缓存）仍按视口门控发起 —— 头像数量与楼层同级，全量挂载时同样是几十上百个
       // 并发占住闸门槽位、把首屏宫格挤到队尾；可见性回调失效时由 1.5s 安全网兜底。
       setTimeout(() => {
+        if (this.disposed) {
+          return;
+        }
         if (!GRID_VISIBILITY_PROBE_FIRED) {
           this.startResolve();
         }
@@ -827,6 +866,49 @@ struct ThreadDetail {
   @State commentRn: number = 3;
   @State commentLoading: boolean = false;
   @State openingSubPost: boolean = false;
+  // ===== 一镜到底图片预览（2026-09-27 v2 自绘飞行层方案）=====
+  // 预览为全屏模态（bindContentCover，瞬开瞬收）；morph 由本页自绘飞行层完成——
+  // 单一图片节点装在「格子矩形 → Contain 矩形」插值的 Cover 容器里，两端与真实内容
+  // 逐像素吻合、全程只有一张图（geometryTransition 的两端内容交叉淡化是双影/闪现根源，弃用）。
+  @State previewShow: boolean = false;
+  /** 关闭请求（onWillDismiss 路径）：PreviewView @Watch 复位缩放后回调 finishClosePreview */
+  @State previewClosing: boolean = false;
+  /** 模态挂载 PreviewView 的透传参数（urls/index/流式补页上下文） */
+  @State previewParams: Record<string, Object> = {};
+  // ----- 飞行层 -----
+  @State morphOverlayShow: boolean = false;
+  @State morphBgOpacity: number = 0;
+  @State morphX: number = 0;
+  @State morphY: number = 0;
+  @State morphW: number = 0;
+  @State morphH: number = 0;
+  /** 飞行容器圆角：起点=宫格圆角 18，落点全屏 0 */
+  @State morphRadius: number = 0;
+  @State morphSrc: string = '';
+  /**
+   * 交接位图（2026-09-27 v2.1）：打开 morph 前把本地文件解码为 PixelMap，飞行层与
+   * 模态首帧共用同一张已解码位图——新 Image 节点不再各自二次解码，消除「打开后闪一下」
+   * （解码空窗）与关闭交接空窗。
+   */
+  @State morphPixelMap: image.PixelMap | null = null;
+  /** morph 代次：异步宽高解码回来时校验，防连点/重复开关的过期回调污染状态 */
+  private morphEpoch: number = 0;
+  // ----- 打开 morph 打断（2026-09-27 v2.3）-----
+  /** 打开 morph 进行中（点击后解码/飞行期间，预览未挂载）：返回键打断反向飞回 */
+  private openingMorph: boolean = false;
+  /** 打开起点：打断反向时要飞回的宫格（打断期间页面可滚动，反向时重查实时矩形） */
+  private openCellNodeId: string = '';
+  private openStartRect: number[] | null = null;
+  /**
+   * 宫格图宽高比登记（2026-09-27 v2.5）：ThreadGridImage onComplete 上报（URL → w/h）。
+   * 第一次点开（图片无本地缓存文件）时据此计算 Contain 矩形，第一次也有完整 morph。
+   */
+  private gridAspectByUrl: Map<string, number> = new Map();
+  // ----- 关闭/打断 morph 的滚动跟随（2026-09-27 v2.3）-----
+  /** 飞行容器滚动补偿量（vp）：内容滚动 delta 的反向值，让飞行图贴住目标格子 */
+  @State morphFollowY: number = 0;
+  /** morph 起点的滚动位置：关闭/打断时捕获，跟随量 = -(当前 - 起点) */
+  private morphStartScrollY: number = 0;
   // 楼中楼预览点赞补齐：本会话已通过 pb/floor 校正过点赞的楼层集合（避免重复请求）
   private subPostLikesFetched: Set<string> = new Set<string>();
   private enrichingSubPostLikes: boolean = false;
@@ -867,6 +949,10 @@ struct ThreadDetail {
   @State floorsReady: boolean = false;
   /** 2026-09-20（分区上屏）：楼层区进场淡入透明度（随楼主卡落定后 120ms 启动） */
   @State floorsOpacity: number = 0;
+  /** P3（2026-09-28 流畅度）：楼层淡入动画进行中标记 —— renderGroup 离屏合成开关。
+   *  动画期间整组子树烘焙成一张纹理，opacity 逐帧只做纹理级透明度合成，不再逐帧重绘
+   *  整棵楼层子树；动画收束/被打断时关闭，避免常驻离屏纹理占内存。 */
+  @State floorsRevealing: boolean = false;
   private floorsRevealTimer: number = -1;
   /**
    * P4 楼层渐进挂载（2026-09-26 丢帧治理）：FloorColumnsBlock 只渲染 floors 的前缀
@@ -955,6 +1041,8 @@ struct ThreadDetail {
   private scrollerLeft: Scroller = new Scroller();
 
   aboutToAppear(): void {
+    // P0-2 归因打点：详情页是本期报告的第三页，进入即登记页面上下文
+    PerfTrace.setPage('ThreadDetail');
     MaterialManager.init();
     // 首帧形态初值（§4.9 DT-A）：onAreaChange 只在尺寸变化后触发，横屏冷启动若不预置会先按竖屏判定再跳分栏；
     // 顺带把 currentWidth 从写死的 360 换成真实窗口宽（口径与 §4.8 T-B 同源）。
@@ -1186,6 +1274,9 @@ struct ThreadDetail {
       this.highlightFloorId = floorId;
       this.scroller.scrollTo({ xOffset: 0, yOffset: Math.max(0, targetY), animation: true });
       setTimeout(() => {
+        if (!this.pageAlive) {
+          return;
+        }
         if (this.highlightFloorId === floorId) {
           this.highlightFloorId = '';
         }
@@ -1198,7 +1289,13 @@ struct ThreadDetail {
         'AUTOOPEN floor=%{public}s notifyMsgPostId=%{public}s isFloor=%{public}s floorDirect=%{public}s',
         floorId, this.notifyMsgPostId, this.notifyIsFloor, floorDirect ? '1' : '0');
       if (this.notifyIsFloor === '0' && !floorDirect && !this.notifySubPostHandled) {
-        setTimeout(() => { this.maybeAutoOpenNotifySubPost(); }, 900);
+        setTimeout(() => {
+          // 退页守卫：900ms 后退页时不得再拉起楼中楼路由
+          if (!this.pageAlive) {
+            return;
+          }
+          this.maybeAutoOpenNotifySubPost();
+        }, 900);
       }
       return true;
     } catch (e) {
@@ -1218,7 +1315,8 @@ struct ThreadDetail {
     }
     let attempts: number = 0;
     const tick = (): void => {
-      if (this.highlightFloorId === this.targetFloorId) {
+      // 退页守卫：重试链最长自续 ~5s，销毁后不得再调 scroller / 写高亮状态
+      if (!this.pageAlive || this.highlightFloorId === this.targetFloorId) {
         return;
       }
       if (this.scrollToTargetFloor()) {
@@ -1267,7 +1365,17 @@ struct ThreadDetail {
         return;
       }
       this.floorsReady = true;
-      animateTo({ duration: FLOORS_FADE_IN_MS, curve: Curve.EaseOut, delay: FLOORS_FADE_DELAY_MS }, () => {
+      // P3：淡入期间开 renderGroup —— 楼层子树离屏合成一张纹理，opacity 逐帧只做纹理级
+      // 透明度合成，不再重绘整棵楼层子树；收束后关闭恢复常态。
+      this.floorsRevealing = true;
+      animateTo({
+        duration: FLOORS_FADE_IN_MS,
+        curve: Curve.EaseOut,
+        delay: FLOORS_FADE_DELAY_MS,
+        onFinish: (): void => {
+          this.floorsRevealing = false;
+        }
+      }, () => {
         this.floorsOpacity = 1;
       });
     }, FLOORS_REVEAL_DELAY_MS);
@@ -1381,6 +1489,8 @@ struct ThreadDetail {
     // 分区上屏：楼层区回到未构建态（数据落地后楼主卡先绘制，楼层区由 scheduleFloorsReveal 补齐）
     this.floorsReady = false;
     this.floorsOpacity = 0;
+    // P3：重载打断上一轮淡入时，onFinish 可能不再回调，这里一并复位 renderGroup 开关
+    this.floorsRevealing = false;
     // §P0-4：首屏（本页尚无内容）不立即挂骨架屏，交 aboutToAppear 的 120ms 延时放行；
     // 已有内容的重新加载（切排序 / 只看楼主 / 强制刷新）立即放行，骨架屏表现与改造前一致。
     if (this.detail !== null) {
@@ -1491,7 +1601,12 @@ struct ThreadDetail {
           // post_id 恰好是楼层 pid（楼层直回）：原地滚动高亮
           this.scheduleScrollToTargetFloor();
         } else {
-          setTimeout(() => { this.resolveNotifyTarget(); }, 250);
+          setTimeout(() => {
+            if (!this.pageAlive) {
+              return;
+            }
+            this.resolveNotifyTarget();
+          }, 250);
         }
       }
     } catch (e) {
@@ -1851,6 +1966,61 @@ struct ThreadDetail {
       }
       // 跳转官方贴吧确认弹窗已迁到系统 CustomDialog（见宿主 jumpDialogController / JumpTiebaDialogCard）：
       // 原自绘浮层挂在页面 body 内，systemMaterial 必然判 out of scope，只有系统弹窗宿主才吃官方沉浸材质
+      // ===== 一镜到底预览层（2026-09-27 v2.2，页内同树挂载，替代 bindContentCover 模态）=====
+      // 模态层是独立合成层，挂载首帧永远可能落后一拍（此前多次「闪一下」的根因）；
+      // 同树挂载后时序完全受控：预览先挂，飞行层叠在其上，等预览首图 onLoad（或 250ms 兜底）
+      // 才撤——预览没画好之前屏幕上始终是飞行层稳定末帧，结构上不可能闪。
+      if (this.previewShow) {
+        PreviewView({
+          previewParams: this.previewParams,
+          closing: this.previewClosing,
+          initialPixelMap: this.morphPixelMap,
+          initialPixelMapPath: this.morphSrc,
+          onClose: (index: number): void => this.finishClosePreview(index),
+          onReady: (): void => {
+            if (this.previewShow) {
+              this.morphOverlayShow = false;
+            }
+          }
+        })
+      }
+      // ===== 一镜到底飞行层（2026-09-27 v2，自绘）=====
+      // 单一图片节点装在「格子矩形 → Contain 矩形」弹簧插值的 Cover 容器里：
+      // 起点帧 = 宫格格子逐像素、终点帧 = 预览页首帧逐像素，全程只有一张图、
+      // 无 geometryTransition 的两端内容交叉淡化（双影/闪现根源）。
+      // hitTestBehavior None：纯视觉层，不挡任何交互。
+      if (this.morphOverlayShow) {
+        Stack() {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor(Color.Black)
+            .opacity(this.morphBgOpacity)
+            .hitTestBehavior(HitTestMode.None)
+          Stack() {
+            Image(this.morphPixelMap !== null ? this.morphPixelMap : this.morphSrc)
+              .width('100%')
+              .height('100%')
+              .objectFit(ImageFit.Cover)
+              .draggable(false)
+              .hitTestBehavior(HitTestMode.None)
+          }
+          .width(this.morphW)
+          .height(this.morphH)
+          .position({ x: this.morphX, y: this.morphY })
+          // 滚动跟随补偿：关闭/打断 morph 期间内容滚动时，飞行图贴住目标格子一起走
+          .translate({ x: 0, y: this.morphFollowY })
+          .borderRadius(this.morphRadius)
+          .clip(true)
+          // HitTestMode.None 只豁免自身，子节点默认仍参与命中——飞行层各节点必须逐个
+          // 显式穿透，否则关闭 morph 期间（约 400ms）飞行图片会挡住宫格点击，
+          // 表现为「退出后要等一会才能点开下一张」
+          .hitTestBehavior(HitTestMode.None)
+        }
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+      }
     }
     .width('100%')
     .height('100%')
@@ -1878,6 +2048,9 @@ struct ThreadDetail {
         this.applySplitSwitch(nextSplit);
       }
     })
+    // 一镜到底图片预览（2026-09-27 v2.2）：预览为页内全屏层（不再用 bindContentCover 模态——
+    // 其独立合成层挂载首帧落后一拍是「打开后闪一下」的根源）；系统返回/侧滑由页级
+    // onBackPress 拦截（见 onBackPress），飞行层与预览的层级/时序在同树内完全受控。
   }
 
   build() {
@@ -2074,6 +2247,18 @@ struct ThreadDetail {
    * 分栏左栏（主楼）不挂：主楼通常不满一屏，且与右栏共用一个累计器会互相污染基线。
    */
   private onDetailScroll(_x: number, _y: number): void {
+    // P0-2 归因打点：只记时间戳，供 FSTAT 判定本窗口是否在滚动（首行，先于所有早退分支）
+    PerfTrace.noteScroll();
+    // 一镜到底 v2.3（2026-09-27）：关闭/打断 morph 飞行期间，飞行图跟随内容滚动——
+    // 把滚动差值反向补偿到飞行容器的 translate 上（与弹簧驱动的 position 分属不同
+    // 属性，互不干扰），飞行图贴住目标格子一起走，不再「原地停留后消失」。
+    // 仅关闭/打断方向生效（目标是格子，会随内容移动）；打开方向目标是屏幕固定位置，不跟随。
+    if (this.morphOverlayShow && !this.previewShow && !this.openingMorph) {
+      try {
+        this.morphFollowY = -(this.scroller.currentOffset().yOffset - this.morphStartScrollY);
+      } catch (e) {
+      }
+    }
     if (!this.immersiveReading) {
       return;
     }
@@ -2192,12 +2377,27 @@ struct ThreadDetail {
 
   /** 退页清理：藏起 180ms / 唤出 16ms 窗口内退出本页时，延时回调不再落到已销毁的组件上 */
   aboutToDisappear(): void {
+    // §AUDIT（2026-09-29 定时器审计）：存活守卫——无句柄的延时链回调（自动开楼中楼/滚动重试/
+    // 淡入接力/点赞补齐等）以本标志短路，销毁后不再写 @State / 调路由 / 发请求
+    this.pageAlive = false;
     this.clearImmersiveGlassTimer();
     // 尾部提示延时器同理：预取在途时退页，1.2s 后的浮出回调不能落到已销毁的组件上
     this.clearLoadingHintTimer();
     // §Z4a 延后补齐调度器同理：延后/重试窗口内退页，回调不能再落到已销毁的组件上
     this.clearEnrichTimer();
+    // 分区上屏延时器：句柄已存但此前未入清理（退页后 50ms 回调写 floorsReady）
+    if (this.floorsRevealTimer !== -1) {
+      clearTimeout(this.floorsRevealTimer);
+      this.floorsRevealTimer = -1;
+    }
+    // 递增代次作废在途淡入接力链（fadeGeneration 守卫的 stale() 短路）
+    this.fadeGeneration++;
+    // morph 覆盖层收尾守卫同理（250ms 收尾回调写 morphOverlayShow）
+    this.morphEpoch++;
   }
+
+  /** 主页面存活守卫：aboutToDisappear 置 false，所有无句柄延时链回调据此短路 */
+  private pageAlive: boolean = true;
 
   /**
    * 显隐动画参数（藏 / 唤不对称）：取值以**目标态**为准 —— `immersiveHidden` 在本帧渲染前
@@ -2538,9 +2738,12 @@ struct ThreadDetail {
     // 沉浸阅读（2026-09-18 三轮）：整行上移约 0.6 倍高（−59）+ 淡出，藏起 180ms EaseIn / 唤出 260ms 轻回弹。
     // 槽位高度固定 98 不参与内容布局（Scroll 首项自带 98 占位），故位移不影响正文排布。
     .translate({ y: this.immersiveHidden ? this.immersiveTopSink() : 0 })
-    .opacity(this.immersiveHidden ? 0 : 1)
+    // 一镜到底（2026-09-27 v2）：顶栏绘制在页面内容层之上，飞行层盖不住它——
+    // 透明度与飞行层黑幕浓度反向联动（黑幕起 → 顶栏同步隐，黑幕落 → 顶栏同步现），
+    // 消除「morph 期间顶栏浮在黑幕上、模态挂载瞬间顶栏被盖掉」的闪变。
+    .opacity(this.immersiveHidden ? 0 : 1 - this.morphBgOpacity)
     // opacity 0 的组件仍参与命中测试，必须显式禁用，避免"看不见但能点到返回/分享"
-    .enabled(!this.immersiveHidden)
+    .enabled(!this.immersiveHidden && this.morphBgOpacity < 0.5)
     .animation(this.immersiveAnim())
   }
 
@@ -2666,6 +2869,7 @@ struct ThreadDetail {
                       }
                       .width('100%')
                       .opacity(this.floorsOpacity)
+                      .renderGroup(this.floorsRevealing)
                     }
                   }
                   .width('100%')
@@ -2736,6 +2940,7 @@ struct ThreadDetail {
                 }
                 .width('100%')
                 .opacity(this.floorsOpacity)
+                .renderGroup(this.floorsRevealing)
               }
             }
             .width('100%')
@@ -2912,6 +3117,7 @@ struct ThreadDetail {
     try {
       await TiebaService.getInstance().togglePostAgree(this.tid, this.detail?.postId ?? '', next);
       TiebaService.getInstance().invalidateThreadDetailCache(this.threadDetailCacheKey());
+      Haptic.light();
       await this.persistPersonalState(CACHE_KEY.PERSONAL_LIKED, next);
     } catch (e) {
       this.liked = previous;
@@ -2980,6 +3186,7 @@ struct ThreadDetail {
     try {
       await TiebaService.getInstance().togglePostAgree(this.tid, floorId, next, 1);
       TiebaService.getInstance().invalidateThreadDetailCache(this.threadDetailCacheKey());
+      Haptic.light();
     } catch (e) {
       // 回滚
       const rollbackFloors: FloorItem[] = this.floors.map((f: FloorItem): FloorItem => {
@@ -3037,6 +3244,7 @@ struct ThreadDetail {
     this.updateCommentLikeState(floorId, commentId, next, next ? 1 : -1);
     try {
       await TiebaService.getInstance().togglePostAgree(this.tid, commentId, next, 2);
+      Haptic.light();
     } catch (e) {
       this.updateCommentLikeState(floorId, commentId, previous, next ? -1 : 1);
       const msg = (e as Error).message ?? '操作失败';
@@ -3156,7 +3364,13 @@ struct ThreadDetail {
         .then((res: SubPostDetail): void => { this.mergeSubPostLikeCounts(floor.floorId, res.comments); })
         .catch(() => { /* 单楼层补齐失败静默，预览保持原值 */ })
         .finally((): void => {
-          setTimeout((): void => { runNext(idx + 1); }, 120);
+          setTimeout((): void => {
+            // 退页守卫：串行补齐链最多 12 层自续，销毁后不再发请求 / 写 @State
+            if (!this.pageAlive) {
+              return;
+            }
+            runNext(idx + 1);
+          }, 120);
         });
     };
     runNext(0);
@@ -4046,6 +4260,28 @@ struct ThreadDetail {
     });
   }
 
+  /**
+   * 页级返回拦截（2026-09-27 v2.2/v2.3）：预览为页内全屏层（非模态），系统返回键/侧滑在此拦截——
+   * 预览开着 → 交 PreviewView 复位缩放并走关闭 morph，返回键不退出详情页；
+   * 打开 morph 飞行中 → **打断**：弹簧从当前位置反向飞回格子（官方一镜到底同款打断体验）；
+   * 其它飞行层残留 → 作废在途回调并撤层。
+   */
+  onBackPress(): boolean {
+    if (this.previewShow) {
+      this.closeImagePreview();
+      return true;
+    }
+    if (this.openingMorph) {
+      this.interruptOpenMorph();
+      return true;
+    }
+    if (this.morphOverlayShow) {
+      this.morphEpoch++;
+      this.morphOverlayShow = false;
+    }
+    return false;
+  }
+
   onPageShow(): void {
     this.fontSizeTick++;
     this.openingSubPost = false;
@@ -4142,60 +4378,388 @@ struct ThreadDetail {
     return (isLargeFoldDevice() || isPuraXMaxDevice()) ? 72 : 120;
   }
 
+  // ===== 一镜到底图片预览（2026-09-27 v2 自绘飞行层方案）=====
+
+  /**
+   * 宫格飞行定位 id（2026-09-27 v2.4）：`dtgu_${URL哈希}` —— 按点击图自身 URL 生成，
+   * 不再经「首图 URL 推全局偏移」（首图不在全局列表/首图重复时会整组错位：飞行起点
+   * 飞到别的格子、预览 index 指向全局第 0 张）。楼中楼单张同样参与（id 唯一即可）。
+   * 同 URL 重复入列表时哈希撞车取首个格子，可接受。
+   */
+  private gridCellNodeId(images: string[], idx: number): string {
+    return `dtgu_${this.urlHash(images[idx] ?? '')}`;
+  }
+
+  /** djb2 字符串哈希（base36）：同一 URL 稳定、不同 URL 基本不撞 */
+  private urlHash(url: string): string {
+    let h: number = 5381;
+    for (let i = 0; i < url.length; i++) {
+      h = ((h << 5) + h + url.charCodeAt(i)) | 0;
+    }
+    return (h >>> 0).toString(36);
+  }
+
+  /** 查组件窗口矩形（vp）。componentUtils 返回 px，统一转 vp；查不到/尺寸非法返回 null */
+  private getVpRectById(nodeId: string): number[] | null {
+    if (nodeId.length === 0) {
+      return null;
+    }
+    try {
+      const rect = this.getUIContext().getComponentUtils().getRectangleById(nodeId);
+      const w = px2vp(rect.size.width);
+      const h = px2vp(rect.size.height);
+      if (w <= 0 || h <= 0) {
+        return null;
+      }
+      return [px2vp(rect.windowOffset.x), px2vp(rect.windowOffset.y), w, h];
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 飞行图源：优先高清档（pv_）→ 基础档（与宫格、预览共用同一缓存文件，交接帧逐像素一致） */
+  private getMorphLocalPath(url: string): string | null {
+    return ImageCache.getPreviewCachedPath(url) ?? ImageCache.getVerifiedCachedPath(url);
+  }
+
+  /** 解码本地文件为 PixelMap；失败返回 null（打开/关闭 morph 共用，宽高比从位图读） */
+  private async decodeMorphPixelMap(localPath: string): Promise<image.PixelMap | null> {
+    try {
+      const source = image.createImageSource(localPath.substring('file://'.length));
+      const pm = await source.createPixelMap();
+      await source.release();
+      return pm;
+    } catch (e) {
+    }
+    return null;
+  }
+
+  /** 给定宽高比的全屏 Contain 矩形（基于窗口尺寸）[x, y, w, h]（vp） */
+  private containRectFor(aspect: number): number[] {
+    const winW = this.currentWidth > 0 ? this.currentWidth : 360;
+    const winH = this.pageHeight > 0 ? this.pageHeight : 780;
+    let w = winW;
+    let h = w / aspect;
+    if (h > winH) {
+      h = winH;
+      w = h * aspect;
+    }
+    return [(winW - w) / 2, (winH - h) / 2, w, h];
+  }
+
+  /**
+   * 打开预览：参数先落 @State → 异步解码点击图宽高（毫秒级）→ 飞行层从格子矩形
+   * 弹簧插值到 Contain 矩形（Cover 容器，全程单节点无交叉淡化）→ 动画尾段模态瞬开
+   * （首帧与飞行层终态逐像素一致）→ 飞行层退场。
+   * 无本地缓存/解码失败/无格子矩形 → 兜底直开（无 morph）。
+   */
+  private openImagePreview(params: Record<string, Object>, cellNodeId: string, url: string): void {
+    this.previewParams = params;
+    this.previewClosing = false;
+    this.openCellNodeId = cellNodeId;
+    this.openStartRect = null;
+    this.openingMorph = true;
+    // 打开方向目标是屏幕固定位置，不做滚动跟随，清掉上一次的补偿残留
+    this.morphFollowY = 0;
+    const rect = this.getVpRectById(cellNodeId);
+    if (rect === null) {
+      // 兜底直开：清掉上一次 morph 的交接位图，否则预览首帧会闪出上一张旧图
+      this.openingMorph = false;
+      this.morphPixelMap = null;
+      this.previewShow = true;
+      return;
+    }
+    this.openStartRect = rect;
+    const local = this.getMorphLocalPath(url);
+    if (local === null) {
+      // v2.5 第一次点开（图片尚无本地缓存文件）：用宫格 onComplete 登记的原图宽高比
+      // + 宫格显示源 URL（resolveThumbUrl，同源刚渲染过、解码缓存即时）照常起飞。
+      // 预览挂载后走自身加载链（无本地 → 直连 URL），首图 onComplete 才撤飞行层——
+      // 预览加载期间屏幕始终是飞行层稳定末帧，不闪；本地落地后静默升级为 file://。
+      const aspect = this.gridAspectByUrl.get(url) ?? 0;
+      if (aspect <= 0) {
+        this.openingMorph = false;
+        this.morphPixelMap = null;
+        this.previewShow = true;
+        return;
+      }
+      const epoch = ++this.morphEpoch;
+      const target = this.containRectFor(aspect);
+      this.morphPixelMap = null;
+      this.morphSrc = resolveThumbUrl(url);
+      this.morphX = rect[0];
+      this.morphY = rect[1];
+      this.morphW = rect[2];
+      this.morphH = rect[3];
+      this.morphRadius = 18;
+      this.morphBgOpacity = 0;
+      this.morphOverlayShow = true;
+      const anim = previewMorphOpenAnim();
+      anim.onFinish = (): void => {
+        if (this.morphEpoch !== epoch) {
+          return;
+        }
+        this.openingMorph = false;
+        this.previewShow = true;
+        setTimeout((): void => {
+          if (this.morphEpoch === epoch) {
+            this.morphOverlayShow = false;
+          }
+        }, 250);
+      };
+      this.getUIContext().animateTo(anim, () => {
+        this.morphX = target[0];
+        this.morphY = target[1];
+        this.morphW = target[2];
+        this.morphH = target[3];
+        this.morphRadius = 0;
+        this.morphBgOpacity = 1;
+      });
+      return;
+    }
+    const epoch = ++this.morphEpoch;
+    this.decodeMorphPixelMap(local).then((pm: image.PixelMap | null): void => {
+      if (this.morphEpoch !== epoch) {
+        return;
+      }
+      if (pm === null) {
+        this.openingMorph = false;
+        this.morphPixelMap = null;
+        this.previewShow = true;
+        return;
+      }
+      pm.getImageInfo().then((info: image.ImageInfo): void => {
+        if (this.morphEpoch !== epoch) {
+          return;
+        }
+        if (info.size.width <= 0 || info.size.height <= 0) {
+          this.openingMorph = false;
+          this.morphPixelMap = null;
+          this.previewShow = true;
+          return;
+        }
+        const aspect = info.size.width / info.size.height;
+        const target = this.containRectFor(aspect);
+        this.morphPixelMap = pm;
+        this.morphSrc = local;
+        this.morphX = rect[0];
+        this.morphY = rect[1];
+        this.morphW = rect[2];
+        this.morphH = rect[3];
+        this.morphRadius = 18;
+        this.morphBgOpacity = 0;
+        this.morphOverlayShow = true;
+        // 挂载时机用弹簧 onFinish（真实落定帧）；预览挂在飞行层之下，飞行层等
+        // 预览首图 onLoad（onReady）或 250ms 兜底才撤——预览首帧抖动被稳定末帧盖住
+        const anim = previewMorphOpenAnim();
+        anim.onFinish = (): void => {
+          if (this.morphEpoch !== epoch) {
+            return;
+          }
+          this.openingMorph = false;
+          this.previewShow = true;
+          setTimeout((): void => {
+            if (this.morphEpoch === epoch) {
+              this.morphOverlayShow = false;
+            }
+          }, 250);
+        };
+        this.getUIContext().animateTo(anim, () => {
+          this.morphX = target[0];
+          this.morphY = target[1];
+          this.morphW = target[2];
+          this.morphH = target[3];
+          this.morphRadius = 0;
+          this.morphBgOpacity = 1;
+        });
+      });
+    });
+  }
+
+  /** 系统返回/侧滑：交 PreviewView 复位缩放并回调 finishClosePreview（关闭 morph 飞回宫格） */
+  private closeImagePreview(): void {
+    this.previewClosing = true;
+  }
+
+  /**
+   * 打断打开 morph（2026-09-27 v2.3，返回键在飞行途中触发）：
+   * springMotion 弹簧可中断可重定向——反向 animateTo 从当前实时位置接续飞回格子
+   * （打断期间页面可滚动，故重查格子实时矩形；查不到用点击时快照兜底）。
+   * epoch++ 作废打开链的在途 onFinish/挂载定时器，预览不会被挂载。
+   */
+  private interruptOpenMorph(): void {
+    this.openingMorph = false;
+    if (!this.morphOverlayShow) {
+      // 解码在途、飞行层尚未出现：作废整条打开链即可
+      this.morphEpoch++;
+      return;
+    }
+    const epoch = ++this.morphEpoch;
+    const rect = this.getVpRectById(this.openCellNodeId) ?? this.openStartRect;
+    if (rect === null) {
+      this.morphOverlayShow = false;
+      return;
+    }
+    // 反向飞回目标是格子：同样启用滚动跟随
+    this.morphFollowY = 0;
+    try {
+      this.morphStartScrollY = this.scroller.currentOffset().yOffset;
+    } catch (e) {
+      this.morphStartScrollY = 0;
+    }
+    const anim = previewMorphCloseAnim();
+    anim.onFinish = (): void => {
+      if (this.morphEpoch !== epoch) {
+        return;
+      }
+      this.morphOverlayShow = false;
+    };
+    this.getUIContext().animateTo(anim, () => {
+      this.morphX = rect[0];
+      this.morphY = rect[1];
+      this.morphW = rect[2];
+      this.morphH = rect[3];
+      this.morphRadius = 18;
+      this.morphBgOpacity = 0;
+    });
+  }
+
+  /**
+   * 关闭预览：按当前图索引定位本地文件与宫格格子 → 飞行层先落到「全屏终态」（与模态
+   * 当前帧逐像素一致）→ **同帧瞬收模态**（无间隙）→ 弹簧飞回格子矩形、黑幕同步淡出。
+   * 当前图无本地文件/无格子（补页图）→ 兜底瞬关。
+   */
+  private finishClosePreview(index: number): void {
+    if (!this.previewShow) {
+      return;
+    }
+    // 滚动跟随基线：预览期间页面不可滚动，此值即关窗瞬间的内容位置
+    this.morphFollowY = 0;
+    try {
+      this.morphStartScrollY = this.scroller.currentOffset().yOffset;
+    } catch (e) {
+      this.morphStartScrollY = 0;
+    }
+    const epoch = ++this.morphEpoch;
+    const urlsObj: Object | undefined = this.previewParams['urls'];
+    const urls: string[] = Array.isArray(urlsObj) ? (urlsObj as string[]) : [];
+    const url: string = index >= 0 && index < urls.length ? urls[index] : '';
+    const local = url.length > 0 ? this.getMorphLocalPath(url) : null;
+    const rect = url.length > 0 ? this.getVpRectById(this.gridCellNodeId([url], 0)) : null;
+    if (local === null || rect === null) {
+      this.previewShow = false;
+      return;
+    }
+    this.decodeMorphPixelMap(local).then((pm: image.PixelMap | null): void => {
+      if (this.morphEpoch !== epoch) {
+        return;
+      }
+      if (pm === null) {
+        this.previewShow = false;
+        return;
+      }
+      pm.getImageInfo().then((info: image.ImageInfo): void => {
+        if (this.morphEpoch !== epoch) {
+          return;
+        }
+        if (info.size.width <= 0 || info.size.height <= 0) {
+          this.previewShow = false;
+          return;
+        }
+        const aspect = info.size.width / info.size.height;
+        const start = this.containRectFor(aspect);
+        // 同帧交接：飞行层先呈现模态当前帧（已解码位图，零空窗），模态随即卸载——无任何跳变
+        this.morphPixelMap = pm;
+        this.morphSrc = local;
+        this.morphX = start[0];
+        this.morphY = start[1];
+        this.morphW = start[2];
+        this.morphH = start[3];
+        this.morphRadius = 0;
+        this.morphBgOpacity = 1;
+        this.morphOverlayShow = true;
+        this.previewShow = false;
+        const anim = previewMorphCloseAnim();
+        anim.onFinish = (): void => {
+          if (this.morphEpoch !== epoch) {
+            return;
+          }
+          this.morphOverlayShow = false;
+        };
+        this.getUIContext().animateTo(anim, () => {
+          this.morphX = rect[0];
+          this.morphY = rect[1];
+          this.morphW = rect[2];
+          this.morphH = rect[3];
+          this.morphRadius = 18;
+          this.morphBgOpacity = 0;
+        });
+      });
+    });
+  }
+
   @Builder
   ImageGrid(images: string[], capMaxWidth: boolean = true, singlePreview: boolean = false) {
     Grid() {
       ForEach(images, (img: string, idx: number) => {
         GridItem() {
           Stack() {
-            ThreadGridImage({ src: img, isDark: this.isDark })
+            ThreadGridImage({
+              src: img,
+              isDark: this.isDark,
+              onAspect: (aspect: number): void => {
+                if (aspect > 0) {
+                  this.gridAspectByUrl.set(img, aspect);
+                }
+              }
+            })
               .width('100%')
               .height(this.gridCellHeight())
           }
           .width('100%')
           .height(this.gridCellHeight())
+          // 一镜到底 v2.4（2026-09-27）：格子挂 URL 哈希定位 id，点击时/关闭时由
+          // componentUtils 查实时矩形作为飞行起/终点（px→vp 换算见 getVpRectById）。
+          .id(this.gridCellNodeId(images, idx))
           .onClick(() => {
-            // 预览提速 P3（2026-09-23）：点击即拉——pushUrl 之前先把点击图的基础档
-            // 灌进 ImageCache（闸门 priority=1 插队），路由转场动画期间下载已在并行进行；
-            // 预览页首图同步直出/高清升级都吃这条在途链。已在缓存则 warmImages 自动跳过。
+            // 预览提速 P3（2026-09-23）：点击即拉——打开预览前先把点击图的基础档
+            // 灌进 ImageCache（闸门 priority=1 插队），模态转场动画期间下载已在并行进行；
+            // 预览首图同步直出/高清升级都吃这条在途链。已在缓存则 warmImages 自动跳过。
             ImageCache.warmImages([img], 1, 1);
             // 高清档入口并行（2026-09-26）：点击目标图的 720 档随转场动画同步起跑，
-            // 进预览页首图的高清升级已在中途——治「原图加载慢」的第一棒；
+            // 进预览首图的高清升级已在中途——治「原图加载慢」的第一棒；
             // pv_ 已在缓存时 resolvePreview 内部直接命中返回，零重复下载
             ImageCache.resolvePreview(img).catch((): void => {});
             // 楼中楼宫格（singlePreview=true）：单张预览——urls 只含当前这张（单元素 Swiper 不可滑），
-            // 不带流式补页上下文；主图/楼层宫格保持原「全局列表 + 流式补页」行为（2026-09-20 预览解耦）。
+            // 不带流式补页上下文；v2.4 起同样参与一镜到底（URL 哈希定位）。
             if (singlePreview) {
-              this.getUIContext().getRouter().pushUrl({
-                url: 'pages/ImagePreview',
-                params: { urls: [img] }
-              }).catch(() => {
-                this.getUIContext().getPromptAction().showToast({ message: '图片预览打开失败，请稍后重试' });
-              });
+              const singleParams: Record<string, Object> = { 'urls': [img] };
+              this.openImagePreview(singleParams, this.gridCellNodeId(images, idx), img);
               return;
             }
             const allImages = this.collectAllImages();
-            const offset = this.getImageGlobalOffset(images);
-            // 图片流式补页（2026-09-17）：浏览页滑到已加载图片末尾时，会按同一组分页参数
+            // 预览 index = 点击图自身在全局列表的精确位置（v2.4：不再用首图 URL 推偏移，
+            // 首图不在列表/重复时会把整组映射错到全局第 0 张）
+            let globalIdx: number = allImages.indexOf(img);
+            if (globalIdx < 0) {
+              globalIdx = this.getImageGlobalOffset(images) + idx;
+            }
+            // 图片流式补页（2026-09-17）：预览滑到已加载图片末尾时，会按同一组分页参数
             // （tid/sortType/seeLz/forumId/commentRn）继续拉取后续楼层页并追加图片，
             // 使「未加载楼层的图片」也能直接滑到，无需先滚回列表加载楼层。
             // loadedPage/totalPage 用于给出补页游标与上限（详见 ImagePreview.ets 的流式补页说明）。
-            this.getUIContext().getRouter().pushUrl({
-              url: 'pages/ImagePreview',
-              params: {
-                urls: allImages,
-                index: offset + idx,
-                tid: this.tid,
-                sortType: this.sortType,
-                seeLz: this.seeLz,
-                forumId: this.forumId,
-                commentRn: this.commentRn,
-                loadedPage: this.currentPage,
-                totalPage: this.totalFloorPage
-              }
-            }).catch(() => {
-              this.getUIContext().getPromptAction().showToast({ message: '图片预览打开失败，请稍后重试' });
-            });
+            const previewParams: Record<string, Object> = {
+              'urls': allImages,
+              'index': globalIdx,
+              'tid': this.tid,
+              'sortType': this.sortType,
+              'seeLz': this.seeLz,
+              'forumId': this.forumId,
+              'commentRn': this.commentRn,
+              'loadedPage': this.currentPage,
+              'totalPage': this.totalFloorPage
+            };
+            this.openImagePreview(previewParams, this.gridCellNodeId(images, idx), img);
           })
         }
       }, (img: string, idx: number) => img)

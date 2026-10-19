@@ -17,7 +17,7 @@
  */
 
 import { TiebaProtoDecoder } from './TiebaProtoDecoder';
-import { PbPageResponseMessage } from '../model/TiebaProtoSchema';
+import { PbPageResponseMessage, FrsPageResponseMessage, PbFloorResponseMessage } from '../model/TiebaProtoSchema';
 
 /**
  * 详情页解码下沉任务（2026-09-20 性能优化）：
@@ -38,4 +38,24 @@ function decodePbPageTask(binary: ArrayBuffer): PbPageResponseMessage {
   return TiebaProtoDecoder.decodePbPageResponse(binary);
 }
 
-export { decodePbPageTask };
+/**
+ * 吧列表解码下沉任务（2026-09-29 流畅度批次）：frs/page 50 条/页 + 全量图片字段，
+ * 解码在主线程与滚动/进吧转场同期，是列表页滚动尖峰来源之一。边界与 pb/page 完全一致：
+ * 只下沉纯解码（产物为纯数据对象字面量，可结构化克隆），依赖 TiebaService 实例方法的
+ * 模型映射段仍留主线程。
+ */
+@Concurrent
+function decodeFrsPageTask(binary: ArrayBuffer): FrsPageResponseMessage {
+  return TiebaProtoDecoder.decodeFrsPageResponse(binary);
+}
+
+/**
+ * 楼中楼解码下沉任务（2026-09-29）：pb/floor 回包随楼中楼条数可达数十~数百 KB，
+ * 打开楼中楼详情时与路由转场同期。边界同上。
+ */
+@Concurrent
+function decodePbFloorTask(binary: ArrayBuffer): PbFloorResponseMessage {
+  return TiebaProtoDecoder.decodePbFloorResponse(binary);
+}
+
+export { decodePbPageTask, decodeFrsPageTask, decodePbFloorTask };

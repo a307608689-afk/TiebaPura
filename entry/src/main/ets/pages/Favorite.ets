@@ -19,7 +19,7 @@
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
-import { display, LengthMetrics } from '@kit.ArkUI';
+import { curves, display, LengthMetrics } from '@kit.ArkUI';
 import { picker, fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { CacheManager } from '../cache/CacheManager';
@@ -38,6 +38,11 @@ import { Haptic } from '../common/Haptic';
 import { ShareUtil } from '../common/ShareUtil';
 import { compareByName } from '../common/Pinyin';
 import { PrefetchGate } from '../common/PrefetchGate';
+import { PerfTrace } from '../common/PerfTrace';
+import {
+  ImmersiveReadSensor, IMMERSIVE_EXTRA_FLY_SCALE, IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 
 enum FavCategoryTab {
   Forums = 0,
@@ -1138,7 +1143,23 @@ export struct FavoriteTab {
     }).catch(() => {
     });
   }
-  @StorageLink('favEditing') favEditing: boolean = false;
+  @StorageLink('favEditing') @Watch('onFavEditingImmersiveChanged') favEditing: boolean = false;
+  // ===== 「沉浸式阅读补全」（2026-09-29，设置 → 个性化）=====
+  /** 设置项真源：AppStorage `immersiveReadExtra`（独立开关，默认关） */
+  @StorageLink('immersiveReadExtra') @Watch('onFavImmersiveExtraChanged') immersiveReadExtra: boolean = false;
+  /** 当前主 Tab 真源（Index.switchTab 维护）：仅自己为当前 Tab（=2）时才允许驱动宿主底栏 */
+  @StorageLink('currentMainTab') @Watch('onFavCurrentMainTabChanged') currentMainTab: number = 0;
+  /**
+   * 沉浸态：true = TopBar（五形态共行）+ 分类胶囊行 + 宿主底栏已藏起。
+   * **只存页面局部 @State**；宿主底栏经 mainBarImmersiveHidden 驱动（仅当前 Tab 才写）。
+   */
+  @State immersiveHidden: boolean = false;
+  /** 三个滚动面各持一份判定器（基线独立）：吧分类根列表 / 自定义分类根列表 / 收藏夹二级页 */
+  private folderImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
+  private categoryImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
+  private threadImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
+  /** 吧分类收藏夹二级页（ForumThreadsView）的 Scroll 此前为匿名（无 scroller），补绑用于沉浸判定取偏移真值 */
+  private forumThreadScroller: Scroller = new Scroller();
   // BUG-01 系统返回：favCanGoBack = 收藏页当前是否处于可回退层级（Index.onBackPress 据此拦截/放行）；
   // favBackRequest = Index 转发来的返回请求自增计数，FavoriteTab 消费后逐级回退
   @StorageLink('favCanGoBack') @Watch('syncBackState') favCanGoBack: boolean = false;
@@ -1925,6 +1946,11 @@ export struct FavoriteTab {
    * 内容高来源：Scroll + Column 全量渲染分支由 onAreaChange 实测；List 单列分支无内容总高接口 → 折算。
    */
   private onFavoriteThreadScroll(_x: number, _y: number): void {
+    // P0-2 归因打点：收藏页常驻宿主壳（其帧统计被归到 Index），滚动活跃必须在此登记，
+    // 否则「Index 下收藏 Tab 滚动」的样本会被误判成静止
+    PerfTrace.noteScroll();
+    // 沉浸式阅读补全：收藏夹二级页帖子列表（多列 WaterFlow / 单列 List 两分支共用本钩子）
+    this.favImmersiveScroll(this.threadScroller, this.threadImmersiveSensor);
     if (this.loading || this.loadingMore || !this.hasMore) {
       return;
     }
@@ -2756,6 +2782,120 @@ export struct FavoriteTab {
       || this.showBackupDialog
       || this.showExportDialog;
     AppStorage.setOrCreate<boolean>('favCanGoBack', canBack);
+    // 沉浸式阅读补全：任一导航形态/弹层状态变化都复位沉浸判定（防跨形态残留隐藏态与基线串位）
+    this.resetFavImmersive();
+  }
+
+  // ===== 「沉浸式阅读补全」交互（2026-09-29，设置 → 个性化 / AppStorage `immersiveReadExtra`）=====
+
+  /**
+   * 当前导航形态对应的判定器。⚠️ 分类内帖子页（selectedCategoryId>0，自定义分类收藏夹点开）的滚动容器
+   * 是 threadScroller（CategoryThreadsView，钩子传 threadImmersiveSensor）——必须与钩子一致返回
+   * threadImmersiveSensor，否则被 favImmersiveScroll 的防串扰守卫拦截（2026-09-29 真机反馈「不生效」根因二）。
+   */
+  private favActiveSensor(): ImmersiveReadSensor {
+    if (this.selectedForum.length > 0 || this.selectedCategoryId.length > 0) {
+      return this.threadImmersiveSensor;
+    }
+    if (this.categoryTab === FavCategoryTab.Custom) {
+      return this.categoryImmersiveSensor;
+    }
+    return this.folderImmersiveSensor;
+  }
+
+  /** 宿主底栏驱动（仅当前 Tab = 2 收藏 才写，防双常驻 Tab 互相污染；值变化才写） */
+  private setFavImmersiveHidden(hidden: boolean): void {
+    if (this.immersiveHidden === hidden) {
+      return;
+    }
+    this.immersiveHidden = hidden;
+    this.folderImmersiveSensor.setHidden(hidden);
+    this.categoryImmersiveSensor.setHidden(hidden);
+    this.threadImmersiveSensor.setHidden(hidden);
+    // TabIndex.Favorite = 2（Index.ets 私有枚举，此处以数值对齐）
+    if (this.currentMainTab === 2) {
+      AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', hidden);
+    }
+  }
+
+  /** 复位沉浸判定（形态切换 / 弹层开闭 / 切 Tab 回来）：清基线 + 恢复显示 */
+  private resetFavImmersive(): void {
+    this.folderImmersiveSensor.resetBaseline();
+    this.categoryImmersiveSensor.resetBaseline();
+    this.threadImmersiveSensor.resetBaseline();
+    if (this.immersiveHidden) {
+      this.folderImmersiveSensor.setHidden(false);
+      this.categoryImmersiveSensor.setHidden(false);
+      this.threadImmersiveSensor.setHidden(false);
+      this.immersiveHidden = false;
+      if (this.currentMainTab === 2) {
+        AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', false);
+      }
+    }
+  }
+
+  /**
+   * 各滚动面共用的沉浸判定入口。规则与 ThreadDetail 逐项同源（24 藏 / 12 露 + 置顶 8 恒显示 + 跳变 240）。
+   * 搜索态 / 编辑态（favEditing）不参与：强制恢复显示并清基线。
+   */
+  private favImmersiveScroll(scroller: Scroller, sensor: ImmersiveReadSensor): void {
+    if (!this.immersiveReadExtra || this.favEditing || this.searchMode || this.editMode) {
+      if (this.immersiveHidden) {
+        this.setFavImmersiveHidden(false);
+      }
+      return;
+    }
+    // 非当前形态的列表滚动不参与（如搜索结果列表复用 threadScroller 时）
+    if (sensor !== this.favActiveSensor()) {
+      return;
+    }
+    const act = sensor.feed(PrefetchGate.absoluteY(scroller));
+    if (act === 'hide') {
+      this.setFavImmersiveHidden(true);
+    } else if (act === 'show' || act === 'reset') {
+      this.setFavImmersiveHidden(false);
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即恢复显示 */
+  private onFavImmersiveExtraChanged(): void {
+    if (!this.immersiveReadExtra) {
+      this.resetFavImmersive();
+    }
+  }
+
+  /** 当前主 Tab 变化（@Watch）：切走时只清基线（底栏由 Index.switchTab 复位兜底）；切回时全量复位 */
+  private onFavCurrentMainTabChanged(): void {
+    if (this.currentMainTab === 2) {
+      this.resetFavImmersive();
+    } else {
+      this.folderImmersiveSensor.resetBaseline();
+      this.categoryImmersiveSensor.resetBaseline();
+      this.threadImmersiveSensor.resetBaseline();
+    }
+  }
+
+  /** 收藏编辑态变化（@Watch）：底栏被 favEditing 独立接管，进入时复位沉浸态防打架 */
+  private onFavEditingImmersiveChanged(): void {
+    if (this.favEditing) {
+      this.resetFavImmersive();
+    }
+  }
+
+  /** 顶栏隐藏位移（vp，向上）：= 槽位标题高（98 / 148）× 0.6，同「收回」口径 */
+  private favTopSink(): number {
+    return -(this.favTitleBarHeight() * IMMERSIVE_EXTRA_FLY_SCALE);
+  }
+
+  /** 显隐动画参数（藏 / 唤不对称）：取值以目标态为准 */
+  private favImmersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   /** BUG-01：消费 Index.onBackPress 转发的系统返回请求，按优先级逐级回退：弹层 → 编辑态 → 分类内 → 吧内 → 根视图（放行） */
@@ -3542,6 +3682,8 @@ export struct FavoriteTab {
       .onReachEnd(() => { this.loadMore(); })
       .onAppear(() => { this.restoreListScroll(this.folderScroller, this.folderScrollOffset); })
       .onAreaChange((oldValue: Area, newValue: Area) => { this.restoreListScroll(this.folderScroller, this.folderScrollOffset); })
+      // 沉浸式阅读补全（2026-09-29）：吧分类根列表滚动判定
+      .onScroll((_x: number, _y: number) => { this.favImmersiveScroll(this.folderScroller, this.folderImmersiveSensor); })
     }
     .layoutWeight(1)
     // §4.3 真机修复（2026-09-14）：Refresh 显式全宽——未挂 width 时遮罩（width('100%') 相对 Refresh 测量）
@@ -3663,7 +3805,7 @@ export struct FavoriteTab {
           // 在「clip(false) + expandSafeArea 沉浸 + 底部悬浮 Tab」场景下视口剔除错位 → 卡片整层消失
           // （docs/floor-vanish-viewport-fix.md）。按其结论换 **Scroll + Column 全量渲染** 绕过；
           // 多列观感由「列内独立堆叠 + 方案 B 带滞回最短列分桶」承担（与 §4.9 ThreadDetail 同款成熟结构）。
-          Scroll() {
+          Scroll(this.forumThreadScroller) {
             Column({ space: Spacing.md }) {
               Column().width('100%').height(FavoriteTab.THREAD_TOP_PLACEHOLDER)
               this.PostColumnsBlock(this.forumThreads(), false)
@@ -3683,6 +3825,11 @@ export struct FavoriteTab {
           .align(Alignment.TopStart)
           .edgeEffect(EdgeEffect.Spring)
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+          // 沉浸式阅读补全（2026-09-29）：吧分类收藏夹二级页此前是匿名 Scroll（无 scroller、无 onScroll），
+          // 沉浸判定在此页从未触发 —— 补绑 scroller + 挂滚动判定（与 CategoryThreadsView 同口径）
+          .onScroll((_x: number, _y: number) => {
+            this.favImmersiveScroll(this.forumThreadScroller, this.threadImmersiveSensor);
+          })
         }
       }
       .width('100%')
@@ -3943,6 +4090,8 @@ export struct FavoriteTab {
         .clip(false)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         .onReachEnd(() => { this.loadMore(); })
+        // 沉浸式阅读补全（2026-09-29）：自定义分类根列表滚动判定（平板多列档）
+        .onScroll((_x: number, _y: number) => { this.favImmersiveScroll(this.categoryScroller, this.categoryImmersiveSensor); })
       } else {
       List({ space: Spacing.md, scroller: this.categoryScroller }) {
         ListItem() {
@@ -3995,6 +4144,8 @@ export struct FavoriteTab {
       .onReachEnd(() => { this.loadMore(); })
       .onAppear(() => { this.restoreListScroll(this.categoryScroller, this.categoryScrollOffset); })
       .onAreaChange((oldValue: Area, newValue: Area) => { this.restoreListScroll(this.categoryScroller, this.categoryScrollOffset); })
+      // 沉浸式阅读补全（2026-09-29）：自定义分类根列表滚动判定（手机单列档）
+      .onScroll((_x: number, _y: number) => { this.favImmersiveScroll(this.categoryScroller, this.categoryImmersiveSensor); })
       // v1.8 拖拽排序：前置固定项（占位/新建/未分类）不响应拖拽，仅自定义分类可拖
       .onItemDragStart((event: ItemDragInfo, itemIndex: number) => {
         // v1.19 防闪退：拖拽激活帧内**不要**改被拖源 ListItem 自身高度、**不要** animateTo List padding。
@@ -5111,6 +5262,11 @@ export struct FavoriteTab {
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
     .zIndex(14)
+    // 沉浸阅读补全（2026-09-29）：兜底路径整行上移 + 淡出 + 禁用命中（与槽位路径同节奏）
+    .translate({ y: this.immersiveHidden ? this.favTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.favImmersiveAnim())
   }
 
   /** 槽内 44 圆钮（返回/搜索）：Button 必须显式 backgroundColor(Color.Transparent) 清默认品牌蓝填充，
@@ -5326,6 +5482,12 @@ export struct FavoriteTab {
       }
     }
     .width('100%')
+    // 沉浸阅读补全（2026-09-29）：五形态按钮行 + 分类胶囊行整体上移约 0.6 倍槽高 + 淡出 + 禁用命中。
+    // 槽高固定（favTitleBarHeight）不参与内容布局（列表首项自带让位），位移不影响正文排布。
+    .translate({ y: this.immersiveHidden ? this.favTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.favImmersiveAnim())
   }
 
   /** 帖流页顶部满宽渐变层：铺在内容底层，让顶部渐变左右贯通，不被卡片圆角裁切 */
@@ -5425,6 +5587,11 @@ export struct FavoriteTab {
     .zIndex(13)
     // 点开/返回收藏夹时随内容区同步左让位/回位，避免内容从按钮条下方穿过的突兀感
     .transition(this.firstMount ? TransitionEffect.IDENTITY : this.listBaseTransition())
+    // 沉浸阅读补全（2026-09-29）：兜底路径胶囊行随 TopBar 同节奏上移 + 淡出 + 禁用命中
+    .translate({ y: this.immersiveHidden ? this.favTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.favImmersiveAnim())
   }
 
   /** v1.15.6 分类管理操作行（居中卡片风格）：系统 SymbolGlyph 图标 + 标题 + 右箭头，透明底 + 行间分隔线，危险操作用 Theme.danger */

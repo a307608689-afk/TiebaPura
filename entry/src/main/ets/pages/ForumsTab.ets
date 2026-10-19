@@ -18,7 +18,7 @@
 
 import { common } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
-import { display, LengthMetrics } from '@kit.ArkUI';
+import { curves, display, LengthMetrics } from '@kit.ArkUI';
 import { AuthManager } from '../service/AuthManager';
 import { TiebaService } from '../service/TiebaService';
 import { AutoSignManager, AutoSignProgress, AutoSignStage, AutoSignResult } from '../service/AutoSignManager';
@@ -30,6 +30,10 @@ import { Theme, Spacing, Radius, isDarkMode, setDarkMode, fs, ImmMaterial, isWid
 import { Haptic } from '../common/Haptic';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { compareByName } from '../common/Pinyin';
+import {
+  ImmersiveReadSensor, IMMERSIVE_EXTRA_FLY_SCALE, IMMERSIVE_EXTRA_HIDE_MS, IMMERSIVE_EXTRA_SHOW_MS,
+  IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING
+} from '../common/ImmersiveReadSensor';
 import { LoadingView, EmptyView, ErrorView } from '../components/CommonComponents';
 
 /**
@@ -81,6 +85,25 @@ interface RecentForumItem {
   lastVisit: string;
   avatar?: string;
   forumId?: string;
+}
+
+/**
+ * 足迹列表值比较（P1-1，2026-09-29 丢帧治理）：
+ * loadRecentForums 每次 forumsRefreshRequest（返回本页 / 切回本 Tab / 下拉刷新）都会重建一份
+ * 全新数组（元素也是新对象），原实现无条件写 @State → 足迹整行重建。
+ * 真机实测「从吧主页返回进吧」窗口 fps 76 / d33=2。全字段一致即视为无变化，直接不写状态。
+ */
+function recentForumsEqual(a: RecentForumItem[], b: RecentForumItem[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i: number = 0; i < a.length; i++) {
+    if (a[i].name !== b[i].name || a[i].lastVisit !== b[i].lastVisit
+      || (a[i].forumId ?? '') !== (b[i].forumId ?? '') || (a[i].avatar ?? '') !== (b[i].avatar ?? '')) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -450,6 +473,15 @@ export struct ForumsTab {
   @StorageLink('forumsRefreshRequest') @Watch('onForumsRefresh') forumsRefreshRequest: number = 0;
   // 关注/取关广播（2026-09-22）：吧主页 ThreadList 关注/取关成功后递增，本页静默重拉「我关注的吧」（不闪 Loading）
   @StorageLink('forumFollowsChanged') @Watch('onFollowsChangedTick') forumFollowsChanged: number = 0;
+  // ===== 「沉浸式阅读补全」（2026-09-29，设置 → 个性化）=====
+  /** 设置项真源：AppStorage `immersiveReadExtra`（独立开关，默认关） */
+  @StorageLink('immersiveReadExtra') @Watch('onForumsImmersiveExtraChanged') immersiveReadExtra: boolean = false;
+  /** 当前主 Tab 真源（Index.switchTab 维护）：仅自己为当前 Tab（=1）时才允许驱动宿主底栏 */
+  @StorageLink('currentMainTab') currentMainTab: number = 0;
+  /** 沉浸态：true = 顶栏三钮与宿主底栏已藏起。只存页面局部 @State（本页随 Tab 切换卸载，状态自然复位） */
+  @State immersiveHidden: boolean = false;
+  /** 滚动判定器（规则与 ThreadDetail 逐项同源） */
+  private forumsImmersiveSensor: ImmersiveReadSensor = new ImmersiveReadSensor(false);
 
   /**
    * 一键签到弹窗控制器（系统 CustomDialog + API 26 沉浸光感）。
@@ -555,6 +587,72 @@ export struct ForumsTab {
     } else {
       this.forumMenuController.close();
     }
+  }
+
+  // ===== 「沉浸式阅读补全」交互（2026-09-29，设置 → 个性化 / AppStorage `immersiveReadExtra`）=====
+
+  /**
+   * 关注吧列表滚动 → 沉浸显隐判定。规则与 ThreadDetail 逐项同源（24 藏 / 12 露 + 置顶 8 恒显示 + 跳变 240 丢弃）。
+   * 本页为条件挂载 Tab：离开即卸载，本地状态自然复位；切回时 Index.switchTab 已把宿主底栏复位。
+   */
+  private forumsImmersiveScroll(): void {
+    if (!this.immersiveReadExtra) {
+      if (this.immersiveHidden) {
+        this.setForumsImmersiveHidden(false);
+      }
+      return;
+    }
+    let pos: number = 0;
+    try {
+      pos = this.forumsScroller.currentOffset().yOffset;
+    } catch (e) {
+      return;
+    }
+    const act = this.forumsImmersiveSensor.feed(pos);
+    if (act === 'hide') {
+      this.setForumsImmersiveHidden(true);
+    } else if (act === 'show' || act === 'reset') {
+      this.setForumsImmersiveHidden(false);
+    }
+  }
+
+  /** 翻转沉浸态（本地 @State，值变化才写）+ 驱动宿主底栏（仅当前 Tab = 1 进吧 才写） */
+  private setForumsImmersiveHidden(hidden: boolean): void {
+    if (this.immersiveHidden === hidden) {
+      return;
+    }
+    this.immersiveHidden = hidden;
+    this.forumsImmersiveSensor.setHidden(hidden);
+    // TabIndex.Forums = 1（Index.ets 私有枚举，此处以数值对齐）
+    if (this.currentMainTab === 1) {
+      AppStorage.setOrCreate<boolean>('mainBarImmersiveHidden', hidden);
+    }
+  }
+
+  /** 设置开关变化（@Watch）：关掉开关立即恢复显示 */
+  private onForumsImmersiveExtraChanged(): void {
+    if (!this.immersiveReadExtra) {
+      this.forumsImmersiveSensor.resetBaseline();
+      if (this.immersiveHidden) {
+        this.setForumsImmersiveHidden(false);
+      }
+    }
+  }
+
+  /** 顶栏隐藏位移（vp，向上）：= 官方标题栏高 98 × 0.6 ≈ −59（同「收回」口径，其余交给 opacity 淡出） */
+  private forumsTopSink(): number {
+    return -(FORUMS_TITLE_BAR_HEIGHT * IMMERSIVE_EXTRA_FLY_SCALE);
+  }
+
+  /** 显隐动画参数（藏 / 唤不对称）：取值以目标态为准 */
+  private forumsImmersiveAnim(): AnimateParam {
+    if (this.immersiveHidden) {
+      return { duration: IMMERSIVE_EXTRA_HIDE_MS, curve: Curve.EaseIn };
+    }
+    return {
+      duration: IMMERSIVE_EXTRA_SHOW_MS,
+      curve: curves.springMotion(IMMERSIVE_EXTRA_SPRING_RESPONSE, IMMERSIVE_EXTRA_SPRING_DAMPING)
+    };
   }
 
   aboutToAppear(): void {
@@ -1102,7 +1200,10 @@ export struct ForumsTab {
         }
       }
       if (recents.length > 0) {
-        this.recentForums = recents;
+        // P1-1：内容与当前足迹完全一致则零操作（见 recentForumsEqual 注释）
+        if (!recentForumsEqual(this.recentForums, recents)) {
+          this.recentForums = recents;
+        }
       }
     } catch (e) {
       // 保留默认数据
@@ -1497,6 +1598,11 @@ export struct ForumsTab {
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
     .zIndex(14)
+    // 沉浸阅读补全（2026-09-29）：兜底路径顶栏整行上移 + 淡出 + 禁用命中
+    .translate({ y: this.immersiveHidden ? this.forumsTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.forumsImmersiveAnim())
   }
 
   /**
@@ -1588,6 +1694,11 @@ export struct ForumsTab {
     .width('100%')
     .padding({ left: Spacing.lg, right: Spacing.lg, top: 44, bottom: 10 })
     .backgroundColor(Color.Transparent)
+    // 沉浸阅读补全（2026-09-29）：槽高固定 98 不参与内容布局（列表自带让位），整行上移 + 淡出
+    .translate({ y: this.immersiveHidden ? this.forumsTopSink() : 0 })
+    .opacity(this.immersiveHidden ? 0 : 1)
+    .enabled(!this.immersiveHidden)
+    .animation(this.forumsImmersiveAnim())
   }
 
   /**
@@ -2088,6 +2199,8 @@ export struct ForumsTab {
       .scrollBar(BarState.Off)
       .clip(false)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      // 沉浸式阅读补全（2026-09-29）：关注吧列表滚动判定
+      .onScroll((_x: number, _y: number) => { this.forumsImmersiveScroll(); })
       }
       .width('100%')
       .height('calc(100% - 90vp)')

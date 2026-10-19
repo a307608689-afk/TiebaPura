@@ -16,14 +16,19 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { AbilityConstant, UIAbility, Want, common, ConfigurationConstant, Configuration } from '@kit.AbilityKit';
+import { AbilityConstant, UIAbility, Want, common, ConfigurationConstant, Configuration, errorManager } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import { preferences } from '@kit.ArkData';
+import { fileIo } from '@kit.CoreFileKit';
+import { process } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Theme, setDarkMode as applyThemeDarkMode, initDarkMode, syncDarkFromConfig, isWideBarDevice, isLargeFoldDevice, isWideBarFlatDevice } from '../common/Theme';
 import { UsageHabitsManager } from '../service/UsageHabitsManager';
 import { CacheManager, STORE_NAME } from '../cache/CacheManager';
+import { ImageCache } from '../cache/ImageCache';
+import { FollowFeedStore } from '../service/FollowFeedStore';
 import { CACHE_KEY } from '../common/Constants';
+import { PerfTrace } from '../common/PerfTrace';
 
 const TAG: string = 'EntryAbility';
 
@@ -40,6 +45,9 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, 'Ability onCreate');
+    // §CRASHGUARD（2026-09-29 稳定性批次）：崩溃兜底——启动时核对上会话异常退出标记，
+    // 并注册本会话的未捕获异常记录器（落盘日志 + 标记，下次启动可见）。纯诊断/护栏，不改任何业务行为。
+    this.setupCrashGuard();
     // 关键时序：在首帧渲染前 fire-and-forget 异步把 Application Configuration 同步到 manual 值。
     // 此前 onWindowStageCreate loadContent 回调里调 setColorMode 会有 setColorMode 异步窗口与
     // onConfigurationUpdate 竞态（回调里 Configuration.colorMode 仍是旧值，按旧值再 setColorMode
@@ -76,6 +84,100 @@ export default class EntryAbility extends UIAbility {
 
   onDestroy(): void {
     hilog.info(0x0000, TAG, 'Ability onDestroy');
+    // §FLUSHQ：销毁前把防抖窗口内未落盘的缓存写入强制刷盘
+    CacheManager.getInstance().flushNow();
+  }
+
+  /**
+   * §CRASHGUARD：未捕获异常兜底（2026-09-29）。
+   * - 启动时读上会话崩溃标记（tieba_diag 偏好库），存在则 hilog 留痕并清除（用户无感知）；
+   * - 注册 errorManager.on('error')：本会话未捕获异常时同步写标记 + 落盘崩溃日志
+   *   （<filesDir>/crash_logs/crash_<ts>.log，保留最近 3 份），供后续 hilog/文件取证定位。
+   * 刻意不做激进自愈（清缓存/重置数据）：崩溃原因未知时清数据既可能误伤，也可能掩盖问题。
+   */
+  private setupCrashGuard(): void {
+    const DIAG_STORE: string = 'tieba_diag';
+    try {
+      const prefs: preferences.Preferences =
+        preferences.getPreferencesSync(this.context, { name: DIAG_STORE });
+      const lastCrash: string = prefs.getSync('crash_marker_ts', '') as string;
+      if (lastCrash.length > 0) {
+        hilog.warn(0x0000, TAG, '[CRASHGUARD] previous session exited abnormally, ts=%{public}s', lastCrash);
+        try {
+          prefs.deleteSync('crash_marker_ts');
+          prefs.flush().catch((): void => {});
+        } catch (_) { /* 清标记失败无碍 */ }
+      }
+    } catch (e) {
+      hilog.error(0x0000, TAG, '[CRASHGUARD] marker check failed: %{public}s', JSON.stringify(e));
+    }
+    try {
+      // globalErrorOccurred（API18+）：进程内任意线程的未捕获异常。注意官方语义——
+      // 观察者捕获后应用不再自动退出，故记录完成后按官方建议同步退出，保持「崩溃即退出」语义
+      // （否则异常被吞、页面可能卡死在残破状态）。
+      errorManager.on('globalErrorOccurred', (reason: errorManager.GlobalError): void => {
+        this.recordGlobalError(reason);
+        process.exit(-1);
+      });
+      // globalUnhandledRejectionDetected：未捕获的 Promise 拒绝（非致命，只记录不退出）
+      errorManager.on('globalUnhandledRejectionDetected', (reason: errorManager.GlobalError): void => {
+        this.recordGlobalError(reason);
+      });
+    } catch (e) {
+      hilog.error(0x0000, TAG, '[CRASHGUARD] errorManager.on failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /** 崩溃记录：写下次启动可见的标记 + 落盘崩溃日志（同步 IO：崩溃时刻不能依赖异步调度） */
+  private recordGlobalError(err: Error): void {
+    try {
+      const prefs: preferences.Preferences =
+        preferences.getPreferencesSync(this.context, { name: 'tieba_diag' });
+      prefs.putSync('crash_marker_ts', `${Date.now()}`);
+      prefs.flush().catch((): void => {});
+    } catch (_) { /* 标记失败尽力而为 */ }
+    this.writeCrashLogFile(err);
+  }
+
+  /** 崩溃日志落盘（同步 IO：崩溃时刻不能再依赖异步调度），保留最近 3 份 */
+  private writeCrashLogFile(err: Error): void {
+    try {
+      const dir: string = `${this.context.filesDir}/crash_logs`;
+      try {
+        fileIo.mkdirSync(dir, true);
+      } catch (_) { /* 已存在 */ }
+      const path: string = `${dir}/crash_${Date.now()}.log`;
+      const f: fileIo.File =
+        fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+      try {
+        fileIo.writeSync(f.fd,
+          `ts=${Date.now()}\nname=${err.name ?? ''}\nmessage=${err.message ?? ''}\nstack=${err.stack ?? ''}\n`);
+      } finally {
+        fileIo.closeSync(f);
+      }
+      // 只保留最近 3 份
+      const names: string[] = fileIo.listFileSync(dir).filter((n: string): boolean => n.startsWith('crash_')).sort();
+      while (names.length > 3) {
+        try {
+          fileIo.unlinkSync(`${dir}/${names.shift()}`);
+        } catch (_) {
+          break;
+        }
+      }
+    } catch (e) { /* 崩溃记录失败不影响退出流程 */ }
+  }
+
+  /**
+   * 系统内存压力回调（2026-09-29 稳定性批次）：分发到图片内存缓存与关注流待展示池收缩。
+   * 纯后台逻辑，降低后台驻留被杀概率，零 UI 影响。
+   */
+  onMemoryLevel(level: AbilityConstant.MemoryLevel): void {
+    const lv: number = level as number;
+    ImageCache.onSystemMemoryLevel(lv);
+    const feed: FollowFeedStore | undefined = AppStorage.get<FollowFeedStore>('followFeedStore');
+    if (feed) {
+      feed.onSystemMemoryLevel(lv);
+    }
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
@@ -299,5 +401,11 @@ export default class EntryAbility extends UIAbility {
 
   onBackground(): void {
     hilog.info(0x0000, TAG, 'Ability onBackground');
+    // §FLUSHQ：退后台时把防抖窗口内未落盘的缓存写入强制刷盘（300ms 内的写入不丢）
+    CacheManager.getInstance().flushNow();
+    // §P0-2：把 FSTAT 环形缓冲落盘（filesDir/perf_trace.log），解决 hilog 窗口期太短
+    // 抓不全滚动期日志的问题；同时打印一次回捞命令，用户可直接 hdc file recv 取回。
+    PerfTrace.logPullHint(this.context);
+    PerfTrace.flush(this.context);
   }
 }

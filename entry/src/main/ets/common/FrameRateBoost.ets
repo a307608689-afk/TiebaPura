@@ -38,6 +38,7 @@
 
 import { displaySync } from '@kit.ArkGraphics2D';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { PerfTrace } from './PerfTrace';
 
 const TAG = 'FrameRateBoost';
 const LOG_DOMAIN = 0x0000;
@@ -47,9 +48,87 @@ const BOOST_ENABLED: boolean = true;
 /** 拉档目标帧率：min/expected/max 三值同锁（expected 是系统优先满足的字段） */
 const TARGET_FPS: number = 120;
 
+/** 帧统计采样开关（2026-09-28 量化定位「越滑越卡」）：false 时零开销。
+ *  统计的是 displaySync 帧回调在主线程的送达间隔 —— 主线程（ArkTS 构建/布局/GC）卡顿
+ *  会直接体现为间隔拉长；GPU 侧丢帧由系统合成器吸收，不在此口径内。 */
+const FSTAT_ENABLED: boolean = true;
+const FSTAT_LOG_DOMAIN = 0x0000;
+const FSTAT_TAG = 'FSTAT';
+
 class FrameRateBoostManager {
   private ds: displaySync.DisplaySync | undefined = undefined;
   private refCount: number = 0;
+
+  // ===== FSTAT 滚动窗口统计（2s 一条日志）=====
+  private statLastTs: number = 0;
+  private statWindowStart: number = 0;
+  private statFrames: number = 0;
+  private statMaxGap: number = 0;
+  /** 本窗口最差帧的**起始时刻**（epoch ms）：用于离线把这一帧拿去原始 hilog 里
+   *  检索「那一瞬间应用在跑什么」（解码/映射/GC/图片落地/系统抖动），
+   *  使长帧归因从「相关性推测」升级为「时刻级证据」。 */
+  private statMaxGapAt: number = 0;
+  /** 帧间隔超预算计数（2026-09-29 P0-2）：阈值按刷新率档的帧预算取，用于区分
+   *  「轻微超预算」与「真卡死」——d8 >8.3ms 即 120Hz 单帧超预算，d17 掉到 60Hz 档，
+   *  d33 掉到 30Hz 档，d50 / d100 沿用旧 jank50 / jank100 口径（保持与历史日志可对照）。 */
+  private statD8: number = 0;
+  private statD17: number = 0;
+  private statD33: number = 0;
+  private statD50: number = 0;
+  private statD100: number = 0;
+
+  private onFrameTick(): void {
+    const now: number = Date.now();
+    if (this.statLastTs > 0) {
+      const gap: number = now - this.statLastTs;
+      if (gap > this.statMaxGap) {
+        this.statMaxGap = gap;
+        // 记「顿帧起点」而非终点：起点是主线程开始忙的时刻，正是要去日志里对齐的那一瞬
+        this.statMaxGapAt = now - gap;
+      }
+      if (gap > 8.3) {
+        this.statD8++;
+      }
+      if (gap > 16.7) {
+        this.statD17++;
+      }
+      if (gap > 33.3) {
+        this.statD33++;
+      }
+      if (gap > 50) {
+        this.statD50++;
+      }
+      if (gap > 100) {
+        this.statD100++;
+      }
+    } else {
+      this.statWindowStart = now;
+    }
+    this.statLastTs = now;
+    this.statFrames++;
+    const win: number = now - this.statWindowStart;
+    if (win >= 2000) {
+      const fps: number = win > 0 ? Math.round(this.statFrames * 1000 / win) : 0;
+      // 上下文段（页面/主 Tab/是否在滚动/窗口内重活事件计数）由 PerfTrace 提供并清零，
+      // 使同一条日志即可归因「哪个页面 × 哪个 Tab × 滚动还是静止 × 哪类事件」。
+      const ctx: string = PerfTrace.contextSummary();
+      const at: string = this.statMaxGapAt > 0 ? PerfTrace.stampOf(this.statMaxGapAt) : '-';
+      const line: string =
+        `fps=${fps} max=${this.statMaxGap} at=${at} d8=${this.statD8} d17=${this.statD17} `
+          + `d33=${this.statD33} d50=${this.statD50} d100=${this.statD100} ${ctx} win=${win}`;
+      hilog.info(FSTAT_LOG_DOMAIN, FSTAT_TAG, '%{public}s', line);
+      PerfTrace.appendLine(`${PerfTrace.stamp()} ${line}`);
+      this.statFrames = 0;
+      this.statMaxGap = 0;
+      this.statMaxGapAt = 0;
+      this.statD8 = 0;
+      this.statD17 = 0;
+      this.statD33 = 0;
+      this.statD50 = 0;
+      this.statD100 = 0;
+      this.statWindowStart = now;
+    }
+  }
 
   /**
    * 申请拉档（引用计数 +1）。首笔申请时创建 displaySync 实例并启动；
@@ -71,8 +150,11 @@ class FrameRateBoostManager {
           expected: TARGET_FPS,
           max: TARGET_FPS,
         });
-        // 必须注册 frame 回调实例才有实际拉档意义；回调体保持空实现（120 次/秒的空转可忽略）
+        // 必须注册 frame 回调实例才有实际拉档意义；回调体做帧间隔统计（FSTAT 开关控制，空转开销可忽略）
         this.ds.on('frame', () => {
+          if (FSTAT_ENABLED) {
+            this.onFrameTick();
+          }
         });
       }
       this.ds.start();

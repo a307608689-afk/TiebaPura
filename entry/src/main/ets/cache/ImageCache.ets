@@ -151,6 +151,39 @@ export class ImageCache {
   static DEBUG_LOG_ENABLED: boolean = false;
 
   /**
+   * 系统内存压力响应（2026-09-29 稳定性批次，EntryAbility.onMemoryLevel 分发）。
+   * 纯后台逻辑、零 UI 影响：内存吃紧时收缩内存态结构，降低被系统 LMK 整杀/后台杀的概率。
+   * - MODERATE(1)：内存 URL→file:// 映射裁掉一半（Map 迭代序=插入序，最旧的先出）；
+   * - CRITICAL(2)：memCache 全清 + verifiedUrls 全清（下次命中走磁盘重验，正确性不受影响——
+   *   缓存文件本体在磁盘，不清不损，只是多用一次校验）。
+   * inflight 不能清：清了会让在途下载的写盘结果失去合并点，并发重复下载。
+   */
+  static onSystemMemoryLevel(level: number): void {
+    try {
+      if (level >= 2) {
+        if (ImageCache.memCache.size > 0) {
+          ImageCache.memCache.clear();
+        }
+        if (ImageCache.verifiedUrls.size > 0) {
+          ImageCache.verifiedUrls.clear();
+        }
+        console.info(`[MEMLEVEL] ImageCache CRITICAL: memCache/verifiedUrls cleared`);
+      } else if (level === 1 && ImageCache.memCache.size > 64) {
+        const drop: number = Math.floor(ImageCache.memCache.size / 2);
+        let dropped: number = 0;
+        for (const key of ImageCache.memCache.keys()) {
+          if (dropped >= drop) {
+            break;
+          }
+          ImageCache.memCache.delete(key);
+          dropped++;
+        }
+        console.info(`[MEMLEVEL] ImageCache MODERATE: memCache trimmed -${dropped}`);
+      }
+    } catch (e) { /* 内存响应失败不影响主流程 */ }
+  }
+
+  /**
    * 调试文件日志：写入 <cache>/img_cache/img_debug.log。
    * 模拟器上 unsigned HAP 以 debug_hap 模式运行，hilog 输出被 SELinux 屏蔽，
    * 改用应用自有 cache 目录落盘，hdc 直接拉取分析，不受日志系统限制。

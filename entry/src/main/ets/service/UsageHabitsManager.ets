@@ -73,9 +73,12 @@ export class UsageHabitsManager {
       // 「帖子沉浸式阅读」：缺省 null → 关闭，老用户升级零行为变化
       const savedImmersiveRead = await cache.get(CACHE_KEY.IMMERSIVE_READ);
       AppStorage.setOrCreate('immersiveReading', savedImmersiveRead === '1');
-      // 「帖子极速开启」：缺省 null → 开启（用户拍板默认开启），仅老用户显式关闭过才保持关
+      // 「沉浸式阅读补全」（独立开关项，不与主开关联挂）：缺省 null → 关闭，老用户升级零行为变化
+      const savedImmersiveExtra = await cache.get(CACHE_KEY.IMMERSIVE_READ_EXTRA);
+      AppStorage.setOrCreate('immersiveReadExtra', savedImmersiveExtra === '1');
+      // 「帖子极速开启」：缺省 null → 关闭（用户拍板默认关闭），仅显式开启过的用户保持开
       const savedFastOpen = await cache.get(CACHE_KEY.THREAD_FEED_PREFETCH);
-      AppStorage.setOrCreate('threadFastOpen', savedFastOpen !== '0');
+      AppStorage.setOrCreate('threadFastOpen', savedFastOpen === '1');
       // 「仅 WiFi 启用」：缺省 null → 开启（用户拍板默认开启），主开关开启时生效
       const savedFastWifi = await cache.get(CACHE_KEY.THREAD_FAST_WIFI);
       AppStorage.setOrCreate('threadFastWifi', savedFastWifi !== '0');
@@ -92,7 +95,8 @@ export class UsageHabitsManager {
       AppStorage.setOrCreate('autoRotateOff', false);
       AppStorage.setOrCreate('columnMode', 0);
       AppStorage.setOrCreate('immersiveReading', false);
-      AppStorage.setOrCreate('threadFastOpen', true);
+      AppStorage.setOrCreate('immersiveReadExtra', false);
+      AppStorage.setOrCreate('threadFastOpen', false);
       AppStorage.setOrCreate('threadFastWifi', true);
       AppStorage.setOrCreate('forumDefaultSort', 0);
     }
@@ -214,11 +218,27 @@ export class UsageHabitsManager {
   }
 
   /**
+   * 当前是否开启「沉浸式阅读补全」（独立开关项，不与主开关联挂）：开启后首页 / 收藏页 /
+   * 收藏夹二级页 / 吧主页向下滑动自动收起顶栏与底栏。默认 false，保持既有行为。
+   * 真源为 AppStorage（各页用 @StorageLink 直接同步），manager 只负责冷启动恢复与落盘。
+   */
+  isImmersiveReadExtra(): boolean {
+    return AppStorage.get<boolean>('immersiveReadExtra') ?? false;
+  }
+
+  /** 设置「沉浸式阅读补全」：立即更新 AppStorage 并落盘（页面局部隐藏态纪律与主开关相同）。 */
+  async setImmersiveReadExtra(enabled: boolean): Promise<void> {
+    AppStorage.setOrCreate('immersiveReadExtra', enabled);
+    this.persistImmersiveReadExtra(enabled).catch(() => {
+    });
+  }
+
+  /**
    * 当前是否开启「帖子极速开启」（feed 首屏前 3 卡详情+图片预取）。默认 false（关闭），用户拍板。
    * 真源为 AppStorage（服务层预取入口直接读），manager 只负责冷启动恢复与落盘。
    */
   isThreadFastOpen(): boolean {
-    return AppStorage.get<boolean>('threadFastOpen') ?? true;
+    return AppStorage.get<boolean>('threadFastOpen') ?? false;
   }
 
   /** 设置「帖子极速开启」：立即更新 AppStorage 并落盘。 */
@@ -315,6 +335,19 @@ export class UsageHabitsManager {
       const cache = CacheManager.getInstance();
       await cache.init(this.context);
       await cache.put(CACHE_KEY.IMMERSIVE_READ, enabled ? '1' : '0');
+    } catch (e) {
+      // 忽略持久化错误
+    }
+  }
+
+  private async persistImmersiveReadExtra(enabled: boolean): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const cache = CacheManager.getInstance();
+      await cache.init(this.context);
+      await cache.put(CACHE_KEY.IMMERSIVE_READ_EXTRA, enabled ? '1' : '0');
     } catch (e) {
       // 忽略持久化错误
     }

@@ -164,6 +164,13 @@ export interface CacheKeys {
    */
   IMMERSIVE_READ: string;
   /**
+   * 「沉浸式阅读补全」开关（'1' = 开启，缺省 → 关闭）：独立开关项，与主开关不联挂。
+   * 覆盖首页 HomeTab（顶部胶囊 + 宿主底栏）、收藏页 Favorite 根态（TopBar + 分类胶囊 + 宿主底栏）、
+   * 收藏夹二级页（TopBar + 宿主底栏）、吧主页 ThreadList（顶栏 + 排序栏 + 加号）。
+   * 缺省 null → 关闭，老用户升级零行为变化。
+   */
+  IMMERSIVE_READ_EXTRA: string;
+  /**
    * 「吧主页默认进入界面」档位（'1' = 最新；缺省/其他 = 热门）。
    * 吧主页 ThreadList 打开时按本档位初始化 selectedSort；缺省 null → 热门，老用户升级零回归。
    */
@@ -217,6 +224,7 @@ export const CACHE_KEY: CacheKeys = {
   PRIVACY_AGREED: 'tieba_privacy_agreed',
   COLUMN_MODE: 'tieba_column_mode',
   IMMERSIVE_READ: 'tieba_immersive_read',
+  IMMERSIVE_READ_EXTRA: 'tieba_immersive_read_extra',
   FORUM_DEFAULT_SORT: 'tieba_forum_default_sort',
   LATEST_SORT_MODE: 'tieba_latest_sort_mode',
 };

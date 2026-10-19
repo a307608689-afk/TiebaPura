@@ -55,6 +55,28 @@ export class CacheManager {
   private initStarted: boolean = false;
   /** 在 init 收敛前发起、正在等待 store 就绪的读操作回调 */
   private readyWaiters: Array<() => void> = [];
+  /**
+   * §FLUSHQ（2026-09-29）flush 防抖：put/delete 只写内存，flush 延迟合并到 300ms 窗口统一落盘。
+   * 背景：原来每次 put/delete 都 await flush()——FollowFeedStore 池/游标/已消费、详情磁盘缓存等
+   * 高频小写每次都触发一次整库落盘，是主线程外最密集的 I/O 尖峰。Preferences 实例内读 always
+   * 命中内存副本（同会话读语义不变），只有跨进程/掉电恢复受 300ms 窗口影响——缓存数据可接受。
+   */
+  private flushTimer: number = -1;
+  private flushDirty: boolean = false;
+  /** flush 防抖窗口 */
+  private static readonly FLUSH_DEBOUNCE_MS: number = 300;
+
+  // ---- §T1（2026-09-30）prune 节流与延迟：把「全表扫描」从滚动帧上挪开 ----
+  /** prune 最小执行间隔（ms）：原触发点约 5s 一次（真机 95s 滚动窗口内实测 19 次）→ 最长 60s 一次 */
+  private static readonly PRUNE_MIN_INTERVAL_MS: number = 60000;
+  /** prune 触发后的延迟窗口（ms）：调用点正是详情落盘的那一帧，推后执行以离开该帧 */
+  private static readonly PRUNE_DELAY_MS: number = 1200;
+  /** 上次 prune **实际执行**的时刻（0 = 本会话尚未执行过，首次触发即放行） */
+  private lastPruneAt: number = 0;
+  /** 待执行的 prune 定时器（-1 = 无待办） */
+  private pruneTimer: number = -1;
+  private pendingPrunePrefix: string = '';
+  private pendingPruneMax: number = 0;
 
   static getInstance(): CacheManager {
     if (CacheManager.instance === null) {
@@ -133,9 +155,43 @@ export class CacheManager {
     }
     try {
       await this.store.put(key, value);
-      await this.store.flush();
+      // §FLUSHQ：不逐次 flush，挂 300ms 防抖统一落盘（见类头注释）
+      this.scheduleFlush();
     } catch (e) {
       hilog.error(0x0000, TAG, 'put error: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /** 标记脏并挂防抖 flush：窗口内多次写只落一次盘 */
+  private scheduleFlush(): void {
+    this.flushDirty = true;
+    if (this.flushTimer >= 0) {
+      return;
+    }
+    this.flushTimer = setTimeout((): void => {
+      this.flushTimer = -1;
+      this.flushNow();
+    }, CacheManager.FLUSH_DEBOUNCE_MS);
+  }
+
+  /**
+   * 立即落盘（清掉未触发的防抖定时器）。
+   * 调用点：应用退后台 / 销毁（EntryAbility onBackground/onDestroy），
+   * 防止用户切走后 300ms 窗口内的缓存写入丢失。
+   */
+  async flushNow(): Promise<void> {
+    if (this.flushTimer >= 0) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = -1;
+    }
+    if (this.store === null || !this.flushDirty) {
+      return;
+    }
+    this.flushDirty = false;
+    try {
+      await this.store.flush();
+    } catch (e) {
+      hilog.error(0x0000, TAG, 'flushNow error: %{public}s', JSON.stringify(e));
     }
   }
 
@@ -167,14 +223,20 @@ export class CacheManager {
       return result;
     }
     try {
-      const all = await this.store.getAll() as Map<string, preferences.ValueType>;
-      all.forEach((value: preferences.ValueType, key: string) => {
+      // §T1 修复（2026-09-30）：SDK 的 `getAll(): Promise<Object>` 返回的是**普通对象**，
+      // 此处原先 `as Map<string, ValueType>` 后调用 `Map.forEach` ⇒ 必然抛 TypeError，被
+      // 外层 catch 吞成 `getAllByPrefix error: {}`。也就是说本方法**从未返回过任何条目**，
+      // 「一键签到」的「今日已签到」过滤一直在静默失效。改为 Record + Object.keys 迭代。
+      const all = await this.store.getAll() as Record<string, preferences.ValueType>;
+      const keys: string[] = Object.keys(all);
+      for (const key of keys) {
+        const value: preferences.ValueType = all[key];
         if (key.startsWith(prefix) && typeof value === 'string') {
           result.set(key, value as string);
         }
-      });
+      }
     } catch (e) {
-      hilog.error(0x0000, TAG, 'getAllByPrefix error: %{public}s', JSON.stringify(e));
+      hilog.error(0x0000, TAG, 'getAllByPrefix error: %{public}s', CacheManager.errText(e));
     }
     return result;
   }
@@ -193,45 +255,157 @@ export class CacheManager {
   /**
    * 按 key 前缀清理缓存条目：超上限时按 expireAt 删除最旧（含过期清理），
    * 防止详情等高频写入的磁盘缓存无限膨胀。失败不抛错。
+   *
+   * §T1（2026-09-30）三处修复。背景：真机 95s 滚动窗口内 `pruneByPrefix error: {}` 出现 19 次，
+   * 覆盖 32 个长帧（max≥50ms）中的 15 个，是「事件数少但很深」那类单次长阻塞的稳定贡献者。
+   *
+   * ① **类型 bug：本方法从上线起从未真正清理过任何条目。**
+   *    SDK 的 `getAll(): Promise<Object>` 返回的是**普通对象**，原实现 `as Map<...>` 后调用
+   *    `Map.forEach` ⇒ 必然抛 TypeError（对象没有 forEach），被外层 catch 吞成 `error: {}`。
+   *    净效果是：每次触发都白跑一次 `getAll()`（把整个 Preferences 物化成 JS 对象，含全部
+   *    详情缓存，主线程成本随缓存增长且永不回收）然后抛错退出。现改为
+   *    `Record<string, ValueType>` + `Object.keys` 迭代（与 TiebaService 既有写法一致）。
+   * ② **不再为取 expireAt 而解析整条详情**：`putWithTtl` 用对象字面量序列化 TtlWrapper
+   *    （`{data, expireAt}`），字段序恒为 data → expireAt，故 expireAt 必在字符串末尾；
+   *    改用 `readExpireAt` 从尾部定位读取，成本从「每条几十 KB 的 JSON.parse × N 条」
+   *    降为「读末尾几十字节 × N 条」。
+   * ③ **节流 + 延迟执行**：最小间隔 60s（原约 5s 一次），且触发后延迟到下一帧之外执行，
+   *    避免「预取回包 → 详情落盘 → 全表扫描」三件事压进同一个滚动帧。
+   *    （清理是「防磁盘膨胀」的慢变量，60s 粒度足够；详情 TTL 10 分钟亦兜底。）
    */
   async pruneByPrefix(prefix: string, maxCount: number): Promise<void> {
     if (this.store === null || maxCount <= 0) {
       return;
     }
+    // ③-a 节流：距上次实际清理不足最小间隔 → 本次不排（调用点仍可保持「每 N 次写入调一次」）
+    if (Date.now() - this.lastPruneAt < CacheManager.PRUNE_MIN_INTERVAL_MS) {
+      return;
+    }
+    if (this.pruneTimer >= 0) {
+      return;
+    }
+    // ③-b 延迟执行：调用点正是详情落盘的那一帧，推后执行让它离开滚动帧
+    this.pendingPrunePrefix = prefix;
+    this.pendingPruneMax = maxCount;
+    this.pruneTimer = setTimeout((): void => {
+      this.pruneTimer = -1;
+      const p: string = this.pendingPrunePrefix;
+      const n: number = this.pendingPruneMax;
+      this.runPrune(p, n);
+    }, CacheManager.PRUNE_DELAY_MS);
+  }
+
+  /** 实际执行一轮清理（只由 pruneByPrefix 的延迟回调调用） */
+  private async runPrune(prefix: string, maxCount: number): Promise<void> {
+    if (this.store === null) {
+      return;
+    }
+    this.lastPruneAt = Date.now();
+    const t0: number = Date.now();
     try {
-      const all = await this.store.getAll() as Map<string, preferences.ValueType>;
+      const all = await this.store.getAll() as Record<string, preferences.ValueType>;
+      const keys: string[] = Object.keys(all);
       const entries: PruneEntry[] = [];
-      all.forEach((value: preferences.ValueType, key: string) => {
-        if (key.startsWith(prefix) && typeof value === 'string' && value.length > 0) {
-          try {
-            const wrapper = JSON.parse(value) as TtlWrapper<object>;
-            const entry: PruneEntry = { key: key, expireAt: wrapper.expireAt };
-            entries.push(entry);
-          } catch (_) {
-          }
+      const now: number = Date.now();
+      for (const key of keys) {
+        if (!key.startsWith(prefix)) {
+          continue;
         }
-      });
+        const value: preferences.ValueType = all[key];
+        if (typeof value !== 'string' || value.length === 0) {
+          continue;
+        }
+        // ② 尾部定位取 expireAt（-1 = 非 TtlWrapper / 已损坏 → 跳过，与旧实现「解析失败即跳过」一致）
+        const expireAt: number = CacheManager.readExpireAt(value);
+        if (expireAt < 0) {
+          continue;
+        }
+        const entry: PruneEntry = { key: key, expireAt: expireAt };
+        entries.push(entry);
+      }
+      let removed: number = 0;
       if (entries.length <= maxCount) {
         // 未超上限：只清理已过期的条目
-        const now = Date.now();
-        const expired = entries.filter((e) => e.expireAt < now);
-        for (const e of expired) {
-          this.store.delete(e.key);
+        for (const e of entries) {
+          if (e.expireAt < now && await this.deleteKey(e.key)) {
+            removed++;
+          }
         }
-        if (expired.length > 0) {
-          await this.store.flush();
+      } else {
+        entries.sort((a: PruneEntry, b: PruneEntry): number => a.expireAt - b.expireAt);
+        const n: number = entries.length - maxCount;
+        for (let i = 0; i < n; i++) {
+          if (await this.deleteKey(entries[i].key)) {
+            removed++;
+          }
         }
-        return;
       }
-      entries.sort((a, b) => a.expireAt - b.expireAt);
-      const toRemove = entries.slice(0, entries.length - maxCount);
-      for (const e of toRemove) {
-        this.store.delete(e.key);
+      if (removed > 0) {
+        this.scheduleFlush();
       }
-      await this.store.flush();
+      // 结果自证（每轮一行，最长 60s 一次）：scanned = 全表条目数，kept = 保留的前缀条目数
+      hilog.info(0x0000, TAG,
+        'prune prefix=%{public}s table=%{public}d matched=%{public}d kept=%{public}d removed=%{public}d cost=%{public}dms',
+        prefix, keys.length, entries.length, entries.length - removed, removed, Date.now() - t0);
     } catch (e) {
-      hilog.error(0x0000, TAG, 'pruneByPrefix error: %{public}s', JSON.stringify(e));
+      hilog.error(0x0000, TAG, 'pruneByPrefix error: %{public}s', CacheManager.errText(e));
     }
+  }
+
+  /** 删除单个 key：失败只记日志并返回 false，不中断整轮清理 */
+  private async deleteKey(key: string): Promise<boolean> {
+    if (this.store === null) {
+      return false;
+    }
+    try {
+      await this.store.delete(key);
+      return true;
+    } catch (e) {
+      hilog.error(0x0000, TAG, 'prune delete failed key=%{public}s err=%{public}s', key, CacheManager.errText(e));
+      return false;
+    }
+  }
+
+  /**
+   * §T1：只从 TtlWrapper 的 JSON 文本里取 expireAt，不解析整个对象。
+   * TtlWrapper 由对象字面量序列化（字段序 data → expireAt），故本字段在末尾；
+   * 用 lastIndexOf 兜「data 内部恰好含同名字符串」的情形（取最靠后的那个）。
+   * 返回 -1 表示不是合法 TtlWrapper，调用方按「解析失败」跳过。
+   */
+  private static readExpireAt(raw: string): number {
+    const idx: number = raw.lastIndexOf('"expireAt"');
+    if (idx < 0) {
+      return -1;
+    }
+    const len: number = raw.length;
+    let i: number = idx + 10;
+    while (i < len) {
+      const c: number = raw.charCodeAt(i);
+      if (c === 0x3A || c === 0x20) {   // ':' 或空格
+        i++;
+        continue;
+      }
+      break;
+    }
+    let end: number = i;
+    while (end < len) {
+      const d: number = raw.charCodeAt(end);
+      if (d < 0x30 || d > 0x39) {   // 非数字
+        break;
+      }
+      end++;
+    }
+    if (end === i) {
+      return -1;
+    }
+    const n: number = Number.parseInt(raw.substring(i, end), 10);
+    return Number.isNaN(n) ? -1 : n;
+  }
+
+  /** §T1：取真实错误文本（`JSON.stringify(Error)` 恒为 "{}"，会把真因整个吞掉） */
+  private static errText(error: Object): string {
+    const message: string = (error as Error).message;
+    return message !== undefined && message.length > 0 ? message : `${error}`;
   }
 
   /**
@@ -280,7 +454,8 @@ export class CacheManager {
     }
     try {
       await this.store.delete(key);
-      await this.store.flush();
+      // §FLUSHQ：与 put 同口径防抖（同会话读走内存副本，语义不变）
+      this.scheduleFlush();
     } catch (e) {
       hilog.error(0x0000, TAG, 'delete error: %{public}s', JSON.stringify(e));
     }
